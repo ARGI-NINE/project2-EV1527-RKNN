@@ -1,0 +1,64 @@
+{
+  "files": [
+    {
+      "wav": "capture04.wav",
+      "result_json": "d:\\project\\project2\\decode_capture04_fullscan.json",
+      "dominant_burst": null,
+      "sanity_warnings": [
+        "overlap_drop:0x06C0CC@83.386-83.417s vs 0x090322@83.384-83.417s"
+      ],
+      "cluster_count": 1,
+      "segments": [
+        {
+          "code_hex": "0x090322",
+          "bits": "000010010000001100100010",
+          "time_start_sec": 83.384375,
+          "time_end_sec": 83.417,
+          "repeat_count": 2,
+          "frame_count": 2,
+          "quality_score": 1.1801124423995115
+        }
+      ]
+    },
+    {
+      "wav": "capture05.wav",
+      "result_json": "d:\\project\\project2\\decode_capture05_fullscan.json",
+      "dominant_burst": {
+        "start_sec": 30.627625,
+        "end_sec": 30.7165,
+        "count": 49
+      },
+      "sanity_warnings": [],
+      "cluster_count": 1,
+      "segments": [
+        {
+          "code_hex": "0xDCC70C",
+          "bits": "110111001100011100001100",
+          "time_start_sec": 30.62775,
+          "time_end_sec": 30.672,
+          "repeat_count": 3,
+          "frame_count": 2,
+          "quality_score": 1.1559237574290722
+        }
+      ]
+    },
+    {
+      "wav": "capture06.wav",
+      "result_json": "d:\\project\\project2\\decode_capture06_fullscan.json",
+      "dominant_burst": null,
+      "sanity_warnings": [],
+      "cluster_count": 1,
+      "segments": [
+        {
+          "code_hex": "0xFD1ED8",
+          "bits": "111111010001111011011000",
+          "time_start_sec": 90.88425,
+          "time_end_sec": 90.88425,
+          "repeat_count": 2,
+          "frame_count": 1,
+          "quality_score": 1.1456179070994985
+        }
+      ]
+    }
+  ]
+}

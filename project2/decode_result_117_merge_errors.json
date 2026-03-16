@@ -1,0 +1,67 @@
+{
+  "source_fullscan": "d:\\project\\project2\\decode_result_fullscan.json",
+  "source_merged": "d:\\project\\project2\\decode_result_fullscan_merged.json",
+  "reference_cluster_from_merged": {
+    "code_hex": "0x12D1B1",
+    "bits": "000100101101000110110001",
+    "repeat_count": 2,
+    "frame_count": 3,
+    "repeat_valid": true,
+    "repeat_hamming_avg": 2.0,
+    "repeat_hamming_max": 5,
+    "bit_error_avg": 0.09431919069833083,
+    "bit_error_min": 0.00460721095945403,
+    "period_jitter_avg": 0.0729711157651844,
+    "quality_score": 1.1012021696757934,
+    "mean_clk_us": 339.2967281173391,
+    "first_time_sec": 117.187,
+    "last_time_sec": 117.40275,
+    "frames": [
+      {
+        "time_sec": 117.187,
+        "bits": "000100101101000110110000",
+        "clk_us": 340.3225806451613,
+        "confidence": 1.0
+      },
+      {
+        "time_sec": 117.273,
+        "bits": "000100101101000110110001",
+        "clk_us": 341.53129807146337,
+        "confidence": 1.0
+      },
+      {
+        "time_sec": 117.40275,
+        "bits": "000100101101000011011000",
+        "clk_us": 336.0363056353927,
+        "confidence": 1.0
+      }
+    ]
+  },
+  "analysis_window_sec": [
+    117.079875,
+    117.59825000000001
+  ],
+  "clusters_near_117_with_error_detail": [
+    {
+      "code_hex": "0x12D1B1",
+      "time_sec": [
+        117.187,
+        117.40275
+      ],
+      "frame_count": 3,
+      "repeat_count": 2,
+      "quality_score": 1.1012021696757934,
+      "mean_clk_us": 339.2967281173391,
+      "clk_delta_us_vs_ref": 0.0,
+      "edit_distance_vs_ref": 0,
+      "substitute_count": 0,
+      "delete_count_ref_missing_in_obs": 0,
+      "insert_count_obs_extra_vs_ref": 0,
+      "delete_positions_0_based": [],
+      "insert_positions_0_based": [],
+      "substitute_positions_0_based": [],
+      "is_same_family_merge_candidate": true,
+      "bits": "000100101101000110110001"
+    }
+  ]
+}

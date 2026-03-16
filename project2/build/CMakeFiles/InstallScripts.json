@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/project/project2/build/cmake_install.cmake",
+		"D:/project/project2/build/linux_app/cmake_install.cmake",
+		"D:/project/project2/build/simulator/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

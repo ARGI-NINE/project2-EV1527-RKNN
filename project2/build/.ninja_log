@@ -1,0 +1,23 @@
+# ninja log v7
+30	194	7944257161584301	linux_app/CMakeFiles/rf_gateway_core.dir/rf_epoll.c.obj	ce0faddd9a490540
+40	199	7944257161674021	linux_app/CMakeFiles/rf_gateway_core.dir/rf_db.c.obj	16eed9f5433de618
+27	200	7944257161554399	linux_app/CMakeFiles/rf_common.dir/__/common/rf_protocol.c.obj	1ea252f1da3d4be4
+33	203	7944257161604239	linux_app/CMakeFiles/rf_gateway_core.dir/rf_decode.c.obj	a0d1047665d4baf5
+35	211	7944257161634135	linux_app/CMakeFiles/rf_gateway_core.dir/rf_decode_c.c.obj	f06fb6973d7ff027
+28	159	7944264264802833	linux_app/CMakeFiles/rf_gateway_core.dir/rf_source.c.obj	5c2da92df73387c6
+19	144	7944265717690919	linux_app/CMakeFiles/rf_gateway.dir/main.c.obj	b7f1d51f47f96eac
+25	217	7944264264772943	linux_app/CMakeFiles/rf_gateway_core.dir/rf_mqtt.c.obj	b58dafcbc7e0889f
+36	707	7944264264887167	simulator/CMakeFiles/rf_simulator.dir/rf_simulator.c.obj	7cfa7babe406144c
+170	279	7944264923190098	simulator/CMakeFiles/rf_simulator.dir/__/common/rf_protocol.c.obj	cc32e555b5f64da3
+144	326	7944265718941480	linux_app/rf_gateway.exe	184b82f39d600e7
+643	780	7944264927923764	simulator/rf_simulator.exe	2d772590f6ddc169
+15	139	7944278865713467	build.ninja	696e7e32aabaafe6
+15	139	7944278865713467	D:/project/project2/build/cmake_install.cmake	696e7e32aabaafe6
+15	139	7944278865713467	D:/project/project2/build/linux_app/cmake_install.cmake	696e7e32aabaafe6
+15	139	7944278865713467	D:/project/project2/build/simulator/cmake_install.cmake	696e7e32aabaafe6
+26	125	7944278866241691	linux_app/CMakeFiles/rf_gateway_core.dir/rf_decode.c.obj	a0d1047665d4baf5
+125	232	7944278867229083	linux_app/CMakeFiles/rf_gateway_core.dir/rf_decode_window.c.obj	a8c93baa92a901e4
+232	324	7944278868295158	linux_app/CMakeFiles/rf_gateway_core.dir/rf_db.c.obj	16eed9f5433de618
+324	413	7944278869215891	linux_app/CMakeFiles/rf_gateway_core.dir/rf_mqtt.c.obj	b58dafcbc7e0889f
+413	521	7944278870102929	linux_app/CMakeFiles/rf_gateway.dir/main.c.obj	b7f1d51f47f96eac
+521	657	7944278871186775	linux_app/rf_gateway.exe	14c1879aae93b2f9

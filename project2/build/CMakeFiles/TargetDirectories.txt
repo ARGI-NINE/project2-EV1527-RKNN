@@ -1,0 +1,10 @@
+D:/project/project2/build/CMakeFiles/edit_cache.dir
+D:/project/project2/build/CMakeFiles/rebuild_cache.dir
+D:/project/project2/build/linux_app/CMakeFiles/rf_common.dir
+D:/project/project2/build/linux_app/CMakeFiles/rf_gateway_core.dir
+D:/project/project2/build/linux_app/CMakeFiles/rf_gateway.dir
+D:/project/project2/build/linux_app/CMakeFiles/edit_cache.dir
+D:/project/project2/build/linux_app/CMakeFiles/rebuild_cache.dir
+D:/project/project2/build/simulator/CMakeFiles/rf_simulator.dir
+D:/project/project2/build/simulator/CMakeFiles/edit_cache.dir
+D:/project/project2/build/simulator/CMakeFiles/rebuild_cache.dir
