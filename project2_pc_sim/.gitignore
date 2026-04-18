@@ -1,0 +1,19 @@
+# Local Python environment
+.venv/
+
+# Python bytecode/cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local build outputs
+build_live/
+build_verify/
+build_*/
+
+# Runtime artifacts from replay pipeline
+sim_data/
+sim_data/pulse_runtime.json
+sim_data/pulse_runtime.txt
+project2/sim_data/pulse.txt

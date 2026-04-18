@@ -11,7 +11,7 @@
   - `stage1_candidate_frames=2982`
   - `first_candidate_wav_sec=0.150625`
   - `last_candidate_wav_sec=134.793625`
-- Note: `sim_data/` was cleared on 2026-04-13. No JSON evidence file retained on disk.
+- Note: `sim_data/` is cleared; no JSON evidence file retained on disk.
 
 ## Step mapping
 1. WAV full-duration preprocess (candidate generation).
@@ -34,5 +34,5 @@
 - `wav_preprocess_ms` is not part of the current baseline comparison (legacy probe path removed in 2026-04-13 cleanup).
 
 ## Evidence note
-- `sim_data/` was cleared on 2026-04-13. Evidence file paths are no longer valid.
-- Direct binary pipeline test on 2026-04-13 confirmed: `[RF] addr=0x12D1B1 key=1 conf=0.99 source=c pulses=50 seq=2612 decode_us=4`.
+- `sim_data/` is cleared; evidence file paths are no longer valid.
+- Direct binary pipeline test confirmed: `[RF] addr=0x12D1B1 key=1 conf=0.99 source=c pulses=50 seq=2612 decode_us=4`.

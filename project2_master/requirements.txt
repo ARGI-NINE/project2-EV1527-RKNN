@@ -1,0 +1,8 @@
+# project2 dependencies (board-side final version)
+# RF gateway / Qt GUI core are C/C++, no Python dependency for core runtime.
+# Python vision helper modules (if used):
+numpy
+opencv-python-headless
+# Optional:
+# psutil         # system resource monitoring
+# rknnlite       # RKNN model inference (RK3568 only)

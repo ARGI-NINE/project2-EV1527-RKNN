@@ -40,7 +40,6 @@ Key retained output:
 - Launch Qt dashboard with both `--wav-input` (RF) and `--vision-host`/`--vision-port` (Vision) to run both chains simultaneously.
 - RF chain and Vision chain run independently; Qt aggregates both on separate pages.
 
-## Evidence policy (updated 2026-04-13)
-- `sim_data/` was cleared on 2026-04-13. No runtime artifact directories are retained on disk.
-- Historical observations are recorded in `docs/rf_chain_retest_full.txt`, `docs/vision_chain_retest_full.txt`, and `docs/dual_chain_retest_final.txt`.
-- RF pipeline correctness was re-verified via direct binary test on 2026-04-13 (see `ev1527_truth_mapping.md`).
+## Evidence policy
+- `sim_data/` directory is cleared; only `.gitkeep` retained. Runtime artifacts are not stored.
+- RF pipeline correctness verified via direct binary test (see `ev1527_truth_mapping.md`).
