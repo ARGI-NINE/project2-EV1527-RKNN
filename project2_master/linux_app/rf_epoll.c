@@ -4,48 +4,23 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
-static const char *rf_parse_error_name(rf_proto_parser_error_t err) {
-    switch (err) {
-        case RF_PROTO_PARSER_ERR_INVALID_LEN:
-            return "invalid_len";
-        case RF_PROTO_PARSER_ERR_CRC_MISMATCH:
-            return "crc_mismatch";
-        case RF_PROTO_PARSER_ERR_INTERNAL:
-            return "internal";
-        case RF_PROTO_PARSER_ERR_NONE:
-        default:
-            return "unknown";
-    }
-}
+#include "rf433_ioctl.h"
 
-static void rf_emit_parse_stats(const rf_epoll_config_t *cfg, rf_proto_parser_error_t err) {
-    if (cfg == NULL || cfg->stats == NULL) {
-        return;
-    }
-    printf(
-        "[RF_PARSE_STATS] crc_errors=%u parse_errors=%u last_error=%s\n",
-        (unsigned)cfg->stats->crc_error,
-        (unsigned)cfg->stats->parse_error,
-        rf_parse_error_name(err)
-    );
-}
-
-static int consume_rf_stream(const rf_epoll_config_t *cfg, rf_proto_parser_t *parser) {
-    unsigned char buf[256];
-    ssize_t n = 0;
-    int i = 0;
+static int consume_frames(const rf_epoll_config_t *cfg) {
+    struct rf433_frame drv_frame;
     rf_frame_t frame;
+    ssize_t n;
 
     while (1) {
-        n = read(cfg->rf_fd, buf, sizeof(buf));
+        n = read(cfg->rf_fd, &drv_frame, sizeof(drv_frame));
         if (n < 0) {
             if (errno == EINTR) {
                 if (cfg->stats != NULL) {
                     cfg->stats->read_eintr++;
                 }
-                fprintf(stderr, "[RF_IO] read interrupted by signal, retrying\n");
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -67,34 +42,32 @@ static int consume_rf_stream(const rf_epoll_config_t *cfg, rf_proto_parser_t *pa
             fprintf(stderr, "[RF_IO] read returned EOF on rf_fd=%d\n", cfg->rf_fd);
             return -2;
         }
-
-        for (i = 0; i < n; ++i) {
-            const int rc = rf_proto_parser_consume(parser, (uint8_t)buf[i], &frame);
-            if (rc < 0) {
-                const rf_proto_parser_error_t parse_err = parser->last_error;
-                if (cfg->stats != NULL) {
-                    cfg->stats->parse_error++;
-                    if (parse_err == RF_PROTO_PARSER_ERR_CRC_MISMATCH) {
-                        cfg->stats->crc_error++;
-                    }
-                }
-                rf_emit_parse_stats(cfg, parse_err);
-                continue;
+        if ((size_t)n < sizeof(drv_frame)) {
+            if (cfg->stats != NULL) {
+                cfg->stats->short_read++;
             }
-            if (rc == 1 && cfg->on_frame != NULL) {
-                if (cfg->on_frame(&frame, cfg->user) != 0) {
-                    return 1;
-                }
+            fprintf(stderr, "[RF_IO] short read from driver: %zd/%zu\n", n, sizeof(drv_frame));
+            continue;
+        }
+
+        memset(&frame, 0, sizeof(frame));
+        frame.len = drv_frame.pulse_count;
+        if (frame.len > RF_BUFFER_SIZE) {
+            frame.len = (uint16_t)RF_BUFFER_SIZE;
+        }
+        memcpy(frame.pulse, drv_frame.pulse, frame.len * sizeof(uint16_t));
+
+        if (cfg->on_frame != NULL) {
+            if (cfg->on_frame(&frame, drv_frame.timestamp_ns, drv_frame.seq, cfg->user) != 0) {
+                return 1;
             }
         }
     }
-
-    return 0;
 }
 
 int rf_epoll_run(const rf_epoll_config_t *cfg) {
-    rf_proto_parser_t parser;
     int epfd = -1;
+    int timer_fd = -1;
     struct epoll_event ev;
     struct epoll_event events[8];
     int nfds = 0;
@@ -104,7 +77,6 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
     if (cfg == NULL || cfg->rf_fd < 0 || cfg->on_frame == NULL) {
         return -1;
     }
-    rf_proto_parser_init(&parser);
 
     epfd = epoll_create1(0);
     if (epfd < 0) {
@@ -119,6 +91,21 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
         return -3;
     }
 
+    if (cfg->on_stats != NULL && cfg->stats_interval_s > 0) {
+        struct itimerspec its;
+        timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (timer_fd >= 0) {
+            memset(&its, 0, sizeof(its));
+            its.it_value.tv_sec = cfg->stats_interval_s;
+            its.it_interval.tv_sec = cfg->stats_interval_s;
+            timerfd_settime(timer_fd, 0, &its, NULL);
+            memset(&ev, 0, sizeof(ev));
+            ev.events = EPOLLIN;
+            ev.data.fd = timer_fd;
+            epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev);
+        }
+    }
+
     while (1) {
         nfds = epoll_wait(epfd, events, (int)(sizeof(events) / sizeof(events[0])), -1);
         if (nfds < 0) {
@@ -126,15 +113,14 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
                 if (cfg->stats != NULL) {
                     cfg->stats->epoll_eintr++;
                 }
-                fprintf(stderr, "[RF_IO] epoll_wait interrupted by signal, continuing\n");
                 continue;
             }
             if (cfg->stats != NULL) {
                 cfg->stats->epoll_error++;
             }
             fprintf(stderr, "[RF_IO] epoll_wait failed: errno=%d (%s)\n", errno, strerror(errno));
-            close(epfd);
-            return -4;
+            rc = -4;
+            goto out;
         }
         for (i = 0; i < nfds; ++i) {
             if (events[i].data.fd == cfg->rf_fd) {
@@ -149,12 +135,24 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
                 if ((events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0u) {
                     continue;
                 }
-                rc = consume_rf_stream(cfg, &parser);
+                rc = consume_frames(cfg);
                 if (rc != 0) {
-                    close(epfd);
-                    return rc;
+                    goto out;
+                }
+            } else if (timer_fd >= 0 && events[i].data.fd == timer_fd) {
+                uint64_t expirations;
+                (void)read(timer_fd, &expirations, sizeof(expirations));
+                if (cfg->on_stats != NULL) {
+                    cfg->on_stats(cfg->rf_fd, cfg->user);
                 }
             }
         }
     }
+
+out:
+    if (timer_fd >= 0) {
+        close(timer_fd);
+    }
+    close(epfd);
+    return rc;
 }

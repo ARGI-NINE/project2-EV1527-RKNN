@@ -324,9 +324,12 @@ void RF_Capture_TIM2_IRQHandler(void) {
     }
 }
 
+#if !defined(RF_CAPTURE_DISABLE_TIM2_IRQ_BRIDGE)
+/* Default behavior: export TIM2_IRQHandler and forward to RF capture handler. */
 void TIM2_IRQHandler(void) {
     RF_Capture_TIM2_IRQHandler();
 }
+#endif
 
 void RF_Capture_ProcessLoop(void) {
     static rf_frame_t frame_work;

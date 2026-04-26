@@ -39,11 +39,14 @@ void SystemLogPage::setupUi() {
     auto *serialLayout = new QVBoxLayout(serialGroup);
     crcLabel_ = new QLabel(QStringLiteral("CRC Errors: 0"), serialGroup);
     crcLabel_->setFont(QFont("Consolas", 13));
-    dropLabel_ = new QLabel(QStringLiteral("Drops: 0"), serialGroup);
+    parseLabel_ = new QLabel(QStringLiteral("Parse Failures: 0"), serialGroup);
+    parseLabel_->setFont(QFont("Consolas", 13));
+    dropLabel_ = new QLabel(QStringLiteral("Driver Drop Frames: 0"), serialGroup);
     dropLabel_->setFont(QFont("Consolas", 13));
     frameCountLabel_ = new QLabel(QStringLiteral("Total Frames: 0"), serialGroup);
     frameCountLabel_->setStyleSheet("color: #888;");
     serialLayout->addWidget(crcLabel_);
+    serialLayout->addWidget(parseLabel_);
     serialLayout->addWidget(dropLabel_);
     serialLayout->addWidget(frameCountLabel_);
     topLayout->addWidget(serialGroup);
@@ -125,11 +128,12 @@ void SystemLogPage::refresh() {
     const SystemStats stats = backend_->snapshotSystemStats();
     const RFSnapshot rf = backend_->snapshotRF();
     const VisionSnapshot vision = backend_->snapshotVisionState();
+    const bool visionStatusReported = vision.statusReported;
 
-        cpuLabel_->setText(QString("CPU (System): %1%").arg(QString::number(stats.cpuPercent, 'f', 1)));
-        memLabel_->setText(QString("Memory (System): %1% | Process: %2 MB")
-                          .arg(QString::number(stats.memoryPercent, 'f', 1),
-                              QString::number(stats.memoryUsedMB, 'f', 0)));
+    cpuLabel_->setText(QString("CPU: %1%").arg(QString::number(stats.cpuPercent, 'f', 1)));
+    memLabel_->setText(QString("Memory: %1% (%2 MB)")
+                           .arg(QString::number(stats.memoryPercent, 'f', 1),
+                                QString::number(stats.memoryUsedMB, 'f', 0)));
 
     const qint64 uptime = stats.uptimeSec;
     const qint64 hour = uptime / 3600;
@@ -142,13 +146,30 @@ void SystemLogPage::refresh() {
 
     crcLabel_->setText(QString("CRC Errors: %1").arg(rf.crcErrors));
     crcLabel_->setStyleSheet(rf.crcErrors > 0 ? "color: #d9534f; font-size: 13px;" : "font-size: 13px;");
-    dropLabel_->setText(QString("Drops: %1").arg(rf.dropCount));
+    parseLabel_->setText(QString("Parse Failures: %1").arg(rf.parseErrors));
+    parseLabel_->setStyleSheet(rf.parseErrors > 0 ? "color: #d9534f; font-size: 13px;" : "font-size: 13px;");
+    dropLabel_->setText(QString("Driver Drop Frames: %1").arg(rf.driverDropFrames));
     frameCountLabel_->setText(QString("Total Frames: %1").arg(rf.frameCount));
 
-    modelStatusLabel_->setText(QString("Status: %1").arg(vision.modelLoaded ? QStringLiteral("Loaded") : QStringLiteral("Unloaded")));
-    modelStatusLabel_->setStyleSheet(vision.modelLoaded ? "color: #4EC9B0;" : "color: #d9534f;");
-    modelFpsLabel_->setText(QString("Inference FPS: %1").arg(QString::number(vision.fps, 'f', 1)));
-    modelErrorLabel_->setText(QString("Error: %1").arg(vision.errorMsg.isEmpty() ? QStringLiteral("None") : vision.errorMsg));
+    if (!visionStatusReported) {
+        modelStatusLabel_->setText(QStringLiteral("Status: Not connected / not reported"));
+        modelStatusLabel_->setStyleSheet("color: #888;");
+        modelFpsLabel_->setText(QStringLiteral("Inference FPS: --"));
+        modelErrorLabel_->setText(
+            QString("Error: %1").arg(
+                vision.errorMsg.isEmpty()
+                    ? QStringLiteral("Vision bridge has not reported state yet")
+                    : vision.errorMsg
+            )
+        );
+    } else {
+        modelStatusLabel_->setText(
+            QString("Status: %1").arg(vision.modelLoaded ? QStringLiteral("Loaded") : QStringLiteral("Unloaded"))
+        );
+        modelStatusLabel_->setStyleSheet(vision.modelLoaded ? "color: #4EC9B0;" : "color: #d9534f;");
+        modelFpsLabel_->setText(QString("Inference FPS: %1").arg(QString::number(vision.fps, 'f', 1)));
+        modelErrorLabel_->setText(QString("Error: %1").arg(vision.errorMsg.isEmpty() ? QStringLiteral("None") : vision.errorMsg));
+    }
 
     mqttCountLabel_->setText(QString("Publish Count: %1").arg(stats.mqttCount));
     const QVector<LogEntry> mqttLogs = backend_->queryLogs(QStringLiteral("MQTT"), 1);

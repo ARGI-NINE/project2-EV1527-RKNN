@@ -115,10 +115,11 @@ void RFStatusPage::refresh() {
                                      )
                                    : QStringLiteral("离线");
     serialLabel_->setText(serialText);
-    frameLabel_->setText(QString("帧数: %1 | CRC错误: %2 | 解析失败: %3")
+    frameLabel_->setText(QString("帧数: %1 | CRC错误: %2 | 解析失败: %3 | 驱动丢帧: %4")
                              .arg(snapshot.frameCount)
                              .arg(snapshot.crcErrors)
-                             .arg(snapshot.parseErrors));
+                             .arg(snapshot.parseErrors)
+                             .arg(snapshot.driverDropFrames));
 
     waveformWidget_->setPulses(snapshot.waveform);
 

@@ -13,12 +13,14 @@ namespace dashboard {
 MainWindow::MainWindow(const AppOptions &options, QWidget *parent)
     : QMainWindow(parent),
       options_(options),
-            rfClient_(&backend_, options_, this) {
+      rfClient_(&backend_, options_, this),
+      visionRuntime_(&backend_, options_) {
     setupUi();
     setupRuntime();
 }
 
 MainWindow::~MainWindow() {
+    visionRuntime_.stop();
     rfClient_.stop();
 }
 
@@ -48,10 +50,14 @@ void MainWindow::setupUi() {
 
 void MainWindow::setupRuntime() {
     backend_.addLog("INFO", "SYSTEM", QStringLiteral("Qt5 前端已启动"));
-    backend_.setVisionOffline(QStringLiteral("视觉输入未接入（板侧版本不提供内置视觉mock）"));
-    backend_.addLog("INFO", "VISION", QStringLiteral("等待外部视觉状态接入"));
+    backend_.addLog(
+        "INFO",
+        "VISION",
+        QStringLiteral("板侧本地视觉链路已接入，默认使用 %1").arg(options_.visionDevice)
+    );
 
     rfClient_.start();
+    visionRuntime_.start();
     updateStatusBar();
 }
 
@@ -61,11 +67,16 @@ void MainWindow::updateStatusBar() {
     const VisionSnapshot vision = backend_.snapshotVisionState();
 
     statusLabel_->setText(
-        QString("运行 %1s | RF帧 %2 | Vision FPS %3 | CPU %4%")
-            .arg(stats.uptimeSec)
-            .arg(rf.frameCount)
-            .arg(QString::number(vision.fps, 'f', 1))
-            .arg(QString::number(stats.cpuPercent, 'f', 0))
+        vision.statusReported
+            ? QString("运行 %1s | RF帧 %2 | Vision FPS %3 | CPU %4%")
+                  .arg(stats.uptimeSec)
+                  .arg(rf.frameCount)
+                  .arg(QString::number(vision.fps, 'f', 1))
+                  .arg(QString::number(stats.cpuPercent, 'f', 0))
+            : QString("运行 %1s | RF帧 %2 | Vision 未接入 | CPU %3%")
+                  .arg(stats.uptimeSec)
+                  .arg(rf.frameCount)
+                  .arg(QString::number(stats.cpuPercent, 'f', 0))
     );
 }
 

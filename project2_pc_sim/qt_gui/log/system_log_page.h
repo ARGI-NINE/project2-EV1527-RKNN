@@ -24,6 +24,7 @@ private:
     QLabel *mqttCountLabel_ = nullptr;
     QLabel *mqttLastLabel_ = nullptr;
     QLabel *crcLabel_ = nullptr;
+    QLabel *parseLabel_ = nullptr;
     QLabel *dropLabel_ = nullptr;
     QLabel *frameCountLabel_ = nullptr;
     QLabel *modelStatusLabel_ = nullptr;

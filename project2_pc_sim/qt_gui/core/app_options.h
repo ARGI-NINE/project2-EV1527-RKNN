@@ -9,7 +9,6 @@ struct AppOptions {
     QString wavPath;
     bool wavLoop = false;
     double wavSpeed = 1.0;
-    QString videoPath;
     QString pythonBin;
     QString visionHost;
     int visionPort = 0;

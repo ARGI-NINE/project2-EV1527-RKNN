@@ -1,38 +1,35 @@
 # EV1527 Truth Mapping
 
-## Scope boundary
-- This document describes `project2_pc_sim` simulation/baseline behavior only.
-- It is not a spec for `project2_master` realtime serial (`/dev/ttyS9`) behavior.
+## Scope
 
-## Source of truth
-- Original RF source is `capture03.wav`.
-- Stage-1 full preprocess is run by `python/wav_to_pulses.py --wav ... --max-frames 0 --out-txt ... --out-json ...` (called internally by Qt).
-- Current values (verified 2026-04-13 direct binary test):
-  - `stage1_candidate_frames=2982`
-  - `first_candidate_wav_sec=0.150625`
-  - `last_candidate_wav_sec=134.793625`
-- Note: `sim_data/` is cleared; no JSON evidence file retained on disk.
+This file records the RF field mapping used by the surviving `project2_pc_sim` RF chain:
 
-## Step mapping
-1. WAV full-duration preprocess (candidate generation).
-2. Candidate replay into backend decoder pipeline.
-3. EV1527 decode and confidence filtering.
-4. Qt RF page receives and logs decoded events.
+```text
+WAV
+-> candidate-frame extraction
+-> timed replay
+-> simulated AA55 stream
+-> rf_gateway
+-> Qt RF display
+```
 
-## Retained verified target
-- Address: `0x12D1B1`
-- Key: `1`
-- Confidence: `0.99`
-- Candidate WAV time: `117.273s` (`1m57.273s`) - still valid
-- Gateway sequence at decode: `gateway_seq=2612` (within 2982 Stage-1 candidates)
-- C decoder latency: `decode_us=4`
+It does not define any vision behavior and it does not describe acceptance on the real board.
 
-## Metric mapping (unified)
-- `stage1_candidate_frames=2982`: number of candidate rows produced by Stage-1 on full `capture03.wav`.
-- `gateway_seq=2612`: decode-time sequence index reported by gateway `[RF]` output.
-- `candidate_wav_sec=117.273`: target candidate timestamp in original WAV.
-- `wav_preprocess_ms` is not part of the current baseline comparison (legacy probe path removed in 2026-04-13 cleanup).
+## Packet Mapping
 
-## Evidence note
-- `sim_data/` is cleared; evidence file paths are no longer valid.
-- Direct binary pipeline test confirmed: `[RF] addr=0x12D1B1 key=1 conf=0.99 source=c pulses=50 seq=2612 decode_us=4`.
+| Field | Hardware / runtime meaning | `pc_sim` meaning | Requirement |
+|---|---|---|---|
+| `SYNC` | `0xAA 0x55` | same | must match |
+| `LEN` | LE16 pulse count | same | must match |
+| `PAYLOAD[i]` | LE16 pulse width in us | same | must match |
+| `CRC` | XOR of `LEN + PAYLOAD` | same | must match |
+| `addr` | decoded EV1527 code | same semantic | must match semantically |
+| `key` | decoded low 4-bit key | same semantic | must match semantically |
+| `seq` | runtime frame sequence | replay sequence | monotonic per side, exact equality not required |
+| `timestamp` | runtime event time | replay/WAV-derived time | exact equality not required |
+
+## Boundary
+
+- This mapping is for the RF replay chain only.
+- Candidate extraction and timed replay may add simulator-side metadata, but they must not change AA55 packet semantics.
+- `project2_pc_sim` remains a reference simulator, not the final runtime authority.

@@ -12,11 +12,11 @@ public:
     DashboardBackend();
 
     void updateSerialStatus(bool online, const QString &port = QString());
-    void addRFEvent(const RFEvent &event);
+    void addRFEvent(const RFEvent &event, const QVector<int> &pulses);
     void updateWaveform(const QVector<int> &pulses);
     void incrementCrcError();
     void incrementParseError();
-    void updateProtocolStats(int crcErrors, int parseErrors);
+    void updateProtocolStats(int crcErrors, int parseErrors, int driverDropFrames);
     void incrementDrop();
 
     void updateVisionState(const VisionSnapshot &snapshot);
@@ -44,6 +44,7 @@ private:
 
     int crcErrors_ = 0;
     int parseErrors_ = 0;
+    int driverDropFrames_ = 0;
     int frameCount_ = 0;
     int dropCount_ = 0;
     int mqttLogCount_ = 0;

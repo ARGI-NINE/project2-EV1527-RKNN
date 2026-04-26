@@ -38,6 +38,7 @@ struct RFSnapshot {
     QVector<RFEvent> events;
     int crcErrors = 0;
     int parseErrors = 0;
+    int driverDropFrames = 0;
     int frameCount = 0;
     int dropCount = 0;
 };
@@ -46,6 +47,7 @@ struct VisionSnapshot {
     QImage frame;
     QStringList detections;
     double fps = 0.0;
+    bool statusReported = false;
     bool modelLoaded = false;
     bool cameraOnline = false;
     int frameCount = 0;

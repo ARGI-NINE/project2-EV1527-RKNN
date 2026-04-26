@@ -79,9 +79,6 @@ private:
     QString runtimePulseTxtPath_;
     QString runtimePulseJsonPath_;
     int timelineFrameCount_ = 0;
-    bool rfScreenshotReadyLogged_ = false;
-    qint64 prepStartedAtMs_ = -1;
-    qint64 replayStartedAtMs_ = -1;
     qint64 firstRfTimeoutMs_ = 15000;
     QHash<int, double> replayWavSecByIdx_;
 

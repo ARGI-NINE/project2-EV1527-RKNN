@@ -1,11 +1,11 @@
-﻿"""
+"""
 RKNN vision pipeline for the PC simulator.
 
 Keep the runtime path close to the user's RKNN example scripts:
 - ONNX path uses RKNN.config(... target_platform='rk3568') + load_onnx(...) + build(...)
 - RKNN path uses load_rknn(...)
 - init_runtime() with no parameters on the PC side
-- letterbox -> inference -> reshape -> postprocess
+- letterbox -> inference -> postprocess
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .timing_profiler import VisionTimingProfiler
 from .yolov5_postprocess import IMG_SIZE, letterbox, yolov5_post_process
 
 logger = logging.getLogger(__name__)
@@ -84,12 +83,11 @@ class VisionPipelineState:
 
 
 class VisionPipeline:
-    def __init__(self, model_path="yolov5s.rknn", camera_source=0, img_size=IMG_SIZE, state=None, profiler=None):
+    def __init__(self, model_path="yolov5s.rknn", camera_source=0, img_size=IMG_SIZE, state=None):
         self.model_path = str(model_path)
         self.camera_source = camera_source
         self.img_size = int(img_size or IMG_SIZE)
         self.state = state or VisionPipelineState()
-        self.profiler = profiler if profiler is not None else VisionTimingProfiler()
 
         self._capture_queue = queue.Queue(maxsize=1)
         self._result_queue = queue.Queue(maxsize=1)
@@ -98,15 +96,9 @@ class VisionPipeline:
         self._source_frame_interval = 0.0
         self._next_frame_id = 0
 
-        self.profiler.set_runtime_field("model_path", self.model_path)
-        self.profiler.set_runtime_field("camera_source", str(self.camera_source))
-        self.profiler.set_runtime_field("img_size", self.img_size)
-
     def _model_load_failed(self, rknn, message: str):
         logger.error("VisionPipeline: %s", message)
         self.state.set_model_status(False, error=message)
-        self.profiler.set_runtime_field("model_loaded", False)
-        self.profiler.set_runtime_field("model_error", message)
         if rknn is not None:
             try:
                 rknn.release()
@@ -118,11 +110,14 @@ class VisionPipeline:
         if self._running:
             return
         self._running = True
-        for name, target in (("capture", self._capture_loop), ("inference", self._inference_loop), ("postprocess", self._postprocess_loop)):
+        for name, target in (
+            ("capture", self._capture_loop),
+            ("inference", self._inference_loop),
+            ("postprocess", self._postprocess_loop),
+        ):
             thread = threading.Thread(target=target, name=f"vision-{name}", daemon=True)
             thread.start()
             self._threads.append(thread)
-            logger.info("VisionPipeline: started %s thread", name)
 
     def stop(self):
         self._running = False
@@ -135,37 +130,20 @@ class VisionPipeline:
 
         cap = None
         next_deadline = 0.0
-        is_video_file = self._is_video_file_source()
+        is_replay_file = self._is_replay_file_source()
         try:
             cap = cv2.VideoCapture(self.camera_source)
             if not cap.isOpened():
                 self.state.set_camera_status(False)
                 logger.error("VisionPipeline: failed to open camera %s", self.camera_source)
-                self.profiler.set_runtime_field("camera_opened", False)
                 return
 
             self.state.set_camera_status(True)
-            self.profiler.set_runtime_field("camera_opened", True)
-            logger.info("VisionPipeline: camera opened (%s)", self.camera_source)
 
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            self.profiler.set_runtime_field("source_frame_width", frame_width)
-            self.profiler.set_runtime_field("source_frame_height", frame_height)
-            self.profiler.set_runtime_field("source_frame_count", source_frame_count)
-            self.profiler.set_runtime_field("source_fps", source_fps)
-
-            if is_video_file:
-                if source_fps > 1.0:
-                    self._source_frame_interval = 1.0 / source_fps
-                    next_deadline = time.perf_counter()
-                    logger.info(
-                        "VisionPipeline: pacing video-file source at %.3f fps (interval %.3f ms)",
-                        source_fps,
-                        self._source_frame_interval * 1000.0,
-                    )
+            if is_replay_file and source_fps > 1.0:
+                self._source_frame_interval = 1.0 / source_fps
+                next_deadline = time.perf_counter()
 
             while self._running:
                 if self._source_frame_interval > 0.0 and next_deadline > time.perf_counter():
@@ -173,14 +151,11 @@ class VisionPipeline:
 
                 frame_id = self._next_frame_id
                 self._next_frame_id += 1
-                t0 = time.perf_counter()
                 ok, frame = cap.read()
                 if not ok:
-                    self.profiler.increment_counter("capture", "read_fail_count")
-                    if is_video_file and cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
+                    if is_replay_file and cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
                         if self._source_frame_interval > 0.0:
                             next_deadline = time.perf_counter()
-                        self.profiler.increment_counter("capture", "loop_restart_count")
                         continue
                     self.state.set_camera_status(False)
                     time.sleep(0.1)
@@ -188,19 +163,10 @@ class VisionPipeline:
 
                 self.state.set_camera_status(True)
                 img_rgb, frame_bgr, frame_meta = self._preprocess_frame(frame)
-                queued = True
                 try:
                     self._capture_queue.put((frame_id, frame_bgr, np.expand_dims(img_rgb, 0), frame_meta), timeout=0.1)
                 except queue.Full:
-                    queued = False
-                    self.profiler.increment_counter("capture", "capture_queue_full_drop_count")
-
-                self.profiler.record_stage_frame(
-                    "capture",
-                    frame_id,
-                    (time.perf_counter() - t0) * 1000.0,
-                    queued=queued,
-                )
+                    continue
 
                 if self._source_frame_interval > 0.0:
                     next_deadline += self._source_frame_interval
@@ -210,23 +176,17 @@ class VisionPipeline:
         finally:
             if cap is not None:
                 cap.release()
-            logger.info("VisionPipeline: capture thread exiting")
 
     def _inference_loop(self):
         rknn = None
         try:
-            model_load_t0 = time.perf_counter()
             rknn = self._load_model()
-            self.profiler.set_runtime_field("model_prepare_ms", (time.perf_counter() - model_load_t0) * 1000.0)
-            self.profiler.set_runtime_field("runtime_mode", "fallback_empty" if rknn is None else "rknn_inference")
             while self._running:
                 try:
                     frame_id, frame, img_input, frame_meta = self._capture_queue.get(timeout=0.5)
                 except queue.Empty:
-                    self.profiler.increment_counter("inference", "capture_queue_empty_count")
                     continue
 
-                t0 = time.perf_counter()
                 if rknn is None:
                     result = (
                         frame_id,
@@ -237,55 +197,37 @@ class VisionPipeline:
                         True,
                         frame_meta,
                     )
-                    self.profiler.increment_counter("inference", "runtime_fallback_frame_count")
                 else:
                     outputs = rknn.inference(inputs=[img_input])
                     result = (frame_id, frame, self._reshape_outputs(outputs), None, None, False, frame_meta)
 
-                queued = True
                 try:
                     self._result_queue.put(result, timeout=0.1)
                 except queue.Full:
-                    queued = False
-                    self.profiler.increment_counter("inference", "result_queue_full_drop_count")
-
-                self.profiler.record_stage_frame(
-                    "inference",
-                    frame_id,
-                    (time.perf_counter() - t0) * 1000.0,
-                    queued=queued,
-                    runtime_fallback=(rknn is None),
-                )
+                    continue
         except Exception as exc:
             msg = _runtime_error_message(exc)
             logger.error("VisionPipeline: %s", msg)
             self.state.set_model_status(False, error=msg)
-            self.profiler.set_runtime_field("model_loaded", False)
-            self.profiler.set_runtime_field("model_error", msg)
         finally:
             if rknn is not None:
                 try:
                     rknn.release()
                 except Exception:
                     pass
-            logger.info("VisionPipeline: inference thread exiting")
 
     def _postprocess_loop(self):
         fps_marks = []
         try:
             while self._running:
                 try:
-                    frame_id, frame, d1, d2, d3, already_postprocessed, frame_meta = self._result_queue.get(timeout=0.5)
+                    _, frame, d1, d2, d3, already_postprocessed, frame_meta = self._result_queue.get(timeout=0.5)
                 except queue.Empty:
-                    self.profiler.increment_counter("postprocess", "result_queue_empty_count")
                     continue
 
-                t0 = time.perf_counter()
                 if already_postprocessed:
                     boxes, classes, scores = d1, d2, d3
-                    self.profiler.increment_counter("postprocess", "already_postprocessed_frame_count")
                 else:
-                    self.profiler.mark_postprocess_call(Path(yolov5_post_process.__code__.co_filename).resolve())
                     boxes, classes, scores = yolov5_post_process(d1)
                     if boxes is not None:
                         boxes = self._map_boxes_to_frame(boxes, frame, frame_meta)
@@ -296,17 +238,8 @@ class VisionPipeline:
                     fps_marks = fps_marks[-30:]
                 fps = 0.0 if len(fps_marks) < 2 else (len(fps_marks) - 1) / max(1e-6, fps_marks[-1] - fps_marks[0])
                 self.state.update_detections(frame, boxes, classes, scores, fps)
-                self.profiler.record_stage_frame(
-                    "postprocess",
-                    frame_id,
-                    (time.perf_counter() - t0) * 1000.0,
-                    already_postprocessed=bool(already_postprocessed),
-                    detection_count=0 if scores is None else int(len(scores)),
-                )
         except Exception as exc:
             logger.exception("VisionPipeline: postprocess thread error: %s", exc)
-        finally:
-            logger.info("VisionPipeline: postprocess thread exiting")
 
     def _preprocess_frame(self, frame):
         import cv2
@@ -341,21 +274,13 @@ class VisionPipeline:
             msg = f"Failed to prepare RKNN model: {exc}"
             logger.error("VisionPipeline: %s", msg)
             self.state.set_model_status(False, error=msg)
-            self.profiler.set_runtime_field("model_loaded", False)
-            self.profiler.set_runtime_field("model_error", msg)
             return None
 
         model_suffix = runtime_model_path.suffix.lower()
-        self.profiler.set_runtime_field("runtime_model_path", str(runtime_model_path))
-        self.profiler.set_runtime_field("runtime_model_suffix", model_suffix)
 
         rknn = RKNN(verbose=False)
         try:
             if model_suffix == ".onnx":
-                logger.info(
-                    "VisionPipeline: ONNX path selected, using load_onnx+build+init_runtime (%s)",
-                    runtime_model_path,
-                )
                 rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]], target_platform="rk3568")
                 ret = rknn.load_onnx(model=str(runtime_model_path))
                 if ret != 0:
@@ -376,8 +301,6 @@ class VisionPipeline:
                 )
 
             self.state.set_model_status(True)
-            self.profiler.set_runtime_field("model_loaded", True)
-            logger.info("VisionPipeline: model loaded (%s)", runtime_model_path)
             return rknn
         except Exception as exc:
             return self._model_load_failed(rknn, _runtime_error_message(exc))
@@ -416,13 +339,10 @@ class VisionPipeline:
         mapped[:, 3] = np.clip(y2, 0.0, float(h - 1))
         return mapped
 
-    def _is_video_file_source(self) -> bool:
+    def _is_replay_file_source(self) -> bool:
         if isinstance(self.camera_source, int):
             return False
         source = str(self.camera_source).strip()
         if not source or source.isdigit():
             return False
-        if source.lower().startswith(("rtsp://", "http://", "https://", "rtmp://", "udp://")):
-            return False
-        return Path(source).suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".flv", ".ts", ".webm"}
-
+        return Path(source).is_file()

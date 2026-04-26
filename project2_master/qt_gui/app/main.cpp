@@ -17,24 +17,47 @@ int main(int argc, char *argv[]) {
     parser.addHelpOption();
     parser.addVersionOption();
 
+    const QString defaultRfInput = dashboard::defaultRFInputPath();
+
     QCommandLineOption rfInputOption(
         QStringLiteral("rf-input"),
-        QStringLiteral("RF input path passed to rf_gateway (master only supports /dev/ttyS9)."),
+        QStringLiteral("RF input path passed to rf_gateway (default: %1; master only supports this path).")
+            .arg(defaultRfInput),
         QStringLiteral("path")
     );
+    const QString defaultVisionDevice = dashboard::defaultVisionDevicePath();
+    QCommandLineOption visionDeviceOption(
+        QStringLiteral("vision-device"),
+        QStringLiteral("Local V4L2 camera device passed to the board-side vision runtime "
+                       "(default: %1; only /dev/video* is allowed).")
+            .arg(defaultVisionDevice),
+        QStringLiteral("device"),
+        defaultVisionDevice
+    );
     parser.addOption(rfInputOption);
+    parser.addOption(visionDeviceOption);
 
     parser.process(app);
 
     dashboard::AppOptions options;
     options.rfInput = parser.value(rfInputOption).trimmed();
     if (options.rfInput.isEmpty()) {
-        options.rfInput = dashboard::defaultRFInputPath();
+        options.rfInput = defaultRfInput;
     }
-    if (options.rfInput != dashboard::defaultRFInputPath()) {
+    options.visionDevice = parser.value(visionDeviceOption).trimmed();
+    if (options.visionDevice.isEmpty()) {
+        options.visionDevice = defaultVisionDevice;
+    }
+    if (options.rfInput != defaultRfInput) {
         QTextStream(stderr)
             << "Invalid --rf-input: " << options.rfInput
-            << " (master only supports " << dashboard::defaultRFInputPath() << ")\n";
+            << " (master only supports " << defaultRfInput << ")\n";
+        return 1;
+    }
+    if (!dashboard::isAllowedVisionDevicePath(options.visionDevice)) {
+        QTextStream(stderr)
+            << "Invalid --vision-device: " << options.visionDevice
+            << " (master only supports local /dev/video* devices)\n";
         return 1;
     }
 

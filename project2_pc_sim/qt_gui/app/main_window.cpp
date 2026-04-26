@@ -47,8 +47,7 @@ void MainWindow::setupUi() {
 }
 
 void MainWindow::setupRuntime() {
-    backend_.addLog("INFO", "SYSTEM", QStringLiteral("Qt5 frontend started"));
-
+    backend_.addLog(QStringLiteral("INFO"), QStringLiteral("SYSTEM"), QStringLiteral("Qt5 frontend started"));
     rfClient_.start();
     updateStatusBar();
 }

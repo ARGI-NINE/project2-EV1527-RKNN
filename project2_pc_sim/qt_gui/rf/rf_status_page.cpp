@@ -17,16 +17,6 @@ namespace dashboard {
 
 namespace {
 
-QString formatDecodeTime(qint64 decodeUs) {
-    if (decodeUs < 0) {
-        return QStringLiteral("--");
-    }
-    if (decodeUs < 1000) {
-        return QStringLiteral("%1 us").arg(decodeUs);
-    }
-    return QStringLiteral("%1 ms").arg(QString::number(decodeUs / 1000.0, 'f', 2));
-}
-
 QString formatCandidateWavSec(double wavSec) {
     if (wavSec < 0.0) {
         return QStringLiteral("--");
@@ -92,32 +82,27 @@ void RFStatusPage::setupUi() {
     addrLabel_ = new QLabel(QStringLiteral("Address: --"), decodeGroup);
     candidateWavLabel_ = new QLabel(QStringLiteral("WAV Sec: --"), decodeGroup);
     confidenceLabel_ = new QLabel(QStringLiteral("Confidence: --"), decodeGroup);
-    decodeTimeLabel_ = new QLabel(QStringLiteral("Decode Time: --"), decodeGroup);
 
     const QFont mono("Consolas", 11);
     addrLabel_->setFont(mono);
     addrLabel_->setStyleSheet("color: #4EC9B0;");
     candidateWavLabel_->setFont(mono);
     confidenceLabel_->setFont(mono);
-    decodeTimeLabel_->setFont(mono);
-    decodeTimeLabel_->setStyleSheet("color: #888;");
 
     decodeLayout->addWidget(addrLabel_);
     decodeLayout->addWidget(candidateWavLabel_);
     decodeLayout->addWidget(confidenceLabel_);
     decodeLayout->addStretch();
-    decodeLayout->addWidget(decodeTimeLabel_);
     layout->addWidget(decodeGroup);
 
     auto *historyGroup = new QGroupBox(QStringLiteral("RF Event History"), this);
     auto *historyLayout = new QVBoxLayout(historyGroup);
     historyLayout->setContentsMargins(4, 4, 4, 4);
-    historyTable_ = new QTableWidget(0, 4, historyGroup);
+    historyTable_ = new QTableWidget(0, 3, historyGroup);
     historyTable_->setHorizontalHeaderLabels({
         QStringLiteral("Address"),
         QStringLiteral("WAV Sec"),
-        QStringLiteral("Confidence"),
-        QStringLiteral("Decode Time")
+        QStringLiteral("Confidence")
     });
     historyTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     historyTable_->setEditTriggers(QTableWidget::NoEditTriggers);
@@ -164,7 +149,6 @@ void RFStatusPage::refresh() {
         historyTable_->setItem(row, 0, new QTableWidgetItem(event.address));
         historyTable_->setItem(row, 1, new QTableWidgetItem(formatCandidateWavSec(event.candidateWavSec)));
         historyTable_->setItem(row, 2, new QTableWidgetItem(formatConfidence(event.confidence)));
-        historyTable_->setItem(row, 3, new QTableWidgetItem(formatDecodeTime(event.decodeUs)));
     }
 
     if (historyPinned_) {
@@ -197,7 +181,6 @@ void RFStatusPage::refresh() {
         addrLabel_->setText(QStringLiteral("Address: --"));
         candidateWavLabel_->setText(QStringLiteral("WAV Sec: --"));
         confidenceLabel_->setText(QStringLiteral("Confidence: --"));
-        decodeTimeLabel_->setText(QStringLiteral("Decode Time: --"));
     }
 }
 
@@ -205,7 +188,6 @@ void RFStatusPage::showEventDetails(const RFEvent &event) {
     addrLabel_->setText(QString("Address: %1").arg(event.address));
     candidateWavLabel_->setText(QString("WAV Sec: %1").arg(formatCandidateWavSec(event.candidateWavSec)));
     confidenceLabel_->setText(QString("Confidence: %1").arg(formatConfidence(event.confidence)));
-    decodeTimeLabel_->setText(QString("Decode Time: %1").arg(formatDecodeTime(event.decodeUs)));
 }
 
 void RFStatusPage::onHistoryRowClicked(int row) {
@@ -260,7 +242,8 @@ bool RFStatusPage::sameEvent(const RFEvent &lhs, const RFEvent &rhs) {
     }
     return lhs.timestamp == rhs.timestamp &&
            lhs.address == rhs.address &&
-           lhs.decodeUs == rhs.decodeUs;
+           qFuzzyCompare(lhs.confidence + 1.0, rhs.confidence + 1.0) &&
+           qFuzzyCompare(lhs.candidateWavSec + 1.0, rhs.candidateWavSec + 1.0);
 }
 
 }  // namespace dashboard

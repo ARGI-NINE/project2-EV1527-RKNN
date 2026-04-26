@@ -1,11 +1,10 @@
 #include "rf_gateway_client.h"
 
-#include "rf_utils.h"
-
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QStringList>
 
 namespace dashboard {
 
@@ -13,6 +12,25 @@ namespace {
 
 QString fixedGatewayPath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/rf_gateway");
+}
+
+QVector<int> parsePulseUsList(const QString &csv) {
+    QVector<int> pulses;
+    if (csv.isEmpty()) {
+        return pulses;
+    }
+
+    const QStringList parts = csv.split(',', QString::SkipEmptyParts);
+    pulses.reserve(parts.size());
+    for (const QString &part : parts) {
+        bool ok = false;
+        const int pulseUs = part.toInt(&ok);
+        if (!ok || pulseUs <= 0) {
+            return {};
+        }
+        pulses.append(pulseUs);
+    }
+    return pulses;
 }
 
 }  // namespace
@@ -60,11 +78,8 @@ QString RFGatewayClient::resolveGatewayPath() const {
 
 QString RFGatewayClient::resolvedRfInputPath() const {
     const QString defaultPath = defaultRFInputPath();
-    if (options_.rfInput.isEmpty()) {
+    if (options_.rfInput.isEmpty() || options_.rfInput == defaultPath) {
         return defaultPath;
-    }
-    if (options_.rfInput == defaultPath) {
-        return options_.rfInput;
     }
     return defaultPath;
 }
@@ -111,7 +126,7 @@ void RFGatewayClient::startGateway() {
 
     QObject::connect(gateway_, &QProcess::started, context_, [this, gatewayPath, rfInputPath]() {
         if (backend_ != nullptr) {
-            backend_->updateSerialStatus(true, rfInputPath);
+            backend_->updateSerialStatus(false, rfInputPath);
             backend_->addLog("INFO", "SYSTEM", QString("rf_gateway 已启动: %1").arg(gatewayPath));
         }
     });
@@ -159,39 +174,48 @@ void RFGatewayClient::handleGatewayLine(const QString &line) {
     }
 
     static const QRegularExpression rfExpr(
-        R"(\[RF\]\s+addr=([^\s]+)\s+key=([^\s]+)\s+conf=([0-9.]+)\s+source=([^\s]+)\s+pulses=([0-9]+)(?:\s+seq=([0-9]+))?(?:\s+decode_us=([0-9]+))?)"
+        R"(\[RF\]\s+addr=([^\s]+)\s+key=([^\s]+)\s+conf=([0-9.]+)\s+source=([^\s]+)\s+pulses=([0-9]+)(?:\s+seq=([0-9]+))?(?:\s+decode_us=([0-9]+))?(?:\s+pulse_us=([0-9,]+))?)"
     );
     static const QRegularExpression runningExpr(R"(rf_gateway\s+running:\s+rf=([^\s]+))");
-    static const QRegularExpression parseStatsExpr(
-        R"(\[RF_PARSE_STATS\]\s+crc_errors=([0-9]+)\s+parse_errors=([0-9]+)\s+last_error=([^\s]+))"
+    static const QRegularExpression drvStatsExpr(
+        R"(\[DRV_STATS\]\s+frame_ok=(\d+)\s+crc_err=(\d+)\s+len_err=(\d+)\s+drop=(\d+)\s+online=(\d+)\s+seq=(\d+)\s+queue=(\d+)/(\d+))"
     );
     static const QRegularExpression finalStatsExpr(
-        R"(\[RF_STATS\].*?\bproto_crc_err=([0-9]+)\b.*?\bproto_parse_err=([0-9]+)\b)"
+        R"(\[RF_STATS\].*?\bdrv_drop=(\d+)\b)"
     );
 
     const QRegularExpressionMatch runningMatch = runningExpr.match(line);
     if (runningMatch.hasMatch()) {
-        backend_->updateSerialStatus(true, runningMatch.captured(1));
+        backend_->updateSerialStatus(false, runningMatch.captured(1));
         backend_->addLog("INFO", "SYSTEM", line);
         return;
     }
 
-    const QRegularExpressionMatch parseStatsMatch = parseStatsExpr.match(line);
-    if (parseStatsMatch.hasMatch()) {
-        backend_->updateProtocolStats(parseStatsMatch.captured(1).toInt(), parseStatsMatch.captured(2).toInt());
-        backend_->addLog("WARN", "RF", line);
+    const QRegularExpressionMatch drvStatsMatch = drvStatsExpr.match(line);
+    if (drvStatsMatch.hasMatch()) {
+        const int crcErr = drvStatsMatch.captured(2).toInt();
+        const int lenErr = drvStatsMatch.captured(3).toInt();
+        const int driverDrop = drvStatsMatch.captured(4).toInt();
+        const bool linkOnline = drvStatsMatch.captured(5).toInt() != 0;
+        backend_->updateSerialStatus(linkOnline, resolvedRfInputPath());
+        backend_->updateProtocolStats(
+            crcErr,
+            crcErr + lenErr,     /* parseErrors = crc_err + len_err */
+            driverDrop
+        );
+        backend_->addLog("INFO", "RF", line);
         return;
     }
 
     const QRegularExpressionMatch finalStatsMatch = finalStatsExpr.match(line);
     if (finalStatsMatch.hasMatch()) {
-        backend_->updateProtocolStats(finalStatsMatch.captured(1).toInt(), finalStatsMatch.captured(2).toInt());
         backend_->addLog("INFO", "RF", line);
         return;
     }
 
     const QRegularExpressionMatch rfMatch = rfExpr.match(line);
     if (rfMatch.hasMatch()) {
+        const QVector<int> pulses = parsePulseUsList(rfMatch.captured(8));
         RFEvent event;
         event.timestamp = QDateTime::currentDateTime();
         event.address = rfMatch.captured(1);
@@ -203,8 +227,8 @@ void RFGatewayClient::handleGatewayLine(const QString &line) {
         if (!rfMatch.captured(7).isEmpty())
             event.decodeUs = rfMatch.captured(7).toLongLong();
 
-        backend_->addRFEvent(event);
-        backend_->updateWaveform(buildWaveformFromRawCode(parseRawCode(event.address)));
+        backend_->updateSerialStatus(true, resolvedRfInputPath());
+        backend_->addRFEvent(event, pulses);
         backend_->addLog("INFO", "RF", line);
         return;
     }

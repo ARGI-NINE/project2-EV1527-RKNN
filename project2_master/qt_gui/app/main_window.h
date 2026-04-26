@@ -3,6 +3,7 @@
 #include "app_options.h"
 #include "dashboard_backend.h"
 #include "rf_gateway_client.h"
+#include "vision_runtime.h"
 
 #include <QLabel>
 #include <QMainWindow>
@@ -27,6 +28,7 @@ private:
     AppOptions options_;
     DashboardBackend backend_;
     RFGatewayClient rfClient_;
+    VisionRuntime visionRuntime_;
 
     RFStatusPage *rfPage_ = nullptr;
     VisionPage *visionPage_ = nullptr;

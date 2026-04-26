@@ -1,7 +1,7 @@
 #ifndef RF_SOURCE_H
 #define RF_SOURCE_H
 
-#define RF_SOURCE_UART9_PATH "/dev/ttyS9"
+#define RF_SOURCE_PATH "/dev/rf433"
 
 int rf_source_is_supported_path(const char *path);
 int rf_source_open(const char *path);

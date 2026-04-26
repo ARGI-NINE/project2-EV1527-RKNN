@@ -16,10 +16,14 @@ void DashboardBackend::updateSerialStatus(bool online, const QString &port) {
     serialPort_ = port;
 }
 
-void DashboardBackend::addRFEvent(const RFEvent &event) {
+void DashboardBackend::addRFEvent(const RFEvent &event, const QVector<int> &pulses) {
     QMutexLocker locker(&mutex_);
     hasLastDecode_ = true;
     lastDecode_ = event;
+    waveform_ = pulses;
+    if (waveform_.size() > kMaxWaveform) {
+        waveform_.resize(kMaxWaveform);
+    }
     eventHistory_.prepend(event);
     if (eventHistory_.size() > kMaxHistory) {
         eventHistory_.resize(kMaxHistory);
@@ -45,13 +49,16 @@ void DashboardBackend::incrementParseError() {
     ++parseErrors_;
 }
 
-void DashboardBackend::updateProtocolStats(int crcErrors, int parseErrors) {
+void DashboardBackend::updateProtocolStats(int crcErrors, int parseErrors, int driverDropFrames) {
     QMutexLocker locker(&mutex_);
     if (crcErrors >= 0) {
         crcErrors_ = crcErrors;
     }
     if (parseErrors >= 0) {
         parseErrors_ = parseErrors;
+    }
+    if (driverDropFrames >= 0) {
+        driverDropFrames_ = driverDropFrames;
     }
 }
 
@@ -63,11 +70,13 @@ void DashboardBackend::incrementDrop() {
 void DashboardBackend::updateVisionState(const VisionSnapshot &snapshot) {
     QMutexLocker locker(&mutex_);
     visionSnapshot_ = snapshot;
+    visionSnapshot_.statusReported = true;
 }
 
 void DashboardBackend::setVisionOffline(const QString &message) {
     QMutexLocker locker(&mutex_);
     VisionSnapshot snapshot;
+    snapshot.statusReported = false;
     snapshot.cameraOnline = false;
     snapshot.modelLoaded = false;
     snapshot.errorMsg = message;
@@ -112,6 +121,7 @@ RFSnapshot DashboardBackend::snapshotRF() const {
     snapshot.waveform = waveform_;
     snapshot.crcErrors = crcErrors_;
     snapshot.parseErrors = parseErrors_;
+    snapshot.driverDropFrames = driverDropFrames_;
     snapshot.frameCount = frameCount_;
     snapshot.dropCount = dropCount_;
 
@@ -153,7 +163,7 @@ SystemStats DashboardBackend::snapshotSystemStats() {
             QFile procStat("/proc/stat");
             if (procStat.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 const QString line = QTextStream(&procStat).readLine();   /* "cpu  user nice system idle ..." */
-                const QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+                const QStringList parts = line.split(' ', QString::SkipEmptyParts);
                 if (parts.size() >= 5 && parts[0] == "cpu") {
                     qint64 user   = parts[1].toLongLong();
                     qint64 nice   = parts[2].toLongLong();
@@ -186,9 +196,9 @@ SystemStats DashboardBackend::snapshotSystemStats() {
                 while (!stream.atEnd()) {
                     const QString line = stream.readLine();
                     if (line.startsWith("MemTotal:")) {
-                        memTotal = line.split(' ', Qt::SkipEmptyParts).at(1).toLongLong();
+                        memTotal = line.split(' ', QString::SkipEmptyParts).at(1).toLongLong();
                     } else if (line.startsWith("MemAvailable:")) {
-                        memAvailable = line.split(' ', Qt::SkipEmptyParts).at(1).toLongLong();
+                        memAvailable = line.split(' ', QString::SkipEmptyParts).at(1).toLongLong();
                     }
                     if (memTotal > 0 && memAvailable > 0)
                         break;

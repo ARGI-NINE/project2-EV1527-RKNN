@@ -11,10 +11,7 @@
 #endif
 
 int rf_source_open(const char *path) {
-    if (path == NULL) {
-        path = "/dev/rf433";
-    }
-    if (path[0] == '-' && path[1] == '\0') {
+    if (path == NULL || path[0] == '\0' || (path[0] == '-' && path[1] == '\0')) {
 #if defined(_WIN32)
         int fd = _fileno(stdin);
         if (fd < 0) {
@@ -31,19 +28,20 @@ int rf_source_open(const char *path) {
         return 0;
 #endif
     }
-
-#if defined(_WIN32)
-    return _open(path, _O_RDONLY | _O_BINARY);
-#else
-    return open(path, O_RDONLY | O_NONBLOCK);
-#endif
+    return -1;
 }
 
 void rf_source_close(int fd) {
     if (fd < 0) {
         return;
     }
+    if (fd == 0) {
+        return;
+    }
 #if defined(_WIN32)
+    if (fd == _fileno(stdin)) {
+        return;
+    }
     _close(fd);
 #else
     close(fd);

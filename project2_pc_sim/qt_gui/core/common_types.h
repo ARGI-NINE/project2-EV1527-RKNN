@@ -20,7 +20,6 @@ struct RFEvent {
     QString source;
     qint64 frameSeq = -1;
     double candidateWavSec = -1.0;
-    qint64 decodeUs = -1;
 };
 
 struct LogEntry {
@@ -38,6 +37,8 @@ struct RFSnapshot {
     QVector<int> waveform;
     QVector<RFEvent> events;
     int crcErrors = 0;
+    int parseErrors = 0;
+    int driverDropFrames = 0;
     int frameCount = 0;
     int dropCount = 0;
 };
@@ -46,6 +47,7 @@ struct VisionSnapshot {
     QImage frame;
     QStringList detections;
     double fps = 0.0;
+    bool statusReported = false;
     bool modelLoaded = false;
     bool cameraOnline = false;
     int frameCount = 0;

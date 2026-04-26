@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 
 #include "rf_decode.h"
 #include "rf_epoll.h"
 #include "rf_source.h"
+#include "rf433_ioctl.h"
 
 #define RF_STABLE_GROUP_MAX 12u
 
@@ -40,13 +42,14 @@ typedef struct {
     uint32_t stable_drop;
     uint32_t dup_drop;
     uint32_t published;
-    uint32_t proto_crc_err;
-    uint32_t proto_parse_err;
+    uint32_t drv_seq_prev;
+    uint32_t drv_drop;
+    int has_drv_seq;
 } app_ctx_t;
 
 static void print_usage(const char *exe) {
     printf("Usage: %s [options]\n", exe);
-    printf("  --rf-input <path>         Serial device path (only %s)\n", RF_SOURCE_UART9_PATH);
+    printf("  --rf-input <path>         Device path (default: %s)\n", RF_SOURCE_PATH);
     printf("  --stable-repeat <N>       Need N agreeing frames (default 2)\n");
     printf("  --stable-window <N>       Group memory window in frames (default 12)\n");
     printf("  --stable-near-bits <N>    Hamming-near threshold for merge (default 4)\n");
@@ -156,15 +159,29 @@ static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf,
     }
 }
 
-static int on_rf_frame(const rf_frame_t *frame, void *user) {
+static int on_rf_frame(const rf_frame_t *frame, uint64_t timestamp_ns, uint32_t drv_seq, void *user) {
     app_ctx_t *ctx = (app_ctx_t *)user;
     rf_decoded_packet_t pkt;
     rf_decode_last_call_stats_t call_stats;
     int rc = 0;
+    (void)timestamp_ns;
 
     if (ctx == NULL || frame == NULL) {
         return -1;
     }
+
+    if (ctx->has_drv_seq && drv_seq > ctx->drv_seq_prev) {
+        const uint32_t gap = drv_seq - ctx->drv_seq_prev - 1u;
+        if (gap > 0u) {
+            if (ctx->drv_drop > (0xFFFFFFFFu - gap)) {
+                ctx->drv_drop = 0xFFFFFFFFu;
+            } else {
+                ctx->drv_drop += gap;
+            }
+        }
+    }
+    ctx->drv_seq_prev = drv_seq;
+    ctx->has_drv_seq = 1;
 
     ctx->frames_total++;
     ctx->frame_seq++;
@@ -233,7 +250,7 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
     }
 
     printf(
-        "[RF] addr=%s key=%s conf=%.2f source=%s pulses=%u seq=%u decode_us=%llu\n",
+        "[RF] addr=%s key=%s conf=%.2f source=%s pulses=%u seq=%u decode_us=%llu pulse_us=",
         pkt.addr,
         pkt.key,
         pkt.confidence,
@@ -242,6 +259,10 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
         (unsigned)ctx->frame_seq,
         call_stats.total_us
     );
+    for (uint16_t i = 0; i < frame->len; ++i) {
+        printf("%s%u", (i == 0u) ? "" : ",", (unsigned)frame->pulse[i]);
+    }
+    printf("\n");
     ctx->last_code = pkt.raw_code;
     ctx->has_last_code = 1;
     ctx->last_publish_seq = ctx->frame_seq;
@@ -249,8 +270,30 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
     return 0;
 }
 
+static void on_drv_stats(int rf_fd, void *user) {
+    struct rf433_stats drv_stats;
+    struct rf433_status drv_status;
+    (void)user;
+
+    if (ioctl(rf_fd, RF433_IOC_GET_STATS, &drv_stats) == 0 &&
+        ioctl(rf_fd, RF433_IOC_GET_STATUS, &drv_status) == 0) {
+        printf(
+            "[DRV_STATS] frame_ok=%llu crc_err=%llu len_err=%llu drop=%llu"
+            " online=%u seq=%u queue=%u/%u\n",
+            (unsigned long long)drv_stats.frame_ok,
+            (unsigned long long)drv_stats.crc_err,
+            (unsigned long long)drv_stats.len_err,
+            (unsigned long long)drv_stats.drop_cnt,
+            (unsigned)drv_status.online,
+            (unsigned)drv_status.seq,
+            (unsigned)drv_status.queue_depth,
+            (unsigned)drv_status.queue_capacity
+        );
+    }
+}
+
 int main(int argc, char **argv) {
-    const char *rf_input = RF_SOURCE_UART9_PATH;
+    const char *rf_input = RF_SOURCE_PATH;
     uint16_t stable_repeat = 2u;
     uint16_t stable_window = 12u;
     uint8_t stable_near_bits = 4u;
@@ -297,7 +340,7 @@ int main(int argc, char **argv) {
     }
 
     if (!rf_source_is_supported_path(rf_input)) {
-        printf("Unsupported --rf-input: %s (master only allows %s)\n", rf_input, RF_SOURCE_UART9_PATH);
+        printf("Unsupported --rf-input: %s (allowed: %s)\n", rf_input, RF_SOURCE_PATH);
         return 1;
     }
 
@@ -319,6 +362,8 @@ int main(int argc, char **argv) {
 
     cfg.rf_fd = rf_fd;
     cfg.on_frame = on_rf_frame;
+    cfg.on_stats = on_drv_stats;
+    cfg.stats_interval_s = 5;
     cfg.stats = &epoll_stats;
     cfg.user = &ctx;
 
@@ -333,14 +378,13 @@ int main(int argc, char **argv) {
         (unsigned)publish_gap
     );
     epoll_rc = rf_epoll_run(&cfg);
-    ctx.proto_crc_err = epoll_stats.crc_error;
-    ctx.proto_parse_err = epoll_stats.parse_error;
     if (epoll_rc != 0) {
         fprintf(stderr, "[RF_IO] rf_epoll_run exited with rc=%d\n", epoll_rc);
     }
 
     printf(
-        "[RF_STATS] frames_total=%u decode_ok=%u decode_no_frame=%u decode_err=%u low_conf_drop=%u stable_drop=%u dup_drop=%u published=%u proto_crc_err=%u proto_parse_err=%u\n",
+        "[RF_STATS] frames_total=%u decode_ok=%u decode_no_frame=%u decode_err=%u"
+        " low_conf_drop=%u stable_drop=%u dup_drop=%u published=%u drv_drop=%u\n",
         (unsigned)ctx.frames_total,
         (unsigned)ctx.decode_ok,
         (unsigned)ctx.decode_no_frame,
@@ -349,8 +393,7 @@ int main(int argc, char **argv) {
         (unsigned)ctx.stable_drop,
         (unsigned)ctx.dup_drop,
         (unsigned)ctx.published,
-        (unsigned)ctx.proto_crc_err,
-        (unsigned)ctx.proto_parse_err
+        (unsigned)ctx.drv_drop
     );
     printf(
         "[RF_IO_STATS] read_eintr=%u read_eagain=%u read_eof=%u read_error=%u epoll_eintr=%u epoll_error=%u\n",

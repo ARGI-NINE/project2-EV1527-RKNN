@@ -50,7 +50,7 @@ def _load_frames(path: Path) -> list[dict]:
         pulse = row.get("pulse", [])
         if not isinstance(pulse, list) or not pulse:
             continue
-        start_sec = float(row.get("candidate_wav_sec", row.get("start_sec", 0.0)))
+        start_sec = float(row.get("candidate_wav_sec", 0.0))
         valid.append(
             {
                 "idx": int(row.get("candidate_idx", len(valid) + 1)),

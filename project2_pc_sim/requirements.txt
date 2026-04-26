@@ -1,10 +1,8 @@
 # project2 dependencies
 # RF gateway (pure C, no Python deps for core)
-# Vision pipeline (Python) require:
+# Vision bridge/runtime support on the WSL side:
 numpy
 opencv-python-headless
 # Optional:
-# psutil         # optional system resource monitoring
-# PyQt5          # Python Qt dashboard has been abandoned; do not install
-# rknn-toolkit2  # PC侧请通过Rockchip官方wheel离线安装（见README）
-# rknnlite       # RKNNLite runtime (RK3568 board-side only, do not install on PC)
+# rknn-toolkit2  # install from Rockchip official wheel when WSL-side model processing is needed
+# rknnlite       # board-side runtime only; not for the Windows Qt simulator

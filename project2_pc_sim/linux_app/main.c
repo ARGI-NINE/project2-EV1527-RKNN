@@ -1,14 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#if defined(_WIN32)
-#include <sys/stat.h>
-#include <windows.h>
-#else
-#include <sys/time.h>
-#endif
 
 #include "rf_decode.h"
 #include "rf_epoll.h"
@@ -50,7 +42,7 @@ typedef struct {
 
 static void print_usage(const char *exe) {
     printf("Usage: %s [options]\n", exe);
-    printf("  --rf-input <path>         Input stream (default /dev/rf433)\n");
+    printf("  --rf-input -              Replay pulse stream from stdin (default -)\n");
     printf("  --stable-repeat <N>       Need N agreeing frames (default 2)\n");
     printf("  --stable-window <N>       Group memory window in frames (default 12)\n");
     printf("  --stable-near-bits <N>    Hamming-near threshold for merge (default 4)\n");
@@ -163,7 +155,6 @@ static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf,
 static int on_rf_frame(const rf_frame_t *frame, void *user) {
     app_ctx_t *ctx = (app_ctx_t *)user;
     rf_decoded_packet_t pkt;
-    rf_decode_last_call_stats_t call_stats;
     int rc = 0;
 
     if (ctx == NULL || frame == NULL) {
@@ -173,8 +164,6 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
     ctx->frames_total++;
     ctx->frame_seq++;
     rc = rf_decode_frame(frame, &pkt);
-    memset(&call_stats, 0, sizeof(call_stats));
-    rf_decode_get_last_call_stats(&call_stats);
     if (rc != 0) {
         if (rc == RF_DECODE_RC_NO_FRAME) {
             ctx->decode_no_frame++;
@@ -237,14 +226,13 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
     }
 
     printf(
-        "[RF] addr=%s key=%s conf=%.2f source=%s pulses=%u seq=%u decode_us=%llu\n",
+        "[RF] addr=%s key=%s conf=%.2f source=%s pulses=%u seq=%u\n",
         pkt.addr,
         pkt.key,
         pkt.confidence,
         pkt.source,
         frame->len,
-        (unsigned)ctx->frame_seq,
-        call_stats.total_us
+        (unsigned)ctx->frame_seq
     );
     ctx->last_code = pkt.raw_code;
     ctx->has_last_code = 1;
@@ -254,7 +242,7 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
 }
 
 int main(int argc, char **argv) {
-    const char *rf_input = "/dev/rf433";
+    const char *rf_input = "-";
     uint16_t stable_repeat = 2u;
     uint16_t stable_window = 12u;
     uint8_t stable_near_bits = 4u;
@@ -265,7 +253,6 @@ int main(int argc, char **argv) {
     int rf_fd = -1;
     int i = 0;
     rf_epoll_config_t cfg;
-    rf_decode_runtime_stats_t decode_stats;
 
     /* Ensure logs are flushed immediately when rf_gateway is piped by Qt. */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -275,6 +262,10 @@ int main(int argc, char **argv) {
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--rf-input") == 0 && i + 1 < argc) {
             rf_input = argv[++i];
+            if (!(rf_input[0] == '-' && rf_input[1] == '\0')) {
+                fprintf(stderr, "--rf-input only supports '-' in pc_sim replay mode.\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--stable-repeat") == 0 && i + 1 < argc) {
             stable_repeat = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stable-window") == 0 && i + 1 < argc) {
@@ -292,7 +283,7 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 0;
         } else {
-            printf("Unknown arg: %s\n", argv[i]);
+            fprintf(stderr, "Unknown arg: %s\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
@@ -300,7 +291,7 @@ int main(int argc, char **argv) {
 
     rf_fd = rf_source_open(rf_input);
     if (rf_fd < 0) {
-        printf("Open RF input failed: %s\n", rf_input);
+        fprintf(stderr, "Open RF input failed: %s\n", rf_input);
         return 2;
     }
 
@@ -319,38 +310,7 @@ int main(int argc, char **argv) {
     cfg.on_frame = on_rf_frame;
     cfg.user = &ctx;
 
-    printf(
-        "rf_gateway running: rf=%s stable=%u near=%u stable_win=%u preferred=0x%06X pub_conf=%.2f gap=%u\n",
-        rf_input,
-        (unsigned)stable_repeat,
-        (unsigned)ctx.stable_near_bits,
-        (unsigned)ctx.stable_window,
-        (unsigned)ctx.preferred_code,
-        min_publish_conf,
-        (unsigned)publish_gap
-    );
     (void)rf_epoll_run(&cfg);
-
-    printf(
-        "[RF_STATS] frames_total=%u decode_ok=%u decode_no_frame=%u decode_err=%u low_conf_drop=%u stable_drop=%u dup_drop=%u published=%u\n",
-        (unsigned)ctx.frames_total,
-        (unsigned)ctx.decode_ok,
-        (unsigned)ctx.decode_no_frame,
-        (unsigned)ctx.decode_err,
-        (unsigned)ctx.low_conf_drop,
-        (unsigned)ctx.stable_drop,
-        (unsigned)ctx.dup_drop,
-        (unsigned)ctx.published
-    );
-    memset(&decode_stats, 0, sizeof(decode_stats));
-    rf_decode_get_runtime_stats(&decode_stats);
-    printf(
-        "[RF_DECODE_STATS] c_attempts=%u c_accepts=%u c_total_us=%llu c_accept_total_us=%llu\n",
-        decode_stats.c_attempts,
-        decode_stats.c_accepts,
-        decode_stats.c_total_us,
-        decode_stats.c_accept_total_us
-    );
 
     rf_source_close(rf_fd);
     return 0;

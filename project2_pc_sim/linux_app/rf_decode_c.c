@@ -94,8 +94,7 @@ static void build_runs_from_frame(const rf_frame_t *frame, int start_level, rf_r
 static int decode_best_from_runs(
     const rf_run_t *runs,
     uint16_t run_count,
-    rf_decode_result_c_t *best_out,
-    rf_decode_stage_stats_t *stats
+    rf_decode_result_c_t *best_out
 ) {
     const float min_clk = EV1527_SAMPLE_RATE * (EV1527_CLK_MIN_US * 1e-6f / EV1527_PROFILE_CLOCK_DIVISOR);
     const float max_clk = EV1527_SAMPLE_RATE * (EV1527_CLK_MAX_US * 1e-6f / EV1527_PROFILE_CLOCK_DIVISOR);
@@ -194,10 +193,6 @@ static int decode_best_from_runs(
             if ((sync_low / fmaxf(1.0f, (float)max_data_low)) < EV1527_SYNC_LOW_LONGEST_MIN_RATIO) {
                 continue;
             }
-        }
-
-        if (stats != NULL) {
-            stats->step1_structural++;
         }
 
         clk_from_totals = (float)upper_median_u16(totals, EV1527_BITS) / pair_t;
@@ -316,10 +311,6 @@ static int decode_best_from_runs(
             continue;
         }
 
-        if (stats != NULL) {
-            stats->step2_timing++;
-        }
-
         if (
             !found ||
             conf > best_conf ||
@@ -348,19 +339,12 @@ static int decode_best_from_runs(
 }
 
 int rf_decode_ev1527_c(const rf_frame_t *frame, rf_decode_result_c_t *out) {
-    return rf_decode_ev1527_c_with_stats(frame, out, NULL);
-}
-
-int rf_decode_ev1527_c_with_stats(const rf_frame_t *frame, rf_decode_result_c_t *out, rf_decode_stage_stats_t *stats) {
     rf_run_t runs[RF_BUFFER_SIZE];
     uint16_t run_count = 0u;
     rf_decode_result_c_t best;
     int found = 0;
     int phase = 0;
 
-    if (stats != NULL) {
-        memset(stats, 0, sizeof(*stats));
-    }
     if (frame == NULL || out == NULL) {
         return -1;
     }
@@ -376,7 +360,7 @@ int rf_decode_ev1527_c_with_stats(const rf_frame_t *frame, rf_decode_result_c_t 
         memset(&phase_best, 0, sizeof(phase_best));
         phase_best.confidence = -1.0f;
         build_runs_from_frame(frame, phase, runs, &run_count);
-        if (decode_best_from_runs(runs, run_count, &phase_best, stats) != 0) {
+        if (decode_best_from_runs(runs, run_count, &phase_best) != 0) {
             continue;
         }
         if (

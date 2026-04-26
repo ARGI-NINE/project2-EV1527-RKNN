@@ -12,7 +12,7 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setApplicationVersion(QStringLiteral("1.0.0"));
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Qt5 C++ Dashboard for RF Gateway + Vision monitor"));
+    parser.setApplicationDescription(QStringLiteral("Qt5 C++ Dashboard for RF Gateway + WSL vision bridge monitor"));
     parser.addHelpOption();
     parser.addVersionOption();
 
@@ -36,11 +36,6 @@ int main(int argc, char *argv[]) {
         QStringLiteral("factor"),
         QStringLiteral("1.0")
     );
-    QCommandLineOption videoInputOption(
-        QStringLiteral("video-input"),
-        QStringLiteral("Video file path for real vision display (for example test.mp4)."),
-        QStringLiteral("path")
-    );
     QCommandLineOption pythonBinOption(
         QStringLiteral("python-bin"),
         QStringLiteral("Python interpreter path passed to rf_gateway."),
@@ -48,13 +43,13 @@ int main(int argc, char *argv[]) {
     );
     QCommandLineOption visionHostOption(
         QStringLiteral("vision-host"),
-        QStringLiteral("WSL vision bridge host (optional, for RKNN telemetry)."),
+        QStringLiteral("WSL vision bridge host."),
         QStringLiteral("host"),
         QStringLiteral("127.0.0.1")
     );
     QCommandLineOption visionPortOption(
         QStringLiteral("vision-port"),
-        QStringLiteral("WSL vision bridge TCP port (0 disables bridge)."),
+        QStringLiteral("WSL vision bridge TCP port (0 disables the bridge)."),
         QStringLiteral("port"),
         QStringLiteral("0")
     );
@@ -62,7 +57,6 @@ int main(int argc, char *argv[]) {
     parser.addOption(wavInputOption);
     parser.addOption(wavLoopOption);
     parser.addOption(wavSpeedOption);
-    parser.addOption(videoInputOption);
     parser.addOption(pythonBinOption);
     parser.addOption(visionHostOption);
     parser.addOption(visionPortOption);
@@ -74,7 +68,6 @@ int main(int argc, char *argv[]) {
     options.wavPath = parser.value(wavInputOption).trimmed();
     options.wavLoop = parser.isSet(wavLoopOption);
     options.wavSpeed = parser.value(wavSpeedOption).toDouble();
-    options.videoPath = parser.value(videoInputOption).trimmed();
     options.pythonBin = parser.value(pythonBinOption).trimmed();
     options.visionHost = parser.value(visionHostOption).trimmed();
     options.visionPort = parser.value(visionPortOption).toInt();

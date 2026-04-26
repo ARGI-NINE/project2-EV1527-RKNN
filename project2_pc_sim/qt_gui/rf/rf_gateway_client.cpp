@@ -1,16 +1,15 @@
 #include "rf_gateway_client.h"
 
+#include "project_paths.h"
 #include "rf_utils.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
-#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QDebug>
 #include <QRegularExpression>
 
 namespace {
@@ -20,15 +19,7 @@ constexpr int kPrepTimeoutSeconds = kPrepTimeoutMs / 1000;
 constexpr qint64 kMinFirstRfTimeoutMs = 15000;
 constexpr qint64 kFirstRfTimeoutGraceMs = 5000;
 
-QString normalizePathIfExists(const QString &path) {
-    const QFileInfo info(path);
-    if (info.exists() && info.isFile()) {
-        return info.absoluteFilePath();
-    }
-    return QString();
-}
-
-qint64 extractTimingValueLongLong(const QString &line, const QString &key, qint64 fallback = -1) {
+qint64 extractLongLongField(const QString &line, const QString &key, qint64 fallback = -1) {
     static const QRegularExpression re(QStringLiteral("([A-Za-z0-9_]+)=([^\\s]+)"));
     QRegularExpressionMatchIterator it = re.globalMatch(line);
     while (it.hasNext()) {
@@ -80,8 +71,8 @@ void RFGatewayClient::start() {
     ) {
         backend_->updateSerialStatus(false);
         backend_->addLog(
-            "ERROR",
-            "RF",
+            QStringLiteral("ERROR"),
+            QStringLiteral("RF"),
             QStringLiteral("RF pipeline startup failed; check --gateway/--wav-input/--python-bin arguments")
         );
     }
@@ -103,13 +94,14 @@ void RFGatewayClient::startGatewayProcess() {
         return;
     }
 
-    rfScreenshotReadyLogged_ = false;
     lastStartError_.clear();
     firstRfTimeoutMs_ = kMinFirstRfTimeoutMs;
 
     auto failStart = [this](const QString &msg) {
         lastStartError_ = msg;
-        backend_->addLog("ERROR", "RF", msg);
+        if (backend_ != nullptr) {
+            backend_->addLog(QStringLiteral("ERROR"), QStringLiteral("RF"), msg);
+        }
     };
 
     const QString gatewayPath = resolveGatewayPath();
@@ -136,7 +128,9 @@ bool RFGatewayClient::prepareRealtimeTimeline() {
 
     auto failStart = [this](const QString &msg) {
         lastStartError_ = msg;
-        backend_->addLog("ERROR", "RF", msg);
+        if (backend_ != nullptr) {
+            backend_->addLog(QStringLiteral("ERROR"), QStringLiteral("RF"), msg);
+        }
     };
 
     const QString wavPath = resolveWavInputPath();
@@ -192,35 +186,6 @@ bool RFGatewayClient::prepareRealtimeTimeline() {
         wavToPulses,
         QStringLiteral("--wav"),
         wavPath,
-        QStringLiteral("--mode"),
-        QStringLiteral("timeline"),
-        // Use a tolerant extraction profile for PC replay so RF events are preserved.
-        QStringLiteral("--sync-us"),
-        QStringLiteral("8000"),
-        QStringLiteral("--min-frame-pulses"),
-        QStringLiteral("50"),
-        QStringLiteral("--smooth-window"),
-        QStringLiteral("2"),
-        QStringLiteral("--min-run-samples"),
-        QStringLiteral("0"),
-        QStringLiteral("--min-pulse-us"),
-        QStringLiteral("80"),
-        QStringLiteral("--max-pulse-us"),
-        QStringLiteral("65535"),
-        QStringLiteral("--hw-prefilter"),
-        QStringLiteral("--fixed-frame-pulses"),
-        QStringLiteral("50"),
-        QStringLiteral("--fixed-pulses-tolerance"),
-        QStringLiteral("0"),
-        QStringLiteral("--require-first-low-longest"),
-        QStringLiteral("--selector"),
-        QStringLiteral("decode"),
-        QStringLiteral("--decoder-min-frame-confidence"),
-        QStringLiteral("0.20"),
-        QStringLiteral("--decoder-min-occurrences"),
-        QStringLiteral("1"),
-        QStringLiteral("--decoder-min-burst-occurrences"),
-        QStringLiteral("1"),
         QStringLiteral("--max-frames"),
         QStringLiteral("0"),
         QStringLiteral("--out-txt"),
@@ -240,14 +205,12 @@ bool RFGatewayClient::prepareRealtimeTimeline() {
         return false;
     }
 
-    prepStartedAtMs_ = QDateTime::currentMSecsSinceEpoch();
     prepTimeoutTimer_.start(kPrepTimeoutMs);
     backend_->addLog(
-        "INFO",
-        "RF",
+        QStringLiteral("INFO"),
+        QStringLiteral("RF"),
         QString("WAV preprocessing (full duration): %1").arg(wavPath)
     );
-
     return true;
 }
 
@@ -258,7 +221,9 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
 
     auto failStart = [this](const QString &msg) {
         lastStartError_ = msg;
-        backend_->addLog("ERROR", "RF", msg);
+        if (backend_ != nullptr) {
+            backend_->addLog(QStringLiteral("ERROR"), QStringLiteral("RF"), msg);
+        }
     };
 
     const QString replayScript = resolveTimelineReplayPath();
@@ -354,7 +319,6 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
         return;
     }
 
-    replayStartedAtMs_ = QDateTime::currentMSecsSinceEpoch();
     lastStartError_.clear();
     awaitingFirstRf_ = true;
     firstRfTimeoutMs_ = computeFirstRfTimeoutMs();
@@ -362,8 +326,8 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
 
     backend_->updateSerialStatus(true, QStringLiteral("proc://rf_gateway/stdin"));
     backend_->addLog(
-        "INFO",
-        "RF",
+        QStringLiteral("INFO"),
+        QStringLiteral("RF"),
         QString("Starting realtime WAV replay: frames=%1 speed=%2 loop=%3 first_event_timeout_ms=%4")
             .arg(timelineFrameCount_)
             .arg(QString::number(options_.wavSpeed <= 0.0 ? 1.0 : options_.wavSpeed, 'f', 3))
@@ -371,8 +335,8 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
             .arg(firstRfTimeoutMs_)
     );
     backend_->addLog(
-        "INFO",
-        "RF",
+        QStringLiteral("INFO"),
+        QStringLiteral("RF"),
         QString("Starting rf_gateway: %1 %2").arg(gatewayPath, gatewayArgs.join(' '))
     );
 }
@@ -381,10 +345,7 @@ void RFGatewayClient::stopGatewayProcess() {
     prepTimeoutTimer_.stop();
     firstRfTimer_.stop();
     awaitingFirstRf_ = false;
-    rfScreenshotReadyLogged_ = false;
     pendingGatewayPath_.clear();
-    prepStartedAtMs_ = -1;
-    replayStartedAtMs_ = -1;
     firstRfTimeoutMs_ = kMinFirstRfTimeoutMs;
 
     if (prepProcess_.state() != QProcess::NotRunning) {
@@ -447,8 +408,8 @@ void RFGatewayClient::onGatewayFinished(int exitCode, QProcess::ExitStatus exitS
 
     backend_->updateSerialStatus(false);
     backend_->addLog(
-        "WARN",
-        "RF",
+        QStringLiteral("WARN"),
+        QStringLiteral("RF"),
         QString("rf_gateway exited: code=%1 status=%2")
             .arg(exitCode)
             .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal") : QStringLiteral("crash"))
@@ -469,15 +430,6 @@ void RFGatewayClient::onReplayStdout() {
     while (totalWritten < chunk.size()) {
         const qint64 wrote = gatewayProcess_.write(chunk.constData() + totalWritten, chunk.size() - totalWritten);
         if (wrote <= 0) {
-            if (backend_ != nullptr) {
-                backend_->addLog(
-                    "WARN",
-                    "RF",
-                    QString("Failed to write replay data into gateway: wrote=%1 pending=%2")
-                        .arg(wrote)
-                        .arg(gatewayProcess_.bytesToWrite())
-                );
-            }
             if (!gatewayProcess_.waitForBytesWritten(1000)) {
                 break;
             }
@@ -488,35 +440,26 @@ void RFGatewayClient::onReplayStdout() {
 }
 
 void RFGatewayClient::onReplayFinished(int exitCode, QProcess::ExitStatus exitStatus) {
-    if (backend_ == nullptr) {
-        return;
-    }
-
     if (gatewayProcess_.state() == QProcess::Running) {
         gatewayProcess_.closeWriteChannel();
     }
-
-    backend_->addLog(
-        "INFO",
-        "RF",
-        QString("WAV replay process finished: code=%1 status=%2")
-            .arg(exitCode)
-            .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal") : QStringLiteral("crash"))
-    );
+    if (backend_ != nullptr) {
+        backend_->addLog(
+            QStringLiteral("INFO"),
+            QStringLiteral("RF"),
+            QString("WAV replay process finished: code=%1 status=%2")
+                .arg(exitCode)
+                .arg(exitStatus == QProcess::NormalExit ? QStringLiteral("normal") : QStringLiteral("crash"))
+        );
+    }
 }
 
 void RFGatewayClient::onPrepStdout() {
-    if (backend_ == nullptr) {
-        return;
-    }
     const QByteArray chunk = prepProcess_.readAllStandardOutput();
     drainBuffer(&prepStdoutBuffer_, chunk, QStringLiteral("PREP"));
 }
 
 void RFGatewayClient::onPrepStderr() {
-    if (backend_ == nullptr) {
-        return;
-    }
     const QByteArray chunk = prepProcess_.readAllStandardError();
     drainBuffer(&prepStderrBuffer_, chunk, QStringLiteral("PREP_ERR"));
 }
@@ -536,7 +479,7 @@ void RFGatewayClient::onPrepFinished(int exitCode, QProcess::ExitStatus exitStat
 
     auto failStart = [this](const QString &msg) {
         lastStartError_ = msg;
-        backend_->addLog("ERROR", "RF", msg);
+        backend_->addLog(QStringLiteral("ERROR"), QStringLiteral("RF"), msg);
         backend_->updateSerialStatus(false);
         pendingGatewayPath_.clear();
     };
@@ -567,23 +510,11 @@ void RFGatewayClient::onPrepFinished(int exitCode, QProcess::ExitStatus exitStat
         return;
     }
     const qint64 prepFinishedAtMs = QDateTime::currentMSecsSinceEpoch();
-    qint64 prepDurationMs = -1;
-    if (prepStartedAtMs_ > 0 && prepFinishedAtMs >= prepStartedAtMs_) {
-        prepDurationMs = prepFinishedAtMs - prepStartedAtMs_;
-        const QString timingLine =
-            QString("RF_TIMING stage=wav_preprocess duration_ms=%1 frames=%2")
-                .arg(prepDurationMs)
-                .arg(timelineFrameCount_);
-        backend_->addLog(
-            "INFO",
-            "RF",
-            timingLine
-        );
-    }
+    (void)prepFinishedAtMs;
     backend_->addLog(
-        "INFO",
-        "RF",
-        QString("WAV timeline prepared: frames=%1").arg(QString::number(timelineFrameCount_))
+        QStringLiteral("INFO"),
+        QStringLiteral("RF"),
+        QString("WAV timeline prepared: frames=%1").arg(timelineFrameCount_)
     );
 
     const QString gatewayPath = pendingGatewayPath_;
@@ -606,7 +537,7 @@ void RFGatewayClient::onPrepTimeout() {
     prepProcess_.kill();
     (void)prepProcess_.waitForFinished(1000);
     lastStartError_ = QString("WAV preprocessing timed out (%1s)").arg(kPrepTimeoutSeconds);
-    backend_->addLog("ERROR", "RF", lastStartError_);
+    backend_->addLog(QStringLiteral("ERROR"), QStringLiteral("RF"), lastStartError_);
     backend_->updateSerialStatus(false);
     firstRfTimer_.stop();
     awaitingFirstRf_ = false;
@@ -619,19 +550,10 @@ void RFGatewayClient::onFirstRfTimeout() {
     }
 
     awaitingFirstRf_ = false;
-    const QString gatewayState = QString::number(static_cast<int>(gatewayProcess_.state()));
-    const QString replayState = QString::number(static_cast<int>(replayProcess_.state()));
     backend_->addLog(
-        "WARN",
-        "RF",
-        QString("Timed out waiting first RF event (%1 ms): gatewayState=%2 replayState=%3")
-            .arg(firstRfTimeoutMs_)
-            .arg(gatewayState, replayState)
-    );
-    backend_->addLog(
-        "WARN",
-        "RF",
-        QStringLiteral("Check AA55 pulse stream input and WAV extraction thresholds")
+        QStringLiteral("WARN"),
+        QStringLiteral("RF"),
+        QString("Timed out waiting first RF event (%1 ms)").arg(firstRfTimeoutMs_)
     );
 }
 
@@ -674,6 +596,8 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
             text.contains(QStringLiteral("decode_failed"), Qt::CaseInsensitive)
         )
     ) {
+        backend_->incrementParseError();
+        backend_->addLog(QStringLiteral("WARN"), QStringLiteral("RF"), text);
         return;
     }
 
@@ -691,7 +615,6 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
         }
     }
 
-    QString enrichedText = text;
     RFEvent event;
     if (parseRfLine(text, &event)) {
         if (awaitingFirstRf_) {
@@ -699,30 +622,28 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
             firstRfTimer_.stop();
         }
 
-        event.frameSeq = extractTimingValueLongLong(text, QStringLiteral("seq"), -1);
+        event.frameSeq = extractLongLongField(text, QStringLiteral("seq"), -1);
         if (event.frameSeq > 0) {
             const int idx = static_cast<int>(event.frameSeq);
             if (replayWavSecByIdx_.contains(idx)) {
                 event.candidateWavSec = replayWavSecByIdx_.value(idx, -1.0);
             }
         }
-        event.decodeUs = extractTimingValueLongLong(text, QStringLiteral("decode_us"), -1);
 
         const uint32_t rawCode = parseRawCode(event.address);
 
         backend_->addRFEvent(event);
         backend_->updateWaveform(buildWaveformFromRawCode(rawCode));
-        backend_->addLog("INFO", "RF", enrichedText);
+        backend_->addLog(QStringLiteral("INFO"), QStringLiteral("RF"), text);
 
         QJsonObject payloadObj;
         payloadObj.insert(QStringLiteral("addr"), event.address);
         payloadObj.insert(QStringLiteral("key"), event.key);
         payloadObj.insert(QStringLiteral("conf"), event.confidence);
         payloadObj.insert(QStringLiteral("src"), event.source);
-        if (event.decodeUs >= 0) {
-            payloadObj.insert(QStringLiteral("decode_us"), event.decodeUs);
+        if (event.candidateWavSec >= 0.0) {
+            payloadObj.insert(QStringLiteral("wav_sec"), event.candidateWavSec);
         }
-
         backend_->addMqttPublishLog(
             QStringLiteral("home/rf433/report"),
             QString::fromUtf8(QJsonDocument(payloadObj).toJson(QJsonDocument::Compact))
@@ -733,6 +654,9 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
     if (text.contains(QStringLiteral("crc"), Qt::CaseInsensitive)) {
         backend_->incrementCrcError();
     }
+    if (text.contains(QStringLiteral("parse"), Qt::CaseInsensitive)) {
+        backend_->incrementParseError();
+    }
     if (text.contains(QStringLiteral("drop"), Qt::CaseInsensitive)) {
         backend_->incrementDrop();
     }
@@ -741,7 +665,7 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
         (source == QStringLiteral("GATEWAY_ERR") || source == QStringLiteral("REPLAY_ERR"))
             ? QStringLiteral("WARN")
             : QStringLiteral("INFO");
-    backend_->addLog(level, source, enrichedText);
+    backend_->addLog(level, QStringLiteral("RF"), text);
 }
 
 bool RFGatewayClient::parseRfLine(const QString &line, RFEvent *event) const {
@@ -840,25 +764,23 @@ qint64 RFGatewayClient::computeFirstRfTimeoutMs() const {
 }
 
 QString RFGatewayClient::resolvePythonBin() const {
-    return normalizePathIfExists(options_.pythonBin.trimmed());
+    return resolveInputFilePath(options_.pythonBin.trimmed());
 }
 
 QString RFGatewayClient::resolveGatewayPath() const {
-    return normalizePathIfExists(options_.gatewayPath.trimmed());
+    return resolveInputFilePath(options_.gatewayPath.trimmed());
 }
 
 QString RFGatewayClient::resolveWavInputPath() const {
-    return normalizePathIfExists(options_.wavPath.trimmed());
+    return resolveInputFilePath(options_.wavPath.trimmed());
 }
 
 QString RFGatewayClient::resolveWavToPulsesPath() const {
-    const QString appDir = QCoreApplication::applicationDirPath();
-    return normalizePathIfExists(QDir(appDir).filePath(QStringLiteral("../../python/wav_to_pulses.py")));
+    return resolveProjectFilePath(QStringLiteral("python/wav_to_pulses.py"));
 }
 
 QString RFGatewayClient::resolveTimelineReplayPath() const {
-    const QString appDir = QCoreApplication::applicationDirPath();
-    return normalizePathIfExists(QDir(appDir).filePath(QStringLiteral("../../python/replay_pulse_timeline.py")));
+    return resolveProjectFilePath(QStringLiteral("python/replay_pulse_timeline.py"));
 }
 
 }  // namespace dashboard

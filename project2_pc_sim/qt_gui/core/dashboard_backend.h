@@ -15,15 +15,17 @@ public:
     void addRFEvent(const RFEvent &event);
     void updateWaveform(const QVector<int> &pulses);
     void incrementCrcError();
+    void incrementParseError();
+    void updateProtocolStats(int crcErrors, int parseErrors, int driverDropFrames);
     void incrementDrop();
 
     void updateVisionState(const VisionSnapshot &snapshot);
     void setVisionOffline(const QString &message);
+    qint64 uptimeSec() const;
 
     void addLog(const QString &level, const QString &source, const QString &message);
     void addMqttPublishLog(const QString &topic, const QString &payload);
     void clearLogs();
-
     RFSnapshot snapshotRF() const;
     VisionSnapshot snapshotVisionState() const;
     QVector<LogEntry> queryLogs(const QString &sourceFilter, int limit) const;
@@ -41,6 +43,8 @@ private:
     QVector<LogEntry> logs_;
 
     int crcErrors_ = 0;
+    int parseErrors_ = 0;
+    int driverDropFrames_ = 0;
     int frameCount_ = 0;
     int dropCount_ = 0;
     int mqttLogCount_ = 0;

@@ -33,7 +33,6 @@ private:
     QLabel *addrLabel_ = nullptr;
     QLabel *candidateWavLabel_ = nullptr;
     QLabel *confidenceLabel_ = nullptr;
-    QLabel *decodeTimeLabel_ = nullptr;
     QTableWidget *historyTable_ = nullptr;
     QTimer refreshTimer_;
     QTimer historySelectionTimer_;

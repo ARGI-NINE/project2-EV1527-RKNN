@@ -1,0 +1,267 @@
+# PC Sim Toolchain
+
+## Scope
+
+This document is the current toolchain and runtime inventory for `project2_pc_sim` only.
+
+Only two chains are retained:
+
+1. RF: `WAV -> python/wav_to_pulses.py -> python/replay_pulse_timeline.py -> linux_app/rf_gateway -> Windows Qt RF page`
+2. Vision: `WSL-side source/model processing -> python/wsl_vision_bridge_server.py --source <wsl_source> -> TCP bridge -> Windows Qt Vision page`
+
+The Windows Qt app does not open any local MP4 or local camera path.
+
+## Workspace And Assets
+
+Project root:
+
+- `D:\project\repos\project2\project2_pc_sim`
+
+Pinned external assets already established for the current simulator:
+
+- RF input WAV: `D:\project\repos\project2\capture03.wav`
+- Vision model: `D:\project\repos\project2\yolov5s.onnx`
+
+Project-local runtime inputs and code:
+
+- RF stage-1 extractor: `python\wav_to_pulses.py`
+- RF timed replay: `python\replay_pulse_timeline.py`
+- WSL vision bridge entry: `python\wsl_vision_bridge_server.py`
+- RF truth/decode support: `ev1527_decode.py`
+
+## Host / Environment Split
+
+### Windows host
+
+Responsibilities:
+
+- configure and build `rf_gateway` and `rf_dashboard_qt5`
+- run the Qt dashboard
+- run the Windows Python used by the RF chain
+- provide WAV and model file locations visible from Windows
+
+Known locations:
+
+- Windows Python: `D:\project\repos\project2\project2_pc_sim\.venv\Scripts\python.exe`
+- CMake: `C:\Program Files\CMake\bin\cmake.exe`
+- C compiler: `D:/qt/Tools/mingw730_64/bin/gcc.exe`
+- C++ compiler: `D:/qt/Tools/mingw730_64/bin/g++.exe`
+
+### WSL side
+
+Responsibilities:
+
+- activate the RKNN-capable conda environment
+- resolve the explicit vision `--source`
+- run `python/wsl_vision_bridge_server.py`
+- perform model inference / overlay packaging before sending frames to Windows Qt
+
+Known location:
+
+- WSL conda env: `/home/mctupubuser/miniconda3/envs/rknn`
+
+Expected bridge-side Python:
+
+- `/home/mctupubuser/miniconda3/envs/rknn/bin/python`
+
+## Build Toolchain
+
+The following Windows build settings were previously validated on this machine:
+
+- build directory: `D:\project\repos\project2\project2_pc_sim\build`
+- generator: `MinGW Makefiles`
+- build type: `Release`
+- CMake: `C:\Program Files\CMake\bin\cmake.exe`
+- make program: `D:/qt/Tools/mingw730_64/bin/mingw32-make.exe`
+- C compiler: `D:/qt/Tools/mingw730_64/bin/gcc.exe`
+- C++ compiler: `D:/qt/Tools/mingw730_64/bin/g++.exe`
+- `CMAKE_PREFIX_PATH`: `D:/qt/5.12.9/mingw73_64`
+- `Qt5_DIR`: `D:/qt/5.12.9/mingw73_64/lib/cmake/Qt5`
+
+These values were previously observed in `build/CMakeCache.txt` before the normal `build` directory was deleted for cleanup.
+
+Top-level CMake options from `CMakeLists.txt` and the validated cache:
+
+- `BUILD_LINUX_APP=ON`
+- `BUILD_QT5_GUI=ON`
+
+Produced targets from the current repo:
+
+- `linux_app/rf_gateway`
+- `qt_gui/rf_dashboard_qt5`
+
+Qt note from `qt_gui/CMakeLists.txt`:
+
+- `Qt5` is required with components `Core`, `Gui`, `Widgets`, and `Network`
+- the validated working Qt root on this machine is `D:/qt/5.12.9/mingw73_64`
+
+Example Windows configure command:
+
+```powershell
+& 'C:\Program Files\CMake\bin\cmake.exe' `
+  -S D:\project\repos\project2\project2_pc_sim `
+  -B D:\project\repos\project2\project2_pc_sim\build `
+  -G "MinGW Makefiles" `
+  -DCMAKE_C_COMPILER=D:/qt/Tools/mingw730_64/bin/gcc.exe `
+  -DCMAKE_CXX_COMPILER=D:/qt/Tools/mingw730_64/bin/g++.exe `
+  -DBUILD_LINUX_APP=ON `
+  -DBUILD_QT5_GUI=ON `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH=D:/qt/5.12.9/mingw73_64
+```
+
+Example Windows build command:
+
+```powershell
+& 'C:\Program Files\CMake\bin\cmake.exe' --build D:\project\repos\project2\project2_pc_sim\build --config Release --parallel 4 --target rf_gateway rf_dashboard_qt5
+```
+
+## Produced Binaries
+
+After re-running the configure and build commands above, the normal build outputs will appear at:
+
+- `D:\project\repos\project2\project2_pc_sim\build\linux_app\rf_gateway.exe`
+- `D:\project\repos\project2\project2_pc_sim\build\qt_gui\rf_dashboard_qt5.exe`
+
+Target names in source:
+
+- RF gateway binary target: `rf_gateway`
+- Qt dashboard binary target: `rf_dashboard_qt5`
+
+## Runtime Chain Commands
+
+### 1. WSL vision bridge
+
+The retained bridge chain requires explicit `--source <wsl_source>`.
+The validated split on this machine is:
+
+- WSL uses `/home/mctupubuser/miniconda3/envs/rknn/bin/python`
+- Windows Qt uses `D:\project\repos\project2\project2_pc_sim\.venv\Scripts\python.exe`
+
+Example WSL launch using the established conda env:
+
+```bash
+source /home/mctupubuser/miniconda3/etc/profile.d/conda.sh
+conda activate rknn
+cd /mnt/d/project/repos/project2/project2_pc_sim
+/home/mctupubuser/miniconda3/envs/rknn/bin/python python/wsl_vision_bridge_server.py \
+  --host 127.0.0.1 \
+  --port 17655 \
+  --source /mnt/d/project/repos/project2/test.mp4
+```
+
+The exact surviving bridge command validated in live runtime was:
+
+```bash
+cd /mnt/d/project/repos/project2/project2_pc_sim
+/home/mctupubuser/miniconda3/envs/rknn/bin/python python/wsl_vision_bridge_server.py \
+  --host 127.0.0.1 \
+  --port 17655 \
+  --source /mnt/d/project/repos/project2/test.mp4
+```
+
+Bridge CLI from current code:
+
+- `--host` default: `127.0.0.1`
+- `--port` default: `17655`
+- `--model` optional; current code falls back to `../yolov5s.onnx` if omitted
+- `--source` required; may be an explicit WSL path, translated Windows path, or a camera index string
+
+### 2. Windows Qt dashboard
+
+Before launching `rf_dashboard_qt5.exe` from a shell, the Qt and MinGW runtime DLL directories must be on `PATH`:
+
+```powershell
+$env:PATH = 'D:\qt\5.12.9\mingw73_64\bin;D:\qt\Tools\mingw730_64\bin;' + $env:PATH
+```
+
+Example Windows launch:
+
+```powershell
+& D:\project\repos\project2\project2_pc_sim\build\qt_gui\rf_dashboard_qt5.exe `
+  --gateway D:\project\repos\project2\project2_pc_sim\build\linux_app\rf_gateway.exe `
+  --wav-input D:\project\repos\project2\capture03.wav `
+  --python-bin D:\project\repos\project2\project2_pc_sim\.venv\Scripts\python.exe `
+  --vision-host 127.0.0.1 `
+  --vision-port 17655
+```
+
+The restored Qt frontend now has three pages:
+
+- `RF Status`
+- `Vision`
+- `System Log`
+
+Optional RF playback flags exposed by Qt:
+
+- `--wav-loop`
+- `--wav-speed <factor>`
+
+Qt dashboard flags from current code:
+
+- `--gateway <path>`
+- `--wav-input <path>`
+- `--wav-loop`
+- `--wav-speed <factor>`
+- `--python-bin <path>`
+- `--vision-host <host>`
+- `--vision-port <port>`
+
+### 3. RF internal runtime shape
+
+The retained RF chain is orchestrated by the Qt process:
+
+1. Qt starts `python\wav_to_pulses.py`
+2. Qt writes `%TEMP%\project2_pc_sim_runtime\pulse_runtime.txt`
+3. Qt writes `%TEMP%\project2_pc_sim_runtime\pulse_runtime.json`
+4. Qt starts `rf_gateway.exe --rf-input - --stable-repeat 1 --min-publish-confidence 0.92`
+5. Qt starts `python\replay_pulse_timeline.py`
+6. replay sends timed AA55 frames to `rf_gateway` through stdin
+7. `rf_gateway` emits decoded RF events consumed by the Qt RF page
+
+The current Qt-side Stage-1 preprocessing invocation is:
+
+```text
+python\wav_to_pulses.py --wav <wavPath> --max-frames 0 --out-txt <pulse_runtime.txt> --out-json <pulse_runtime.json>
+```
+
+The current Qt-side replay invocation is:
+
+```text
+python\replay_pulse_timeline.py --pulse-json <pulse_runtime.json> --speed <wav_speed> [--loop]
+```
+
+The replay metadata Qt still consumes is:
+
+- `FRAME_TS`
+- `FRAME_META idx=<n> wav_sec=<t>`
+
+Functional RF metadata retained in Qt:
+
+- candidate replay time / `wav_sec`
+- decoded `addr`
+- decoded `key`
+- `confidence`
+
+This `wav_sec` metadata is retained RF replay metadata. It is not standalone profiling residue.
+
+## Tool / Component Ownership Map
+
+| Tool / component | Primary files |
+|---|---|
+| Top-level build entry | `CMakeLists.txt` |
+| RF gateway target | `linux_app/CMakeLists.txt`, `linux_app/main.c`, `linux_app/rf_decode.c`, `linux_app/rf_decode_c.c`, `linux_app/rf_epoll.c`, `linux_app/rf_source.c`, `common/rf_protocol.c` |
+| Qt dashboard target | `qt_gui/CMakeLists.txt`, `qt_gui/app/main.cpp`, `qt_gui/app/main_window.cpp`, `qt_gui/core/dashboard_backend.cpp` |
+| Qt RF page | `qt_gui/rf/rf_gateway_client.cpp`, `qt_gui/rf/rf_status_page.cpp`, `qt_gui/core/rf_utils.cpp`, `qt_gui/widgets/waveform_widget.cpp` |
+| Qt Vision page | `qt_gui/vision/vision_page.cpp` |
+| Qt System Log page | `qt_gui/log/system_log_page.cpp`, `qt_gui/core/dashboard_backend.cpp` |
+| RF stage-1 preprocessing | `python/wav_to_pulses.py`, `ev1527_decode.py` |
+| RF timed replay | `python/replay_pulse_timeline.py` |
+| WSL bridge server | `python/wsl_vision_bridge_server.py` |
+| WSL vision runtime | `vision/rknn_pipeline.py`, `vision/yolov5_postprocess.py` |
+
+## Current Boundaries
+
+- Only the two retained chains above belong to the current simulator.
+- No direct Qt-side MP4/local-video path belongs to the current simulator.
+- No verification artifact bundles belong to the retained simulator flow.

@@ -10,7 +10,7 @@ add_library(
 target_link_libraries(rf_gateway_core PUBLIC rf_common)
 
 target_include_directories(rf_common PUBLIC ../common)
-target_include_directories(rf_gateway_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../common)
+target_include_directories(rf_gateway_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../common ../linux_driver)
 
 add_executable(
   rf_gateway

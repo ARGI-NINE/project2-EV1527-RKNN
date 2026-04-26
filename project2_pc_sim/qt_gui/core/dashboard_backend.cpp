@@ -57,6 +57,24 @@ void DashboardBackend::incrementCrcError() {
     ++crcErrors_;
 }
 
+void DashboardBackend::incrementParseError() {
+    QMutexLocker locker(&mutex_);
+    ++parseErrors_;
+}
+
+void DashboardBackend::updateProtocolStats(int crcErrors, int parseErrors, int driverDropFrames) {
+    QMutexLocker locker(&mutex_);
+    if (crcErrors >= 0) {
+        crcErrors_ = crcErrors;
+    }
+    if (parseErrors >= 0) {
+        parseErrors_ = parseErrors;
+    }
+    if (driverDropFrames >= 0) {
+        driverDropFrames_ = driverDropFrames;
+    }
+}
+
 void DashboardBackend::incrementDrop() {
     QMutexLocker locker(&mutex_);
     ++dropCount_;
@@ -65,15 +83,21 @@ void DashboardBackend::incrementDrop() {
 void DashboardBackend::updateVisionState(const VisionSnapshot &snapshot) {
     QMutexLocker locker(&mutex_);
     visionSnapshot_ = snapshot;
+    visionSnapshot_.statusReported = true;
 }
 
 void DashboardBackend::setVisionOffline(const QString &message) {
     QMutexLocker locker(&mutex_);
     VisionSnapshot snapshot;
+    snapshot.statusReported = false;
     snapshot.cameraOnline = false;
     snapshot.modelLoaded = false;
     snapshot.errorMsg = message;
     visionSnapshot_ = snapshot;
+}
+
+qint64 DashboardBackend::uptimeSec() const {
+    return startTimer_.elapsed() / 1000;
 }
 
 void DashboardBackend::addLog(const QString &level, const QString &source, const QString &message) {
@@ -88,13 +112,13 @@ void DashboardBackend::addLog(const QString &level, const QString &source, const
     if (logs_.size() > kMaxLogs) {
         logs_.remove(0, logs_.size() - kMaxLogs);
     }
-    if (source == "MQTT") {
+    if (source == QStringLiteral("MQTT")) {
         ++mqttLogCount_;
     }
 }
 
 void DashboardBackend::addMqttPublishLog(const QString &topic, const QString &payload) {
-    addLog("INFO", "MQTT", QString("PUB %1: %2").arg(topic, payload));
+    addLog(QStringLiteral("INFO"), QStringLiteral("MQTT"), QString("PUB %1: %2").arg(topic, payload));
 }
 
 void DashboardBackend::clearLogs() {
@@ -113,6 +137,8 @@ RFSnapshot DashboardBackend::snapshotRF() const {
     snapshot.lastDecode = lastDecode_;
     snapshot.waveform = waveform_;
     snapshot.crcErrors = crcErrors_;
+    snapshot.parseErrors = parseErrors_;
+    snapshot.driverDropFrames = driverDropFrames_;
     snapshot.frameCount = frameCount_;
     snapshot.dropCount = dropCount_;
 

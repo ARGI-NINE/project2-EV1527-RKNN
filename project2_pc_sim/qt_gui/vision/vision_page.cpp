@@ -1,10 +1,6 @@
-﻿#include "vision_page.h"
+#include "vision_page.h"
 
-#include <QCoreApplication>
 #include <QDateTime>
-#include <QDebug>
-#include <QDir>
-#include <QFileInfo>
 #include <QFont>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -12,8 +8,6 @@
 #include <QJsonDocument>
 #include <QNetworkProxy>
 #include <QPainter>
-#include <QStackedLayout>
-#include <QUrl>
 #include <QVBoxLayout>
 
 namespace dashboard {
@@ -154,35 +148,7 @@ VisionPage::VisionPage(DashboardBackend *backend, const AppOptions &options, QWi
       backend_(backend),
       options_(options) {
     setupUi();
-
-    QObject::connect(player_, &QMediaPlayer::positionChanged, this, [this](qint64 pos) {
-        if (pos != lastPositionMs_) {
-            lastPositionMs_ = pos;
-            ++frameCount_;
-            ++fpsWindowFrames_;
-        }
-    });
-    QObject::connect(player_, &QMediaPlayer::mediaStatusChanged, this, [this](QMediaPlayer::MediaStatus status) {
-        if (status == QMediaPlayer::EndOfMedia) {
-            player_->setPosition(0);
-            player_->play();
-        }
-    });
-    QObject::connect(
-        player_,
-        QOverload<QMediaPlayer::Error>::of(&QMediaPlayer::error),
-        this,
-        [this](QMediaPlayer::Error) {
-            errorText_ = player_->errorString();
-            if (backend_ != nullptr && !errorText_.isEmpty()) {
-                backend_->addLog("ERROR", "VISION", errorText_);
-            }
-        }
-    );
-
-    setupVideoInput();
     setupVisionBridge();
-    fpsTimer_.start();
     QObject::connect(&timer_, &QTimer::timeout, this, [this]() { refresh(); });
     timer_.start(33);
 }
@@ -192,32 +158,17 @@ void VisionPage::setupUi() {
 
     auto *videoGroup = new QGroupBox(QStringLiteral("Video"), this);
     auto *videoLayout = new QVBoxLayout(videoGroup);
-    auto *videoContainer = new QWidget(videoGroup);
-    videoStack_ = new QStackedLayout(videoContainer);
-
-    videoWidget_ = new QVideoWidget(videoContainer);
-    videoWidget_->setMinimumSize(640, 420);
-    overlayWidget_ = new DetectionOverlayWidget(videoContainer);
+    overlayWidget_ = new DetectionOverlayWidget(videoGroup);
     overlayWidget_->setMinimumSize(640, 420);
-
-    videoStack_->addWidget(videoWidget_);
-    videoStack_->addWidget(overlayWidget_);
-    videoStack_->setStackingMode(QStackedLayout::StackAll);
-    videoStack_->setCurrentWidget(videoWidget_);
-
-    videoLayout->addWidget(videoContainer);
+    videoLayout->addWidget(overlayWidget_);
     layout->addWidget(videoGroup, 3);
-
-    player_ = new QMediaPlayer(this);
-    player_->setVideoOutput(videoWidget_);
-    player_->setNotifyInterval(60);
 
     auto *rightLayout = new QVBoxLayout();
 
     auto *statusGroup = new QGroupBox(QStringLiteral("Status"), this);
     auto *statusLayout = new QVBoxLayout(statusGroup);
 
-    fpsLabel_ = new QLabel(QStringLiteral("FPS: 0.0"), statusGroup);
+    fpsLabel_ = new QLabel(QStringLiteral("Infer FPS: 0.0"), statusGroup);
     fpsLabel_->setFont(QFont("Consolas", 24, QFont::Bold));
     fpsLabel_->setAlignment(Qt::AlignCenter);
 
@@ -245,50 +196,24 @@ void VisionPage::setupUi() {
     layout->addLayout(rightLayout, 1);
 }
 
-void VisionPage::setupVideoInput() {
-    activeVideoPath_ = resolveVideoPath();
-    if (options_.visionPort > 0) {
-        if (backend_ != nullptr) {
-            if (!activeVideoPath_.isEmpty()) {
-                backend_->addLog("INFO", "VISION", QString("Video input resolved: %1").arg(activeVideoPath_));
-            }
-            backend_->addLog(
-                "INFO",
-                "VISION",
-                QStringLiteral("Bridge frame display mode enabled: Qt will display WSL boxed frames only")
-            );
-        }
-        return;
-    }
-
-    if (activeVideoPath_.isEmpty()) {
-        errorText_ = QStringLiteral("Video input file not found (pass --video-input).");
-        if (backend_ != nullptr) {
-            backend_->setVisionOffline(errorText_);
-            backend_->addLog("ERROR", "VISION", errorText_);
-        }
-        return;
-    }
-
-    player_->setMedia(QUrl::fromLocalFile(activeVideoPath_));
-    player_->play();
-    if (backend_ != nullptr) {
-        backend_->addLog("INFO", "VISION", QString("Video input loaded: %1").arg(activeVideoPath_));
-    }
-}
-
 void VisionPage::setupVisionBridge() {
     if (options_.visionPort <= 0) {
+        errorText_ = QStringLiteral("WSL vision bridge disabled");
+        if (backend_ != nullptr) {
+            backend_->setVisionOffline(errorText_);
+            backend_->addLog(QStringLiteral("WARN"), QStringLiteral("VISION"), errorText_);
+        }
+        refresh();
         return;
     }
 
     QString normalizeReason;
     const QString configuredHost = options_.visionHost.trimmed();
     visionBridgeHost_ = normalizedVisionBridgeHost(configuredHost, &normalizeReason);
+    Q_UNUSED(normalizeReason);
     visionBridgePort_ = static_cast<quint16>(options_.visionPort);
 
     visionSocket_ = new QTcpSocket(this);
-    // Force direct TCP path for local/WSL bridge; system HTTP proxies can break raw socket connects.
     visionSocket_->setProxy(QNetworkProxy::NoProxy);
     QObject::connect(visionSocket_, &QTcpSocket::readyRead, this, [this]() { onVisionBridgeReadyRead(); });
     QObject::connect(
@@ -306,20 +231,13 @@ void VisionPage::setupVisionBridge() {
 
     visionReconnectTimer_.setInterval(2000);
     QObject::connect(&visionReconnectTimer_, &QTimer::timeout, this, [this]() { attemptVisionBridgeConnect(); });
-
+    visionReconnectTimer_.start();
     if (backend_ != nullptr) {
         backend_->addLog(
-            "INFO",
-            "VISION",
-            QString("WSL vision bridge enabled: %1:%2 (configured=%3, normalize=%4)")
-                .arg(visionBridgeHost_)
-                .arg(visionBridgePort_)
-                .arg(configuredHost.isEmpty() ? QStringLiteral("<empty>") : configuredHost)
-                .arg(normalizeReason)
+            QStringLiteral("INFO"),
+            QStringLiteral("VISION"),
+            QString("WSL vision bridge enabled: %1:%2").arg(visionBridgeHost_).arg(visionBridgePort_)
         );
-    }
-    if (!visionReconnectTimer_.isActive()) {
-        visionReconnectTimer_.start();
     }
     attemptVisionBridgeConnect();
 }
@@ -371,40 +289,22 @@ void VisionPage::onVisionBridgeStateChanged(QAbstractSocket::SocketState state) 
     if (!stateKnown) {
         return;
     }
+
     if (nowOnline != visionBridgeOnline_) {
         visionBridgeOnline_ = nowOnline;
-        qInfo().noquote() << QString("VISION_BRIDGE_STATE online=%1 host=%2 port=%3")
-                                 .arg(visionBridgeOnline_ ? "true" : "false")
-                                 .arg(visionBridgeHost_)
-                                 .arg(visionBridgePort_);
         if (backend_ != nullptr) {
             if (visionBridgeOnline_) {
                 backend_->addLog(
-                    "INFO",
-                    "VISION",
+                    QStringLiteral("INFO"),
+                    QStringLiteral("VISION"),
                     QString("WSL vision bridge connected: %1:%2").arg(visionBridgeHost_).arg(visionBridgePort_)
                 );
             } else {
-                backend_->addLog("WARN", "VISION", QStringLiteral("WSL vision bridge disconnected; retrying"));
+                backend_->addLog(QStringLiteral("WARN"), QStringLiteral("VISION"), QStringLiteral("WSL vision bridge disconnected; retrying"));
             }
         }
-
         if (!visionBridgeOnline_) {
-            hasRemoteVision_ = false;
-            remoteVisionUpdateMs_ = 0;
-            remoteFps_ = 0.0;
-            remoteDisplayFps_ = 0.0;
-            remoteCameraOnline_ = false;
-            remoteModelLoaded_ = false;
-            remoteFrameCount_ = 0;
-            remoteFrameWidth_ = 0;
-            remoteFrameHeight_ = 0;
-            remoteDetections_.clear();
-            remoteBoxes_.clear();
-            remoteFrameImage_ = QImage();
-            lastRemoteFrameCount_ = -1;
-            lastRemoteFrameTickMs_ = 0;
-            lastRemoteFrameDelta_ = 0;
+            resetRemoteState();
         }
     }
 
@@ -415,24 +315,29 @@ void VisionPage::onVisionBridgeStateChanged(QAbstractSocket::SocketState state) 
     } else if (!visionReconnectTimer_.isActive()) {
         visionReconnectTimer_.start();
     }
+    refresh();
 }
 
 void VisionPage::onVisionBridgeError(QAbstractSocket::SocketError socketError) {
-    (void)socketError;
-    if (backend_ == nullptr || visionSocket_ == nullptr) {
+    Q_UNUSED(socketError);
+    if (visionSocket_ == nullptr) {
         return;
     }
 
     if (visionSocket_->state() != QAbstractSocket::ConnectedState) {
-        backend_->addLog(
-            "WARN",
-            "VISION",
-            QString("WSL vision bridge connection failed: %1").arg(visionSocket_->errorString())
-        );
-        if (!visionReconnectTimer_.isActive()) {
-            visionReconnectTimer_.start();
+        if (backend_ != nullptr) {
+            backend_->addLog(
+                QStringLiteral("WARN"),
+                QStringLiteral("VISION"),
+                QString("WSL vision bridge connection failed: %1").arg(visionSocket_->errorString())
+            );
         }
     }
+
+    if (visionSocket_->state() != QAbstractSocket::ConnectedState && !visionReconnectTimer_.isActive()) {
+        visionReconnectTimer_.start();
+    }
+    refresh();
 }
 
 void VisionPage::handleVisionBridgeLine(const QString &line) {
@@ -445,7 +350,11 @@ void VisionPage::handleVisionBridgeLine(const QString &line) {
     const QJsonDocument doc = QJsonDocument::fromJson(trimmed.toUtf8(), &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
         if (backend_ != nullptr) {
-            backend_->addLog("WARN", "VISION", QString("WSL vision bridge message parse failed: %1").arg(trimmed));
+            backend_->addLog(
+                QStringLiteral("WARN"),
+                QStringLiteral("VISION"),
+                QString("WSL vision bridge message parse failed: %1").arg(trimmed)
+            );
         }
         return;
     }
@@ -464,56 +373,23 @@ void VisionPage::applyVisionBridgePayload(const QJsonObject &obj) {
         remoteModelLoaded_ = obj.value(QStringLiteral("model_loaded")).toBool(remoteModelLoaded_);
     }
     if (obj.contains(QStringLiteral("frame_count"))) {
-        const int newFrameCount = obj.value(QStringLiteral("frame_count")).toInt(remoteFrameCount_);
-        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-        if (lastRemoteFrameCount_ >= 0 && newFrameCount >= lastRemoteFrameCount_ && lastRemoteFrameTickMs_ > 0) {
-            const qint64 deltaFrames = static_cast<qint64>(newFrameCount - lastRemoteFrameCount_);
-            const qint64 deltaMs = nowMs - lastRemoteFrameTickMs_;
-            lastRemoteFrameDelta_ = deltaFrames;
-            if (deltaFrames > 0 && deltaMs > 0) {
-                remoteDisplayFps_ = (static_cast<double>(deltaFrames) * 1000.0) / static_cast<double>(deltaMs);
-            }
-        }
-        lastRemoteFrameCount_ = newFrameCount;
-        lastRemoteFrameTickMs_ = nowMs;
-        remoteFrameCount_ = newFrameCount;
+        remoteFrameCount_ = obj.value(QStringLiteral("frame_count")).toInt(remoteFrameCount_);
     }
     if (obj.contains(QStringLiteral("error"))) {
         remoteError_ = obj.value(QStringLiteral("error")).toString(remoteError_);
     }
 
-    bool frameDecoded = false;
-    QString frameDecodeError;
-
-    const bool needRemoteFrameDecode = visionBridgePort_ > 0;
-
-    if (needRemoteFrameDecode && obj.contains(QStringLiteral("frame_jpeg_b64"))) {
+    remoteFrameImage_ = QImage();
+    if (obj.contains(QStringLiteral("frame_jpeg_b64"))) {
         const QString encoded = obj.value(QStringLiteral("frame_jpeg_b64")).toString();
         if (!encoded.isEmpty()) {
             const QByteArray jpegData = QByteArray::fromBase64(encoded.toLatin1());
             QImage decoded;
             if (decoded.loadFromData(jpegData, "JPG") || decoded.loadFromData(jpegData, "JPEG")) {
                 remoteFrameImage_ = decoded;
-                frameDecoded = true;
             } else {
-                frameDecodeError = QString("JPEG decode failed: %1 bytes").arg(jpegData.size());
+                remoteError_ = QStringLiteral("Failed to decode bridge frame");
             }
-        }
-    }
-
-    if (backend_ != nullptr) {
-        if (frameDecoded && !remoteFrameDecodeLogged_) {
-            remoteFrameDecodeLogged_ = true;
-            remoteFrameDecodeWarned_ = false;
-            backend_->addLog(
-                "INFO",
-                "VISION",
-                QString("WSL vision frame decoded: %1x%2")
-                    .arg(remoteFrameImage_.width())
-                    .arg(remoteFrameImage_.height()));
-        } else if (!frameDecoded && !frameDecodeError.isEmpty() && !remoteFrameDecodeWarned_) {
-            remoteFrameDecodeWarned_ = true;
-            backend_->addLog("WARN", "VISION", QString("WSL vision frame decode error: %1").arg(frameDecodeError));
         }
     }
 
@@ -552,7 +428,8 @@ void VisionPage::applyVisionBridgePayload(const QJsonObject &obj) {
                 .arg(box.x1)
                 .arg(box.y1)
                 .arg(box.x2)
-                .arg(box.y2));
+                .arg(box.y2)
+        );
     }
 
     if (!remoteBoxes_.isEmpty()) {
@@ -566,237 +443,100 @@ void VisionPage::applyVisionBridgePayload(const QJsonObject &obj) {
 
     hasRemoteVision_ = true;
     remoteVisionUpdateMs_ = QDateTime::currentMSecsSinceEpoch();
-    if (remoteVisionUpdateMs_ - lastPayloadLogMs_ >= 1000) {
-        const int detCount = !remoteBoxes_.isEmpty() ? remoteBoxes_.size() : remoteDetections_.size();
-        qInfo().noquote() << QString("VISION_PAYLOAD frame=%1 fps=%2 det=%3 camera_online=%4 model_loaded=%5")
-                                 .arg(remoteFrameCount_)
-                                 .arg(QString::number(remoteFps_, 'f', 2))
-                                 .arg(detCount)
-                                 .arg(remoteCameraOnline_ ? "true" : "false")
-                                 .arg(remoteModelLoaded_ ? "true" : "false");
-        lastPayloadLogMs_ = remoteVisionUpdateMs_;
-    }
     refresh();
 }
 
-QString VisionPage::resolveVideoPath() const {
-    const QString cwd = QDir::currentPath();
-    const QString appDir = QCoreApplication::applicationDirPath();
-    QStringList candidates;
-
-    if (options_.videoPath.trimmed().isEmpty()) {
-        return QString();
-    }
-    candidates << options_.videoPath.trimmed();
-
-    for (const QString &candidate : candidates) {
-        if (candidate.isEmpty()) {
-            continue;
-        }
-
-        const QFileInfo asGiven(candidate);
-        if (asGiven.exists() && asGiven.isFile()) {
-            return asGiven.absoluteFilePath();
-        }
-
-        const QFileInfo inCwd(QDir(cwd).filePath(candidate));
-        if (inCwd.exists() && inCwd.isFile()) {
-            return inCwd.absoluteFilePath();
-        }
-
-        const QFileInfo inApp(QDir(appDir).filePath(candidate));
-        if (inApp.exists() && inApp.isFile()) {
-            return inApp.absoluteFilePath();
-        }
-
-        const QFileInfo inParent(QDir(appDir).filePath(QStringLiteral("../") + candidate));
-        if (inParent.exists() && inParent.isFile()) {
-            return inParent.absoluteFilePath();
-        }
-
-        const QFileInfo inGrandParent(QDir(appDir).filePath(QStringLiteral("../../") + candidate));
-        if (inGrandParent.exists() && inGrandParent.isFile()) {
-            return inGrandParent.absoluteFilePath();
-        }
-    }
-
-    return QString();
+void VisionPage::resetRemoteState() {
+    hasRemoteVision_ = false;
+    remoteVisionUpdateMs_ = 0;
+    remoteFps_ = 0.0;
+    remoteCameraOnline_ = false;
+    remoteModelLoaded_ = false;
+    remoteFrameCount_ = 0;
+    remoteFrameWidth_ = 0;
+    remoteFrameHeight_ = 0;
+    remoteError_.clear();
+    remoteDetections_.clear();
+    remoteBoxes_.clear();
+    remoteFrameImage_ = QImage();
 }
 
 void VisionPage::refresh() {
-    if (backend_ == nullptr) {
-        return;
-    }
-
-    const qint64 elapsedMs = fpsTimer_.elapsed();
-    if (elapsedMs >= 1000) {
-        currentFps_ = (static_cast<double>(fpsWindowFrames_) * 1000.0) / static_cast<double>(elapsedMs);
-        fpsWindowFrames_ = 0;
-        fpsTimer_.restart();
-    }
-
-    const bool localPlaying = player_ != nullptr && player_->state() == QMediaPlayer::PlayingState;
-    const bool localLoaded = player_ != nullptr &&
-        (player_->mediaStatus() == QMediaPlayer::LoadedMedia ||
-         player_->mediaStatus() == QMediaPlayer::BufferingMedia ||
-         player_->mediaStatus() == QMediaPlayer::BufferedMedia ||
-         player_->mediaStatus() == QMediaPlayer::EndOfMedia);
-
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     const bool bridgeConfigured = visionBridgePort_ > 0;
-    const bool remoteConnected = hasRemoteVision_ && visionBridgeOnline_;
-    const bool remoteFresh = remoteConnected && (nowMs - remoteVisionUpdateMs_ <= 3000);
-    const bool useRemote = remoteConnected;
-    const bool preferLocalVideo = !bridgeConfigured && !activeVideoPath_.isEmpty() && localLoaded;
-    const bool useRemoteFrame = useRemote && !remoteFrameImage_.isNull();
+    const bool remoteFresh = bridgeConfigured && visionBridgeOnline_ && hasRemoteVision_ && (nowMs - remoteVisionUpdateMs_ <= 3000);
 
-    const double inferFps = bridgeConfigured ? remoteFps_ : currentFps_;
-    const double remoteDisplayFps = (remoteDisplayFps_ > 0.05) ? remoteDisplayFps_ : remoteFps_;
-    double displayFps = 0.0;
-    if (bridgeConfigured) {
-        displayFps = remoteDisplayFps;
-    } else {
-        displayFps = currentFps_;
-    }
-    const bool playing = bridgeConfigured ? (visionBridgeOnline_ && remoteCameraOnline_) : localPlaying;
-    const bool loaded = bridgeConfigured ? (visionBridgeOnline_ && remoteModelLoaded_) : localLoaded;
-    const int shownFrameCount = bridgeConfigured ? remoteFrameCount_ : frameCount_;
-    QString displayError = useRemote ? remoteError_ : errorText_;
+    QString displayError = errorText_;
     if (bridgeConfigured && !visionBridgeOnline_) {
         displayError = QStringLiteral("WSL vision bridge not connected");
-    } else if (useRemote && !remoteFresh && displayError.isEmpty()) {
+    } else if (bridgeConfigured && !hasRemoteVision_ && displayError.isEmpty()) {
+        displayError = QStringLiteral("Waiting for vision bridge payload");
+    } else if (bridgeConfigured && !remoteFresh && displayError.isEmpty()) {
         displayError = QStringLiteral("WSL vision payload stale");
+    } else if (bridgeConfigured && !remoteError_.isEmpty()) {
+        displayError = remoteError_;
     }
-    const bool hasError = !displayError.isEmpty();
+
+    const bool cameraOnline = remoteFresh && remoteCameraOnline_;
+    const bool modelLoaded = remoteFresh && remoteModelLoaded_;
+    const double inferFps = remoteFresh ? remoteFps_ : 0.0;
+    const int shownFrameCount = remoteFresh ? remoteFrameCount_ : 0;
+    const int detCount = remoteFresh ? remoteDetections_.size() : 0;
 
     if (overlayWidget_ != nullptr) {
         QVector<DetectionOverlayWidget::OverlayBox> drawBoxes;
-        int drawFrameWidth = 0;
-        int drawFrameHeight = 0;
-        QImage drawImage;
-        if (useRemote) {
-            if (preferLocalVideo) {
-                drawBoxes.reserve(remoteBoxes_.size());
-                for (const RemoteDetectionBox &src : remoteBoxes_) {
-                    DetectionOverlayWidget::OverlayBox dst;
-                    dst.x1 = src.x1;
-                    dst.y1 = src.y1;
-                    dst.x2 = src.x2;
-                    dst.y2 = src.y2;
-                    dst.label = src.label;
-                    dst.score = src.score;
-                    drawBoxes.append(dst);
-                }
-            }
-            drawFrameWidth = remoteFrameWidth_;
-            drawFrameHeight = remoteFrameHeight_;
-        }
-        if (useRemoteFrame) {
-            drawImage = remoteFrameImage_;
-            if (drawFrameWidth <= 0) {
-                drawFrameWidth = remoteFrameImage_.width();
-            }
-            if (drawFrameHeight <= 0) {
-                drawFrameHeight = remoteFrameImage_.height();
+        if (remoteFresh) {
+            drawBoxes.reserve(remoteBoxes_.size());
+            for (const RemoteDetectionBox &src : remoteBoxes_) {
+                DetectionOverlayWidget::OverlayBox dst;
+                dst.x1 = src.x1;
+                dst.y1 = src.y1;
+                dst.x2 = src.x2;
+                dst.y2 = src.y2;
+                dst.label = src.label;
+                dst.score = src.score;
+                drawBoxes.append(dst);
             }
         }
-
-        if (videoStack_ != nullptr && videoWidget_ != nullptr) {
-            if (bridgeConfigured) {
-                videoStack_->setCurrentWidget(overlayWidget_);
-            } else if (preferLocalVideo) {
-                videoStack_->setCurrentWidget(videoWidget_);
-                overlayWidget_->raise();
-            } else if (useRemoteFrame) {
-                videoStack_->setCurrentWidget(overlayWidget_);
-            } else {
-                videoStack_->setCurrentWidget(videoWidget_);
-            }
-        }
-
-        overlayWidget_->setFrameImage(drawImage);
-        overlayWidget_->setDetections(drawBoxes, drawFrameWidth, drawFrameHeight);
+        overlayWidget_->setFrameImage(remoteFresh ? remoteFrameImage_ : QImage());
+        overlayWidget_->setDetections(drawBoxes, remoteFresh ? remoteFrameWidth_ : 0, remoteFresh ? remoteFrameHeight_ : 0);
     }
 
-    if (bridgeConfigured) {
-        fpsLabel_->setText(
-            QString("Infer FPS: %1 | Display FPS: %2")
-                .arg(QString::number(inferFps, 'f', 1))
-                .arg(QString::number(displayFps, 'f', 1))
-        );
-    } else {
-        fpsLabel_->setText(QString("FPS: %1").arg(QString::number(displayFps, 'f', 1)));
-    }
-    if (bridgeLabel_ != nullptr) {
-        bridgeLabel_->setText(QString("Bridge: %1").arg(visionBridgeOnline_ ? QStringLiteral("connected") : QStringLiteral("disconnected")));
-        bridgeLabel_->setStyleSheet(visionBridgeOnline_ ? "color: #32cd32;" : "color: #ffb347;");
-    }
+    fpsLabel_->setText(QString("Infer FPS: %1").arg(QString::number(inferFps, 'f', 1)));
+    bridgeLabel_->setText(QString("Bridge: %1").arg(visionBridgeOnline_ ? QStringLiteral("connected") : QStringLiteral("disconnected")));
+    bridgeLabel_->setStyleSheet(visionBridgeOnline_ ? "color: #32cd32;" : "color: #ffb347;");
 
-    cameraLabel_->setText(QString("Camera: %1").arg(playing ? QStringLiteral("online") : QStringLiteral("offline")));
-    cameraLabel_->setStyleSheet(playing ? "color: #32cd32;" : "color: #ff5a5a;");
+    cameraLabel_->setText(QString("Camera: %1").arg(cameraOnline ? QStringLiteral("online") : QStringLiteral("offline")));
+    cameraLabel_->setStyleSheet(cameraOnline ? "color: #32cd32;" : "color: #ff5a5a;");
 
-    modelLabel_->setText(QString("Model: %1").arg(loaded ? QStringLiteral("loaded") : QStringLiteral("unloaded")));
-    modelLabel_->setStyleSheet(loaded ? "color: #32cd32;" : "color: #ff5a5a;");
+    modelLabel_->setText(QString("Model: %1").arg(modelLoaded ? QStringLiteral("loaded") : QStringLiteral("unloaded")));
+    modelLabel_->setStyleSheet(modelLoaded ? "color: #32cd32;" : "color: #ff5a5a;");
 
     frameCountLabel_->setText(QString("Frames: %1").arg(shownFrameCount));
-    if (detCountLabel_ != nullptr) {
-        const int detCount = useRemote ? remoteDetections_.size() : 0;
-        detCountLabel_->setText(QString("Detections: %1").arg(detCount));
-    }
+    detCountLabel_->setText(QString("Detections: %1").arg(detCount));
 
     detList_->clear();
-    if (hasError) {
+    if (!displayError.isEmpty()) {
         detList_->addItem(displayError);
-        if (useRemote && lastRemoteFrameDelta_ > 1 && lastRemoteFrameTickMs_ > 0) {
-            detList_->addItem(
-                QString("Remote frame jump detected: +%1 frames")
-                    .arg(lastRemoteFrameDelta_));
-        }
-    } else if (useRemote && !remoteDetections_.isEmpty()) {
+    } else if (remoteFresh && !remoteDetections_.isEmpty()) {
         for (const QString &item : remoteDetections_) {
             detList_->addItem(item);
         }
-        if (lastRemoteFrameDelta_ > 1) {
-            detList_->addItem(
-                QString("Remote frame jump detected: +%1 frames")
-                    .arg(lastRemoteFrameDelta_));
-        }
-    } else if (visionBridgePort_ > 0 && !visionBridgeOnline_) {
-        detList_->addItem(QStringLiteral("WSL vision bridge not connected (auto reconnecting)"));
-    } else if (!bridgeConfigured && activeVideoPath_.isEmpty()) {
-        detList_->addItem(QStringLiteral("Video input not configured (pass --video-input)"));
-    } else if (bridgeConfigured && visionBridgeOnline_ && remoteFrameImage_.isNull()) {
-        detList_->addItem(QStringLiteral("Waiting for boxed frame from WSL vision bridge"));
     } else {
-        detList_->addItem(QFileInfo(activeVideoPath_).fileName());
+        detList_->addItem(QStringLiteral("No detections"));
     }
 
-    VisionSnapshot snapshot;
-    snapshot.fps = inferFps;
-    snapshot.cameraOnline = playing;
-    snapshot.modelLoaded = loaded;
-    snapshot.frameCount = shownFrameCount;
-    snapshot.errorMsg = displayError;
-    if (useRemote) {
-        snapshot.detections = remoteDetections_;
-    }
-    backend_->updateVisionState(snapshot);
-
-    if (nowMs - lastUiLogMs_ >= 1000) {
-        qInfo().noquote() << QString("VISION_UI bridge=%1 camera=%2 model=%3 use_remote=%4 infer_fps=%5 display_fps=%6 frames=%7 det=%8 error=%9")
-                                 .arg(visionBridgeOnline_ ? "connected" : "disconnected")
-                                 .arg(playing ? "online" : "offline")
-                                 .arg(loaded ? "loaded" : "unloaded")
-                                 .arg(useRemote ? "true" : "false")
-                                 .arg(QString::number(inferFps, 'f', 2))
-                                 .arg(QString::number(displayFps, 'f', 2))
-                                 .arg(shownFrameCount)
-                                 .arg(remoteDetections_.size())
-                                 .arg(displayError.isEmpty() ? "none" : displayError);
-        lastUiLogMs_ = nowMs;
+    if (backend_ != nullptr) {
+        VisionSnapshot snapshot;
+        snapshot.frame = remoteFresh ? remoteFrameImage_ : QImage();
+        snapshot.detections = remoteFresh ? remoteDetections_ : QStringList();
+        snapshot.fps = inferFps;
+        snapshot.cameraOnline = cameraOnline;
+        snapshot.modelLoaded = modelLoaded;
+        snapshot.frameCount = shownFrameCount;
+        snapshot.errorMsg = displayError;
+        backend_->updateVisionState(snapshot);
     }
 }
 
 }  // namespace dashboard
-
-

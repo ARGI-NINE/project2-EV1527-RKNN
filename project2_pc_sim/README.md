@@ -1,130 +1,91 @@
-﻿# project2_pc_sim
+# project2_pc_sim
 
-`project2_pc_sim` is the PC-side integration workspace for `project2`.
-It is the Windows + WSL validation bench for the current dual-chain runtime, not the final board firmware project.
+`project2_pc_sim` is an offline PC-side simulator. It is not the board runtime and it is not the acceptance source of truth.
 
-## Runtime Scope
+## Surviving Chains
 
-- RF433 chain: `capture03.wav` -> `python/wav_to_pulses.py` -> candidate-frame JSON -> `python/replay_pulse_timeline.py` -> `build_live/linux_app/rf_gateway.exe` -> Qt RF page
-- Vision chain: `test.mp4` -> `python/wsl_vision_bridge_server.py` -> `vision/rknn_pipeline.py` -> Qt Vision page
+Only these two chains are in scope.
 
-## Alignment Matrix (master / pc_sim / hardware)
+Detailed toolchain inventory: `docs/toolchain_environment.txt`
 
-| Dimension | project2_master | project2_pc_sim (this repo) | project2_hardware |
-|---|---|---|---|
-| RF input source | `/dev/ttyS9` realtime UART only | WAV + replay pipeline | RF pulse capture on STM32 |
-| Simulation path | Not supported | Supported | Not applicable |
-| Bypass input (`/dev/rf433`, stdin, pipes) | Blocked in master | Not applicable | Not applicable |
-| Role | Board-side runtime | PC validation bench | Lower-board firmware |
+### RF chain
 
-## Current Status
+```text
+WAV
+-> python/wav_to_pulses.py
+-> candidate-frame extraction
+-> python/replay_pulse_timeline.py
+-> simulated lower-machine to upper-machine AA55 stream
+-> linux_app/rf_gateway
+-> Qt RF page analysis and display
+```
 
-- This workspace remains the simulation/integration bench and is unchanged by master-side serial hardening.
-- `project2_master` no longer accepts simulated RF input paths; use this repo for WAV/stage-1 replay validation.
-- Hardware truth source remains STM32 UART frames and `ev1527_decode.py` mapping rules.
-- `project2_pc_sim` must not be used to infer `project2_master` realtime serial behavior; master serial validation belongs to `project2_master`.
+### Vision chain
 
-## Canonical RF CLI & Metrics (pc_sim)
+```text
+video source resolved inside WSL
+-> python/wsl_vision_bridge_server.py --source <wsl_source>
+-> TCP bridge
+-> Windows Qt Vision page display
+```
 
-- Stage-1 extractor command shape: `python/wav_to_pulses.py --wav <wav_path> --max-frames 0 --out-txt <pulse_txt> --out-json <pulse_json>`
-- Replay command shape: `python/replay_pulse_timeline.py --pulse-json <pulse_json> --speed <speed> [--loop]`
-- Qt fixed RF entry flag: `--wav-input` (dashboard side), not `--input`/`--output`.
-- `stage1_candidate_frames`: `frames=<N>` from `wav_to_pulses.py` (`N=2982` on full `capture03.wav` baseline).
-- `gateway_seq`: `seq=<n>` in `[RF]` line from `rf_gateway.exe` (e.g. `2612`), a decode-time sequence index inside the replay stream.
-- Historical counts from older artifacts (such as `786`/`1154`) are not the current baseline and must not be mixed with `stage1_candidate_frames`.
+Qt does not open any local video file or local camera path. The Windows side only connects to the WSL bridge through `--vision-host` and `--vision-port`.
 
-## Hard Constraints
+## Qt Frontend
 
-- `ev1527_decode.py` is the RF truth reference.
-- RF Stage-1 candidate-frame preprocessing is mandatory and stays separate from backend decode and repeat judgment.
-- Final RF validation uses full-duration `capture03.wav`.
-- Vision must not fabricate detections.
-- If RKNN runtime is unavailable, the bridge must report an explicit error and emit zero detections.
+The retained Windows Qt frontend has three pages:
 
-## Main Directories
+- `RF Status`
+- `Vision`
+- `System Log`
 
-- `common/`: shared RF protocol helpers
-- `linux_app/`: `rf_gateway` backend and RF decode logic
-- `qt_gui/`: Qt5 frontend pages, widgets, backend state, and app shell
-- `python/`: RF preprocessing, replay, decode bridge, and Vision bridge entrypoint
-- `vision/`: RKNN/ONNX pipeline and YOLOv5 postprocess
-- `docs/`: maintained runtime, rule, architecture, and audit documents
-- `sim_data/`: retained evidence artifacts and RF intermediate outputs
-- `build_live/`: active generated build tree used by the validated workflow
-- `.venv/`: project-local Python environment referenced by the runtime baseline
+These pages are display surfaces over the retained RF replay chain and WSL bridge vision chain. The `System Log` page is restored UI, not a third runtime chain.
 
-## Toolchain Baseline
+## Normal Build And Launch
 
-- `C:\Program Files\CMake\bin\cmake.exe`
-- `D:\qt\5.12.9\mingw73_64\bin\qmake.exe`
-- `D:\qt\5.12.9\mingw73_64\bin\windeployqt.exe`
-- `D:\qt\Tools\mingw730_64\bin\mingw32-make.exe`
-- `D:\qt\Tools\mingw730_64\bin\gcc.exe`
-- `D:\qt\Tools\mingw730_64\bin\g++.exe`
-- `D:\project\repos\project2\project2_pc_sim\.venv\Scripts\python.exe`
-- `C:\Windows\System32\wsl.exe`
-- WSL RKNN Python: `/home/mctupubuser/miniconda3/envs/rknn/bin/python`
+The normal user-facing build directory is `build`.
 
-Runtime inputs:
-
-- RF WAV: `D:\project\repos\project2\capture03.wav`
-- Vision video: `D:\project\repos\project2\test.mp4`
-- Model: `D:\project\repos\project2\yolov5s.onnx`
-
-## Build
+Validated configure/build flow on this machine:
 
 ```powershell
-cmake -S . -B build_live -G "MinGW Makefiles" -DBUILD_LINUX_APP=ON -DBUILD_QT5_GUI=ON
-cmake --build .\build_live --target rf_gateway rf_dashboard_qt5 -j 8
-D:\qt\5.12.9\mingw73_64\bin\windeployqt.exe --release --compiler-runtime .\build_live\qt_gui\rf_dashboard_qt5.exe
+& 'C:\Program Files\CMake\bin\cmake.exe' `
+  -S D:\project\repos\project2\project2_pc_sim `
+  -B D:\project\repos\project2\project2_pc_sim\build `
+  -G "MinGW Makefiles" `
+  -DCMAKE_C_COMPILER=D:/qt/Tools/mingw730_64/bin/gcc.exe `
+  -DCMAKE_CXX_COMPILER=D:/qt/Tools/mingw730_64/bin/g++.exe `
+  -DBUILD_LINUX_APP=ON `
+  -DBUILD_QT5_GUI=ON `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH=D:/qt/5.12.9/mingw73_64
+
+& 'C:\Program Files\CMake\bin\cmake.exe' --build D:\project\repos\project2\project2_pc_sim\build --config Release --parallel 4 --target rf_gateway rf_dashboard_qt5
 ```
 
-## Start The WSL Vision Bridge
-
-```bash
-cd /mnt/d/project/repos/project2/project2_pc_sim
-/home/mctupubuser/miniconda3/envs/rknn/bin/python python/wsl_vision_bridge_server.py \
-  --host 0.0.0.0 \
-  --port 17655 \
-  --source /mnt/d/project/repos/project2/test.mp4 \
-  --model /mnt/d/project/repos/project2/yolov5s.onnx \
-  --log-level INFO
-```
-
-On this machine, Windows Qt may need the WSL IPv4 address from `wsl.exe hostname -I` instead of `127.0.0.1`.
-
-## Run The Integrated Dashboard
+Before launching `build\qt_gui\rf_dashboard_qt5.exe`, set the Qt and MinGW runtime DLL paths:
 
 ```powershell
-.\build_live\qt_gui\rf_dashboard_qt5.exe `
-  --gateway .\build_live\linux_app\rf_gateway.exe `
-  --wav-input D:/project/repos/project2/capture03.wav `
-  --video-input D:/project/repos/project2/test.mp4 `
-  --python-bin .\.venv\Scripts\python.exe `
-  --vision-host <WSL_IPV4> `
-  --vision-port 17655
+$env:PATH = 'D:\qt\5.12.9\mingw73_64\bin;D:\qt\Tools\mingw730_64\bin;' + $env:PATH
 ```
 
-## Documentation Map
+Current WSL bridge behavior:
 
-Entry docs:
+- The actual vision input is resolved on the WSL side by `python/wsl_vision_bridge_server.py`.
+- `--source` may be an explicit WSL/translated path or a camera index string.
+- `--source <wsl_source>` is required for the retained simulator vision path.
 
-- [README.md](README.md)
-- [docs/pc_sim_architecture.md](docs/pc_sim_architecture.md)
-- [docs/ev1527_truth_mapping.md](docs/ev1527_truth_mapping.md)
+## Explicit Non-Goals
 
-Runtime baselines:
+- No direct Qt-side MP4/local-video vision path.
+- No standalone timing analysis or profiling outputs kept as part of the documented flow. RF replay metadata such as Qt-visible `wav_sec` remains part of the retained RF chain.
+- No verification artifact bundles retained as part of the documented simulator flow.
 
-- [docs/toolchain_environment_record_20260407.txt](docs/toolchain_environment_record_20260407.txt)
-- [docs/stage1_test_commands.md](docs/stage1_test_commands.md)
+## Relationship With master
 
-Design references:
+| Area | `project2_master` | `project2_pc_sim` |
+|---|---|---|
+| RF | Real `/dev/rf433` runtime path | WAV replay simulation path |
+| Vision | Board-local `/dev/video9 + VisionRuntime + RKNN` | WSL processing plus bridge display path |
+| Acceptance | Primary | Secondary reference only |
 
-- [docs/rknn_c_accel_design_from_article.txt](docs/rknn_c_accel_design_from_article.txt)
-
-Acceptance records:
-
-- [docs/rf_chain_retest_full.txt](docs/rf_chain_retest_full.txt)
-- [docs/vision_chain_retest_full.txt](docs/vision_chain_retest_full.txt)
-- [docs/dual_chain_retest_final.txt](docs/dual_chain_retest_final.txt)
-- [docs/final_acceptance_audit.txt](docs/final_acceptance_audit.txt)
+If `pc_sim` and `master` disagree, `project2_master` wins for acceptance.

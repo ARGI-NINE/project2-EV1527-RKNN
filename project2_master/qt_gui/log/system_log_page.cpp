@@ -40,7 +40,7 @@ void SystemLogPage::setupUi() {
     crcLabel_->setFont(QFont("Consolas", 13));
     parseLabel_ = new QLabel(QStringLiteral("解析失败: 0"), serialGroup);
     parseLabel_->setFont(QFont("Consolas", 13));
-    dropLabel_ = new QLabel(QStringLiteral("丢包: 0"), serialGroup);
+    dropLabel_ = new QLabel(QStringLiteral("驱动丢帧: 0"), serialGroup);
     dropLabel_->setFont(QFont("Consolas", 13));
     frameCountLabel_ = new QLabel(QStringLiteral("总帧数: 0"), serialGroup);
     frameCountLabel_->setStyleSheet("color: #888;");
@@ -127,6 +127,7 @@ void SystemLogPage::refresh() {
     const SystemStats stats = backend_->snapshotSystemStats();
     const RFSnapshot rf = backend_->snapshotRF();
     const VisionSnapshot vision = backend_->snapshotVisionState();
+    const bool visionStatusReported = vision.statusReported;
 
     cpuLabel_->setText(QString("CPU: %1%").arg(QString::number(stats.cpuPercent, 'f', 1)));
     memLabel_->setText(QString("内存: %1% (%2 MB)")
@@ -146,13 +147,26 @@ void SystemLogPage::refresh() {
     crcLabel_->setStyleSheet(rf.crcErrors > 0 ? "color: #d9534f; font-size: 13px;" : "font-size: 13px;");
     parseLabel_->setText(QString("解析失败: %1").arg(rf.parseErrors));
     parseLabel_->setStyleSheet(rf.parseErrors > 0 ? "color: #d9534f; font-size: 13px;" : "font-size: 13px;");
-    dropLabel_->setText(QString("丢包: %1").arg(rf.dropCount));
+    dropLabel_->setText(QString("驱动丢帧: %1").arg(rf.driverDropFrames));
     frameCountLabel_->setText(QString("总帧数: %1").arg(rf.frameCount));
 
-    modelStatusLabel_->setText(QString("状态: %1").arg(vision.modelLoaded ? QStringLiteral("已加载 ✓") : QStringLiteral("未加载 ✗")));
-    modelStatusLabel_->setStyleSheet(vision.modelLoaded ? "color: #4EC9B0;" : "color: #d9534f;");
-    modelFpsLabel_->setText(QString("推理 FPS: %1").arg(QString::number(vision.fps, 'f', 1)));
-    modelErrorLabel_->setText(QString("错误: %1").arg(vision.errorMsg.isEmpty() ? QStringLiteral("无") : vision.errorMsg));
+    if (!visionStatusReported) {
+        modelStatusLabel_->setText(QStringLiteral("状态: 未接入/未上报"));
+        modelStatusLabel_->setStyleSheet("color: #888;");
+        modelFpsLabel_->setText(QStringLiteral("推理 FPS: --"));
+        modelErrorLabel_->setText(
+            QString("错误: %1").arg(
+                vision.errorMsg.isEmpty()
+                    ? QStringLiteral("等待板侧视觉状态接线")
+                    : vision.errorMsg
+            )
+        );
+    } else {
+        modelStatusLabel_->setText(QString("状态: %1").arg(vision.modelLoaded ? QStringLiteral("已加载 ✓") : QStringLiteral("未加载 ✗")));
+        modelStatusLabel_->setStyleSheet(vision.modelLoaded ? "color: #4EC9B0;" : "color: #d9534f;");
+        modelFpsLabel_->setText(QString("推理 FPS: %1").arg(QString::number(vision.fps, 'f', 1)));
+        modelErrorLabel_->setText(QString("错误: %1").arg(vision.errorMsg.isEmpty() ? QStringLiteral("无") : vision.errorMsg));
+    }
 
     mqttCountLabel_->setText(QString("上报次数: %1").arg(stats.mqttCount));
     const QVector<LogEntry> mqttLogs = backend_->queryLogs(QStringLiteral("MQTT"), 1);
