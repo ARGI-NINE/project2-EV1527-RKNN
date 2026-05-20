@@ -28,10 +28,10 @@ int main(int argc, char *argv[]) {
     const QString defaultVisionDevice = dashboard::defaultVisionDevicePath();
     QCommandLineOption visionDeviceOption(
         QStringLiteral("vision-device"),
-        QStringLiteral("Local V4L2 camera device passed to the board-side vision runtime "
-                       "(default: %1; only /dev/video* is allowed).")
+        QStringLiteral("Board-side vision input passed to the local runtime "
+                       "(default: %1; accepts /dev/video* or a readable local video file).")
             .arg(defaultVisionDevice),
-        QStringLiteral("device"),
+        QStringLiteral("input"),
         defaultVisionDevice
     );
     parser.addOption(rfInputOption);
@@ -54,10 +54,10 @@ int main(int argc, char *argv[]) {
             << " (master only supports " << defaultRfInput << ")\n";
         return 1;
     }
-    if (!dashboard::isAllowedVisionDevicePath(options.visionDevice)) {
+    if (!dashboard::isAllowedVisionInputPath(options.visionDevice)) {
         QTextStream(stderr)
             << "Invalid --vision-device: " << options.visionDevice
-            << " (master only supports local /dev/video* devices)\n";
+            << " (master supports local /dev/video* devices or readable local video files)\n";
         return 1;
     }
 

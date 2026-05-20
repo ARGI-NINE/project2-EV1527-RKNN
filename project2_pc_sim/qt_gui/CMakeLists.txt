@@ -1,10 +1,6 @@
 enable_language(CXX)
 
-find_package(Qt5 COMPONENTS Core Gui Widgets Network QUIET)
-if(NOT Qt5_FOUND)
-  message(WARNING "Qt5 not found. Skip target rf_dashboard_qt5. Set CMAKE_PREFIX_PATH to your Qt5 installation.")
-  return()
-endif()
+find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets Network)
 
 set(QT_GUI_SOURCES
   app/main.cpp

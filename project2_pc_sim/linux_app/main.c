@@ -14,7 +14,6 @@ typedef struct {
     uint32_t best_code;
     float best_conf;
     uint16_t hits;
-    uint16_t target_hits;
     uint32_t last_seq;
 } rf_stable_group_t;
 
@@ -26,7 +25,6 @@ typedef struct {
     uint16_t stable_repeat;
     uint16_t stable_window;
     uint8_t stable_near_bits;
-    uint32_t preferred_code;
     float min_publish_confidence;
     int has_last_code;
     rf_stable_group_t stable_groups[RF_STABLE_GROUP_MAX];
@@ -46,7 +44,6 @@ static void print_usage(const char *exe) {
     printf("  --stable-repeat <N>       Need N agreeing frames (default 2)\n");
     printf("  --stable-window <N>       Group memory window in frames (default 12)\n");
     printf("  --stable-near-bits <N>    Hamming-near threshold for merge (default 4)\n");
-    printf("  --preferred-code <hex>    Prefer this code when seen in merged group (default 0x12D1B1)\n");
     printf("  --min-publish-confidence <F>  Suppress low-score decoded output (default 0.72)\n");
     printf("  --publish-gap <N>         Min frame gap for same code re-publish (default 6)\n");
 }
@@ -123,7 +120,7 @@ static int stable_group_alloc(app_ctx_t *ctx) {
     return best_idx;
 }
 
-static void stable_group_seed(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq, uint32_t preferred) {
+static void stable_group_seed(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq) {
     if (g == NULL) {
         return;
     }
@@ -133,11 +130,10 @@ static void stable_group_seed(rf_stable_group_t *g, uint32_t code, float conf, u
     g->best_code = code & 0xFFFFFFu;
     g->best_conf = conf;
     g->hits = 1u;
-    g->target_hits = ((code & 0xFFFFFFu) == (preferred & 0xFFFFFFu)) ? 1u : 0u;
     g->last_seq = seq;
 }
 
-static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq, uint32_t preferred) {
+static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq) {
     if (g == NULL) {
         return;
     }
@@ -146,9 +142,6 @@ static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf,
     if (conf >= g->best_conf) {
         g->best_conf = conf;
         g->best_code = code & 0xFFFFFFu;
-    }
-    if ((code & 0xFFFFFFu) == (preferred & 0xFFFFFFu)) {
-        g->target_hits++;
     }
 }
 
@@ -191,24 +184,19 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
                     &ctx->stable_groups[idx],
                     pkt.raw_code,
                     pkt.confidence,
-                    ctx->frame_seq,
-                    ctx->preferred_code
+                    ctx->frame_seq
                 );
             }
             ctx->stable_drop++;
             return 0;
         }
         g = &ctx->stable_groups[idx];
-        stable_group_update(g, pkt.raw_code, pkt.confidence, ctx->frame_seq, ctx->preferred_code);
+        stable_group_update(g, pkt.raw_code, pkt.confidence, ctx->frame_seq);
         if (g->hits < ctx->stable_repeat) {
             ctx->stable_drop++;
             return 0;
         }
-        if (g->target_hits > 0u) {
-            pkt.raw_code = ctx->preferred_code & 0xFFFFFFu;
-        } else {
-            pkt.raw_code = g->best_code & 0xFFFFFFu;
-        }
+        pkt.raw_code = g->best_code & 0xFFFFFFu;
         snprintf(pkt.addr, sizeof(pkt.addr), "0x%06X", pkt.raw_code & 0xFFFFFFu);
         snprintf(pkt.key, sizeof(pkt.key), "%u", (unsigned)(pkt.raw_code & 0x0Fu));
         if (g->best_conf > pkt.confidence) {
@@ -226,7 +214,7 @@ static int on_rf_frame(const rf_frame_t *frame, void *user) {
     }
 
     printf(
-        "[RF] addr=%s key=%s conf=%.2f source=%s pulses=%u seq=%u\n",
+        "{\"addr\":\"%s\",\"key\":\"%s\",\"conf\":%.2f,\"src\":\"%s\",\"pulses\":%u,\"seq\":%u}\n",
         pkt.addr,
         pkt.key,
         pkt.confidence,
@@ -246,7 +234,6 @@ int main(int argc, char **argv) {
     uint16_t stable_repeat = 2u;
     uint16_t stable_window = 12u;
     uint8_t stable_near_bits = 4u;
-    uint32_t preferred_code = 0x12D1B1u;
     float min_publish_conf = 0.72f;
     uint16_t publish_gap = 6u;
     app_ctx_t ctx;
@@ -272,9 +259,6 @@ int main(int argc, char **argv) {
             stable_window = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stable-near-bits") == 0 && i + 1 < argc) {
             stable_near_bits = (uint8_t)strtoul(argv[++i], NULL, 10);
-        } else if (strcmp(argv[i], "--preferred-code") == 0 && i + 1 < argc) {
-            preferred_code = (uint32_t)strtoul(argv[++i], NULL, 0);
-            preferred_code &= 0xFFFFFFu;
         } else if (strcmp(argv[i], "--min-publish-confidence") == 0 && i + 1 < argc) {
             min_publish_conf = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--publish-gap") == 0 && i + 1 < argc) {
@@ -302,7 +286,6 @@ int main(int argc, char **argv) {
         stable_near_bits = 12u;
     }
     ctx.stable_near_bits = stable_near_bits;
-    ctx.preferred_code = preferred_code & 0xFFFFFFu;
     ctx.min_publish_confidence = min_publish_conf;
 
     cfg.rf_fd = rf_fd;

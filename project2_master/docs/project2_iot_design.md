@@ -4,9 +4,9 @@
 
 - `master` 是板端实时运行目录，`pc_sim` 只是离线仿真/回归基线。
 - `master` 当前 RF 唯一用户态输入是 `/dev/rf433`，其底层链路是 `UART -> serdev -> /dev/rf433`。
-- RF 页面和日志中的波形数据都来自真实 `pulse_us`，不是 UI 侧反推的假波形。
+- RF 页面和日志中的波形数据都来自 `rf_event` JSON payload 里的真实 `pulse_us[]`，不是 UI 侧反推的假波形。
 - RF 在线状态由驱动 `online` 位和真实 RF 帧共同表征，不以网关进程启动为在线判据。
-- `master` 视觉当前仍未接入真实板侧状态，且本地视频文件输入已被禁用；本文档不把视觉页写成已接通。
+- `master` 视觉当前是板侧本地 runtime；默认输入为 `/dev/video9`，同时保留可读本地视频文件（含本地 MP4）的解码支路；本文档只陈述代码路径，不把视觉页写成已完成实机验收。
 - `hardware` 与 `master` 通过 UART 协议帧对接，字段语义需与 `pc_sim` 真值表对应。
 - 当前尚未完成端到端实机验收，因此本文档只陈述设计和代码口径，不陈述 E2E 已通过。
 
@@ -55,10 +55,11 @@ CRC 覆盖范围：从 `LEN0` 到 payload 末字节。
 
 | 字段 | 语义 | 典型来源 |
 |---|---|---|
-| `parseErrors` | 仅表示解析失败计数，不包含驱动丢帧；可由 `crc_err + len_err` 构成 | `[DRV_STATS] crc_err/len_err`、明确解析失败日志 |
-| `driverDropFrames` | 仅表示驱动层丢帧计数 | 当前前端实现仅由 `[DRV_STATS] drop` 更新；`[RF_STATS] drv_drop` 仅记录日志，不写入该字段 |
-| `dropCount` | 用户态解码阶段丢弃计数 | `rf_gateway` 解码日志 |
-| `online` | 驱动在线位 | `[DRV_STATS] online` / `RF433_IOC_GET_STATUS` |
+| `crcErrors` | 驱动 CRC 错误计数 | `device_status.payload.driver_crc_err`、`rf_stats.payload.driver_crc_err` |
+| `parseErrors` | 当前 Qt 将用户态解析失败视为 `decode_no_frame + decode_err`；协议 JSON 不合法时还会走本地 `incrementParseError()` | `rf_stats.payload.decode_no_frame/decode_err`、`RFGatewayClient::parseProtocolEnvelope()` / `parseRFEventPayload()` |
+| `driverDropFrames` | 当前 Qt 以应用侧累计驱动缺口为准 | `rf_stats.payload.drv_drop`、`device_status.payload.app_drv_drop` |
+| `dropCount` | 当前 RF 客户端未从 `rf_gateway` JSON envelope 回填该字段，仍预留给后续 UI 指标扩展 | `DashboardBackend::incrementDrop()` 目前未接 `rf_gateway` |
+| `online` | 驱动在线位 | `device_status.payload.rf_online`、`rf_stats.payload.driver_online` |
 
 ## 5. 组件职责
 
@@ -67,7 +68,7 @@ CRC 覆盖范围：从 `LEN0` 到 payload 末字节。
 | `linux_driver/rf433_drv.c` | serdev 接收、协议解析、导出 `/dev/rf433`、维护 `online` 位 |
 | `linux_app/rf_source.c` | 打开并校验 `/dev/rf433` |
 | `linux_app/rf_epoll.c` | epoll 读取帧与回调分发 |
-| `linux_app/main.c` | 输出 `[RF]` 与 `[DRV_STATS]`，携带真实 `pulse_us` |
+| `linux_app/main.c` | 输出 `rf_event` / `device_status` / `rf_stats` JSON envelope，携带真实 `pulse_us[]` 与驱动/解码统计 |
 | `linux_app/rf_decode*.c` | EV1527 解码与统计 |
 | `qt_gui` | 启动网关并展示实时结果 |
 
@@ -80,7 +81,7 @@ CRC 覆盖范围：从 `LEN0` 到 payload 末字节。
 
 ## 7. 当前验证边界
 
-- 已核对：输入路径限制、协议字段、在线位语义、真实 `pulse_us` 波形、vision 输入限制。
+- 已核对：输入路径限制、协议字段、在线位语义、真实 `pulse_us[]` 波形、vision 本地 `/dev/video*` + 本地视频文件支路。
 - 未核对完成：UART 实机链路、驱动在线超时、Qt 长时间运行、真实视觉状态通道接线。
 - 不能写成：已完成整机端到端实机验收。
 
@@ -88,7 +89,7 @@ CRC 覆盖范围：从 `LEN0` 到 payload 末字节。
 
 - `/dev/rf433` 打不开：检查驱动加载、设备权限、DTS 绑定。
 - 解码不稳定：核查下位机脉冲质量与稳定分组参数。
-- UI 无更新：检查网关 stdout 行是否被前端解析，是否包含真实 `pulse_us=`。
+- UI 无更新：检查网关 stdout 行是否是可解析的 JSON envelope，尤其 `type="rf_event"` 且 `payload.pulse_us[]` 为真实脉冲数组。
 - 与 `pc_sim` 不一致：按实时链路优先级进行差异归因。
 
 ## 9. 互引

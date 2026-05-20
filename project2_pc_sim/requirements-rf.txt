@@ -1,0 +1,5 @@
+# project2_pc_sim RF-only Python dependencies
+#
+# This layer is intentionally empty.
+# `python/wav_to_pulses.py` and `python/replay_pulse_timeline.py`
+# use only the Python standard library.

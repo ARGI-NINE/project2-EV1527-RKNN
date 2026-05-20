@@ -98,11 +98,11 @@ int main(int argc, char *argv[]) {
 为什么这样设计：
 - `main` 只做最早期的硬约束。它不碰 RF 协议，也不碰视觉推理。
 - `--rf-input` 在 master 侧不是自由配置，而是固定路径约束。
-- `--vision-device` 只允许本地 `/dev/video*`，避免把运行时拉到别的设备类型上。
+- `--vision-device` 默认是本地 `/dev/video9`，但也允许可读的本地视频文件；两者都走同一个板侧本地运行时，不存在可接受的 stub 成功路径。
 
 你要抓住的点是：
 - `main.cpp` 的职责不是“启动所有功能”，而是“把能不能启动、从哪里启动”先判断清楚。
-- 这个入口已经把 master 侧的运行边界定住了：RF 用固定输入，视觉用本地摄像头设备。
+- 这个入口已经把 master 侧的运行边界定住了：RF 用固定输入，视觉默认用本地摄像头，也允许切到可读本地视频文件。
 
 ## 2. 启动参数与主题：`app_options.h` / `app_palette.*`
 
@@ -125,12 +125,28 @@ inline QString defaultVisionDevicePath() {
 inline bool isAllowedVisionDevicePath(const QString &path) {
     return path.startsWith(QStringLiteral("/dev/video"));
 }
+
+inline bool isReadableVisionInputFile(const QString &path) {
+    if (path.isEmpty()) {
+        return false;
+    }
+    const QFileInfo info(path);
+    return info.exists() && info.isFile() && info.isReadable();
+}
+
+inline bool isAllowedVisionInputPath(const QString &path) {
+    if (isAllowedVisionDevicePath(path)) {
+        return true;
+    }
+    return isReadableVisionInputFile(path);
+}
 ```
 
 这段的作用是把启动参数收口成两个字段。
 
 依赖：
-- 只依赖 `QString`。
+- `QString`
+- `QFileInfo`
 
 输入：
 - `main.cpp` 解析后的命令行参数。
@@ -146,7 +162,7 @@ inline bool isAllowedVisionDevicePath(const QString &path) {
 为什么这样设计：
 - 这里没有业务逻辑，只有配置载体。
 - 默认路径和允许规则都放在这里，避免入口和运行时到处散落常量。
-- `isAllowedVisionDevicePath()` 不是扩展点，而是启动前的最小白名单检查。
+- `isAllowedVisionDevicePath()` 和 `isAllowedVisionInputPath()` 的分工是“设备路径快速判定”和“启动前总入口校验”。
 
 再看主题：
 
@@ -605,6 +621,7 @@ QString RFGatewayClient::resolvedRfInputPath() const {
 ```cpp
 QObject::connect(gateway_, &QProcess::started, context_, ...);
 QObject::connect(gateway_, &QProcess::readyReadStandardOutput, context_, ...);
+QObject::connect(gateway_, &QProcess::readyReadStandardError, context_, ...);
 QObject::connect(gateway_, &QProcess::errorOccurred, context_, ...);
 QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), context_, ...);
 ```
@@ -614,13 +631,15 @@ QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finis
 输入：
 - 外部进程状态
 - stdout 行
+- stderr 诊断文本
 
 输出：
 - `updateSerialStatus()`
 - `addLog()`
 - `updateProtocolStats()`
 - `addRFEvent()`
-- `incrementDrop()/incrementParseError()/incrementCrcError()`
+- `appendDiagnosticChunk()/takeBufferedDiagnostics()`
+- `incrementParseError()`
 
 去向：
 - `DashboardBackend`
@@ -631,34 +650,31 @@ QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finis
 
 ### 5.4 行解析
 
-`handleGatewayLine()` 按几类模式处理：
+`handleProtocolLine()` 按 JSON envelope 的 `type` 字段处理：
 
-- `rf_gateway running: rf=...`
-  - 记录系统日志
-  - 标记 RF 链路状态
-- `[DRV_STATS] ...`
-  - 更新在线状态
-  - 更新 CRC、解析错误、驱动丢帧
-  - 记录 RF 日志
-- `[RF_STATS] ...`
-  - 只记录日志
-- `[RF] ...`
-  - 解析地址、按键、置信度、来源、序号、解码耗时、脉冲序列
-  - 写入 `RFEvent`
-  - 写入波形
-  - 更新在线状态
-- `decode failed`
-  - 丢帧计数加一
-- `parse ... fail`
-  - 解析错误加一
-- `CRC`
-  - CRC 错误加一
-- `[MQTT ...]`
-  - 归到 MQTT 日志
-- 其他行
-  - 归到 SYSTEM 日志
+- 非法 JSON / 缺少 `payload`
+  - `incrementParseError()`
+  - 记一条 `Invalid rf_gateway protocol JSON`
+- `type == "rf_event"`
+  - `parseRFEventPayload()` 解析 `addr/key/conf/src/seq/decode_us/pulse_us[]`
+  - `updateSerialStatus(true, rf_input)`
+  - `addRFEvent()` 写入事件和真实波形
+  - `addLog("INFO", "RF", line)`
+  - `mqtt_published == true` 时额外记 `addMqttPublishLog()`
+- `type == "device_status"`
+  - 从 `payload` 读取 `rf_online`、`driver_crc_err`、`app_drv_drop`
+  - `updateSerialStatus()` 和 `updateProtocolStats()`
+  - 记录 RF 日志 / MQTT 发布日志
+- `type == "rf_stats"`
+  - 从 `payload` 读取 `driver_crc_err`、`decode_no_frame`、`decode_err`、`drv_drop`
+  - `parseErrors = decode_no_frame + decode_err`
+  - 如有 `driver_online` 则同步在线状态
+  - 记录 RF 日志 / MQTT 发布日志
+- 未知 `type`
+  - `incrementParseError()`
+  - 记一条 `Unknown rf_gateway protocol type`
 
-这段的作用是把纯文本 stdout 变成结构化状态。
+这段的作用是把单行 JSON envelope 变成结构化状态。
 
 你要抓住的点是：
 - `rf_gateway` 输出不是给 UI 直接看的，而是给客户端解析器看的。
@@ -669,40 +685,42 @@ QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finis
 
 ### 6.0 `RFGatewayClient` helper 链：启动外部进程与解析 stdout
 
-这条链把“怎么启动 `rf_gateway`”和“怎么把 stdout 变成事件”串在一起看：
+这条链把“怎么启动 `rf_gateway`”和“怎么把 JSON stdout 变成事件”串在一起看：
 
 ```text
 fixedGatewayPath()
   -> resolveGatewayPath()
-  -> startGateway()
   -> resolvedRfInputPath()
   -> buildGatewayArgs()
+  -> startGateway()
   -> QProcess::setProgram()/setArguments()/start()
 
 QProcess::readyReadStandardOutput
-  -> handleGatewayLine()
-  -> parsePulseUsList()
-  -> updateSerialStatus()
-  -> addRFEvent()
-  -> addLog()
+  -> drainProtocolBuffer()
+  -> handleProtocolLine()
+  -> parseProtocolEnvelope()
+  -> parseRFEventPayload()
+  -> updateSerialStatus()/updateProtocolStats()/addRFEvent()/addLog()
 ```
 
-这条链里最关键的是：`fixedGatewayPath()` 先给出二进制的固定落点，`resolveGatewayPath()` 再验证它真的存在；`resolvedRfInputPath()` 把启动参数收敛回允许的输入路径，`buildGatewayArgs()` 只负责拼参数，不掺杂解析逻辑；`parsePulseUsList()` 则把 `[RF]` 行里逗号分隔的脉宽列表收束成 `QVector<int>`，再交给 `DashboardBackend` 去做快照写入。
+这条链里最关键的是：`fixedGatewayPath()` 先给出二进制的固定落点，`resolveGatewayPath()` 再验证它真的存在；`resolvedRfInputPath()` 不接受任意注入，最终只会落回 `/dev/rf433`；`buildGatewayArgs()` 只负责拼参数，不掺杂解析逻辑；`parseProtocolEnvelope()` 负责拆顶层 `type/topic/mqtt_published/payload`，`parseRFEventPayload()` 再把 `pulse_us[]` 等字段收束成 `RFEvent + QVector<int>`，最后交给 `DashboardBackend` 去做快照写入。
 
 | 函数 | 作用 | 依赖 | 输入 | 输出 | 去向 | 为什么这样设计 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `fixedGatewayPath()` | 给出 `rf_gateway` 的固定安装路径 | `QCoreApplication::applicationDirPath()` | 无 | 可预期的二进制路径 | `resolveGatewayPath()` | master 侧不开放任意 gateway 注入，只认包内固定落点 |
 | `resolveGatewayPath()` | 校验固定路径是否真实存在且可执行 | `QFileInfo` | `fixedGatewayPath()` 的结果 | 绝对路径或空串 | `startGateway()` | 把“路径拼出来”与“路径可用”分开，失败更早暴露 |
-| `resolvedRfInputPath()` | 收敛 RF 输入路径，默认回退到固定值 | `defaultRFInputPath()`、`options_.rfInput` | 命令行/默认值 | 进程参数用的输入路径 | `buildGatewayArgs()`、`startGateway()` | 让 master 的输入面保持收口，避免页面层误以为可任意传参 |
+| `resolvedRfInputPath()` | 收敛 RF 输入路径；当前实现除默认值外一律回退到固定值 | `defaultRFInputPath()`、`options_.rfInput` | 命令行/默认值 | 进程参数用的输入路径 | `buildGatewayArgs()`、`startGateway()` | 让 master 的输入面保持收口，避免页面层误以为可任意传参 |
 | `buildGatewayArgs()` | 拼出 `rf_gateway` 的启动参数 | `resolvedRfInputPath()` | 当前 options | `QStringList` | `QProcess::setArguments()` | 把参数拼接独立出来，便于单独审查与测试 |
-| `parsePulseUsList()` | 把 stdout 里的脉宽 CSV 转成整数数组 | `QString::split()`、`QString::toInt()` | `[RF]` 行中的 `pulse_us=` 字段 | `QVector<int>`，非法时返回空 | `handleGatewayLine()` -> `addRFEvent()` | 把文本解析边界收窄到一个 helper，避免事件写入里混进字符串处理 |
+| `parseProtocolEnvelope()` | 解析顶层 JSON envelope | `QJsonDocument`、`QJsonObject` | stdout 单行文本 | `type/topic/mqtt_published/payload` | `handleProtocolLine()` | 把 stdout ABI 固定成单行 JSON，而不是让页面层认识多套文本标签 |
+| `parseRFEventPayload()` | 把 `rf_event.payload` 里的真实字段还原成事件和波形 | `QJsonArray`、`QDateTime` | `payload.addr/key/conf/src/seq/decode_us/pulse_us[]` | `RFEvent`、`QVector<int>` | `handleProtocolLine()` -> `addRFEvent()` | 把 RF 事件解析边界收窄到一个 helper，避免事件写入里混进 JSON 细节 |
 
 `startGateway()` 的实际顺序是：
 
 ```text
 resolveGatewayPath()
   -> stop/cleanup old QProcess
-  -> QProcess::setProcessChannelMode(MergedChannels)
+  -> QProcess::setProcessChannelMode(SeparateChannels)
+  -> connect(started/stdout/stderr/error/finished)
   -> setProgram()
   -> setArguments(buildGatewayArgs())
   -> start()
@@ -714,8 +732,8 @@ stdout 这一侧则是：
 readyReadStandardOutput
   -> append into gatewayBuffer_
   -> split by newline
-  -> handleGatewayLine(line)
-  -> regex match / parsePulseUsList()
+  -> handleProtocolLine(line)
+  -> parseProtocolEnvelope() / parseRFEventPayload()
   -> backend_->updateSerialStatus()
   -> backend_->updateProtocolStats()
   -> backend_->addRFEvent()
@@ -724,7 +742,7 @@ readyReadStandardOutput
 
 这样拆的原因很简单：
 - 启动链只负责“把外部进程拉起来”，不负责理解协议。
-- 解析链只负责“把 stdout 变成结构化事件”，不负责创建进程。
+- 解析链只负责“把 JSON stdout 变成结构化事件”，不负责创建进程。
 - `DashboardBackend` 是唯一写入点，页面只读快照。
 
 ### 6.1 `RFStatusPage`
@@ -899,22 +917,25 @@ void VisionRuntime::stop() {
 
 `workerLoop()` 在本地启用时，顺序是这样的：
 
-1. 记录启动日志。
-2. 解析模型路径。
-3. 初始化 `rkYolov5s`。
-4. 打开 `V4L2Capture`。
-5. 启动视频流。
-6. 检查像素格式并映射到 RGA 格式。
-7. 循环抓帧。
-8. 把原始帧转成 RGB。
-9. 跑 `detector.infer()`。
-10. 生成 `VisionSnapshot`。
-11. `updateVisionState(snapshot)`。
-12. `capture.releaseFrame()`。
+1. 记录启动日志，解析模型路径，初始化 `rkYolov5s`。
+2. 按 `options_.visionDevice` 分支：
+   - `/dev/video*` 走 `V4L2Capture::open()/startStream()`
+   - 可读本地视频文件走 `MppDecoder::open()`，并先 decode 一帧拿到真实几何尺寸
+3. 基于真实输入尺寸分配 `FrameCopyPool`、`StreamFramePool` 和 RGB buffer。
+4. 起 `streamThread`，专门消费 RTSP 推流队列。
+5. 起 `sourceThread`，统一把相机帧或解码帧做双路 fan-out：
+   - 一路 `copyFrameToAiPool()` 送到 `rknnPool`
+   - 一路 `copyFrameToStreamPool()` 送到 `streamThread`
+6. 主循环 `aiPool.get()` 取回 AI 结果，把 NV12/YUYV 帧转成 RGB，渲染框图，必要时发布 detection MQTT。
+7. 组装 `VisionSnapshot`，调用 `updateVisionState(snapshot)`。
+8. 退出时 join `sourceThread` / `streamThread`，并关闭 `V4L2Capture` 或 `MppDecoder`。
 
-这段的作用是把“摄像头 -> 预处理 -> 推理 -> 回传”串成一个闭环。
+这段的作用是把“本地相机或本地视频文件 -> 统一产帧 -> AI/RTSP 双路 fan-out -> 推理快照回传”串成一个闭环。
 
 依赖：
+- `frame_pools.h`
+- `mpp_decoder.h`
+- `mpp_encoder_rtsp.h`
 - `preprocess.h`
 - `rkYolov5s.hpp`
 - `v4l2_capture.h`
@@ -922,6 +943,7 @@ void VisionRuntime::stop() {
 
 输入：
 - 摄像头设备，例如 `/dev/video9`
+- 可读的本地视频文件，例如板侧 MP4
 - 模型文件，例如 `model/yolov5s_relu-640-640-rk3568.rknn`
 
 输出：
@@ -929,6 +951,7 @@ void VisionRuntime::stop() {
 - 检测列表
 - FPS
 - 摄像头/模型状态
+- RTSP 推流状态
 - 错误文本
 
 去向：
@@ -936,7 +959,8 @@ void VisionRuntime::stop() {
 - `DashboardBackend::addLog()`
 
 为什么这样设计：
-- 模型加载、摄像头打开、推理失败都被降级成状态快照，而不是让线程崩掉。
+- 模型加载、相机打开、视频文件打开、推流失败都被降级成状态快照，而不是让线程崩掉。
+- 相机帧和 MP4 解码帧共用同一条本地 runtime，只在输入获取阶段分叉，不再维护“假的默认路径”。
 - 页面只需要知道当前能不能看、看到了什么、报了什么错。
 
 ### 7.2.1 `VisionRuntime` helper 链：本地模型 / 相机 / 渲染辅助函数
@@ -1189,7 +1213,7 @@ snapshot / frame 这条线：
 
 | 结构 | 字段谁写 | 谁读 | 多久刷新一次 |
 | --- | --- | --- | --- |
-| `RFEvent` | `RFGatewayClient::handleGatewayLine()` 在匹配 `[RF]` 行时一次性写入 `timestamp`、`address`、`key`、`confidence`、`source`、`frameSeq`、`decodeUs` | `DashboardBackend::snapshotRF()`，`RFStatusPage` 的最近解码区和历史表 | 事件驱动，每次 RF 解码命中刷新一次 |
+| `RFEvent` | `RFGatewayClient::handleProtocolLine()` 在匹配 `type == "rf_event"` 的 JSON envelope 时一次性写入 `timestamp`、`address`、`key`、`confidence`、`source`、`frameSeq`、`decodeUs` 和真实 `pulse_us[]` | `DashboardBackend::snapshotRF()`，`RFStatusPage` 的最近解码区和历史表 | 事件驱动，每次 RF 解码命中刷新一次 |
 | `VisionSnapshot` | `VisionRuntime::workerLoop()` 在每帧后写 `frame`、`detections`、`fps`、`frameCount`、`errorMsg`，`cameraOnline`、`modelLoaded`；`DashboardBackend::updateVisionState()` 统一把 `statusReported` 置真，`setVisionOffline()` 会重置离线态 | `MainWindow::updateStatusBar()`、`VisionPage::refresh()`、`SystemLogPage::refresh()` | 帧驱动，页面侧分别按 2000ms / 33ms / 1000ms 读快照，`fps` 本身大约每秒更新一次 |
 | `SystemStats` | `DashboardBackend::snapshotSystemStats()` 读 `/proc/stat`、`/proc/meminfo` 并缓存；`addLog()` 在 `source == "MQTT"` 时顺手累计 `mqttCount` | `MainWindow::updateStatusBar()`、`SystemLogPage::refresh()` | 系统统计缓存约每 1500ms 刷新一次，`uptimeSec` 每次快照都会递增 |
 

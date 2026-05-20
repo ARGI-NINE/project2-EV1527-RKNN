@@ -6,19 +6,23 @@
 - The runtime reuses a vendored RK3568 stack under
   `project2_master/third_party/rknn_yolov5_rk3568/`:
   `rkYolov5s`, `preprocess`, `postprocess`, `v4l2_capture`,
-  bundled RKNN/RGA headers/libs, and the local model assets.
-- The runtime does not use TCP, bridge transport, `pc_sim`, `drm_display`, `mpp_decoder`, or an MP4 primary path.
-- The default real camera input is `/dev/video9`.
+  `mpp_decoder`, `mpp_encoder_rtsp`, bundled RKNN/RGA/MPP headers/libs,
+  FFmpeg integration, and the local model assets.
+- The runtime does not use TCP transport, bridge transport, `pc_sim`, or `drm_display`.
+- The default real camera input is `/dev/video9`; `--vision-device` also accepts a readable local video file, which still runs through the same board-side runtime rather than any stub path.
 - The Qt page still consumes the existing `VisionSnapshot`; the integration point stays at `DashboardBackend::updateVisionState()`.
 
 ## Runtime Contract
 
 - RF remains on the existing real path:
-  `UART -> serdev -> /dev/rf433 -> rf_gateway -> qt_gui`
-- Vision now runs on the existing local board path:
-  `/dev/video9 -> V4L2Capture -> RGA preprocess -> RKNN infer -> postprocess -> VisionSnapshot -> Qt UI`
-- Only Linux `/dev/video*` devices are accepted for vision input.
-- Local video files are still not a supported primary input path.
+  `UART -> serdev -> /dev/rf433 -> rf_gateway(JSON envelope stdout) -> qt_gui`
+- Vision runs on one local board runtime with two real input branches:
+  - `/dev/video9 -> V4L2Capture -> sourceThread`
+  - `local MP4/video file -> MppDecoder -> sourceThread`
+- `sourceThread` performs the real dual fan-out for every frame:
+  - `copyFrameToAiPool()` -> RKNN infer -> `VisionSnapshot` / detection MQTT
+  - `copyFrameToStreamPool()` -> `streamThread` -> `MppRtspEncoder` -> RTSP push
+- The MP4 path is not a fake fallback. It is a first-class local decode branch used to feed the same AI and RTSP outputs as the camera branch.
 
 ## UI Behaviour
 
@@ -28,12 +32,11 @@
 
 ## Build Notes
 
-- `qt_gui/CMakeLists.txt` removes the unfinished bridge/network dependency.
-- On Linux, the Qt target conditionally adds the vendored RKNN/RGA/V4L2 sources and links the vendored RKNN/RGA runtime libraries.
-- On non-Linux hosts, the Qt build falls back to a stub status path so configure-time checks can still run.
+- `qt_gui/CMakeLists.txt` pulls in the local runtime sources, including `mpp_decoder.cc` and `mpp_encoder_rtsp.cc`.
+- The Qt target requires the vendored RKNN/RGA/MPP runtime libraries plus FFmpeg and `libmosquitto`; missing pieces fail the build instead of switching to a supported stub runtime.
+- `VisionRuntime` still contains an unsupported-configuration error branch for builds that somehow lack `DASHBOARD_HAVE_LOCAL_VISION_RUNTIME`, but that branch is an explicit failure state, not an acceptable default path.
 
 ## Validation Boundary
 
-- This change only wires the local direct vision code path into `project2_master`.
-- Hardware acceptance on the real RK3568 board has not been completed.
-- Treat the current state as code integration plus minimal build/static validation, not as full board-side signoff.
+- This document reflects the current code structure only.
+- The contract to preserve is: real local runtime, optional local video-file decode branch, and source-side dual fan-out into AI plus RTSP.

@@ -5,10 +5,10 @@
 - `project2_master` 是 RK3568 板端实时运行目录，不提供离线仿真入口。
 - `pc_sim` 是离线仿真/回归基线，不是板端实时路径。
 - `master` 当前唯一 RF 用户态输入是 `/dev/rf433`；`/dev/ttyS9` 仅属于底层 UART 物理链路，不是用户态默认输入。
-- 当前实时主链路是：`UART 基础链路 -> serdev 上层 RF 驱动 -> /dev/rf433 -> linux_app/rf_gateway -> qt_gui`。
-- Qt RF 波形来自 `rf_gateway` 输出的真实 `pulse_us=` CSV，源头是驱动帧中的真实脉冲数组，不再是按地址/键值反推的假波形。
-- RF 在线状态依据驱动 `online` 位和真实 `[RF]` 帧更新；仅有“`rf_gateway running`”并不代表 RF 已在线。
-- Qt 视觉页已改为板侧本地直连 `VisionRuntime`，默认真实输入为 `/dev/video9`，只允许 Linux `/dev/video*` 设备，不开放本地视频文件主路径；所需 RKNN/RGA 依赖已内聚到 `third_party/rknn_yolov5_rk3568/`。
+- 当前实时主链路是：`UART 基础链路 -> serdev 上层 RF 驱动 -> /dev/rf433 -> linux_app/rf_gateway(JSON envelope stdout) -> qt_gui`。
+- Qt RF 波形来自 `rf_gateway` 输出的 `rf_event` JSON payload 里的真实 `pulse_us[]` 数组，源头是驱动帧中的真实脉冲数组，不再是按地址/键值反推的假波形。
+- RF 在线状态依据 `device_status` / `rf_stats` JSON payload 里的驱动在线位和真实 `rf_event` 更新；仅有“`rf_gateway 已启动`”并不代表 RF 已在线。
+- Qt 视觉页已改为板侧本地直连 `VisionRuntime`，默认真实输入为 `/dev/video9`，同时保留可读本地视频文件（含本地 MP4）的解码支路；两者都走同一条板侧本地 runtime；所需 RKNN/RGA 依赖已内聚到 `third_party/rknn_yolov5_rk3568/`。
 - 已完成的是代码事实同步，不是端到端实机验收结论。
 
 ## 目录定位
@@ -17,7 +17,7 @@
 
 1. 从 `/dev/rf433` 实时读取 RF 帧。
 2. 进行协议解析与 EV1527 解码。
-3. 将结果输出到网关日志与 Qt 可视化界面。
+3. 将结果输出为 `rf_event` / `device_status` / `rf_stats` 单行 JSON envelope，并由 Qt 消费。
 
 本目录不提供可执行模拟入口，不作为离线回放容器。
 
@@ -34,7 +34,7 @@
 master 的 RF 数据路径固定为：
 
 ```text
-UART 物理链路 -> serdev 上层 RF 驱动 -> /dev/rf433 帧接口 -> linux_app/rf_gateway -> qt_gui
+UART 物理链路 -> serdev 上层 RF 驱动 -> /dev/rf433 帧接口 -> linux_app/rf_gateway(JSON envelope stdout) -> qt_gui
 ```
 
 说明：
@@ -105,8 +105,8 @@ cmake --build build -j
 
 - `/dev/rf433` 不存在：检查 `linux_driver/rf433_drv.ko` 是否加载。
 - 仅有 CRC/LEN 错误：回查下位机协议编码与线序。
-- 只有 gateway 启动日志但 RF 仍离线：检查驱动 `online` 位和是否真的收到 `[RF]` 帧。
-- UI 无 RF 事件：检查 `rf_gateway` stdout 是否包含 `[RF]` 和真实 `pulse_us=`。
+- 只有 gateway 启动日志但 RF 仍离线：检查 `device_status` / `rf_stats` JSON payload 里的在线位，以及是否真的收到 `rf_event`。
+- UI 无 RF 事件：检查 `rf_gateway` stdout 是否输出 `type="rf_event"` 的 JSON envelope，且 `payload.pulse_us[]` 为真实脉冲数组。
 - `--rf-input` 报非法：确认传参为 `/dev/rf433`。
 - 与 `pc_sim` 结果不一致：优先验证板端实时链路，再用 `pc_sim` 做离线对照。
 

@@ -121,13 +121,6 @@ def main() -> int:
             if delay > 0:
                 time.sleep(delay)
 
-            # Keep the legacy idx-only marker and add a timing side marker for UI/backend timing.
-            sys.stderr.write(f"FRAME_TS idx={int(item['idx'])}\n")
-            sys.stderr.write(
-                f"FRAME_META idx={int(item['idx'])} wav_sec={float(item['wav_sec']):.6f}\n"
-            )
-            sys.stderr.flush()
-
             out.write(packet)
             out.flush()
             prev_t = t

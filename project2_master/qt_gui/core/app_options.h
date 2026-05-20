@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QFileInfo>
 #include <QString>
 
 namespace dashboard {
@@ -19,6 +20,21 @@ inline QString defaultVisionDevicePath() {
 
 inline bool isAllowedVisionDevicePath(const QString &path) {
     return path.startsWith(QStringLiteral("/dev/video"));
+}
+
+inline bool isReadableVisionInputFile(const QString &path) {
+    if (path.isEmpty()) {
+        return false;
+    }
+    const QFileInfo info(path);
+    return info.exists() && info.isFile() && info.isReadable();
+}
+
+inline bool isAllowedVisionInputPath(const QString &path) {
+    if (isAllowedVisionDevicePath(path)) {
+        return true;
+    }
+    return isReadableVisionInputFile(path);
 }
 
 }  // namespace dashboard

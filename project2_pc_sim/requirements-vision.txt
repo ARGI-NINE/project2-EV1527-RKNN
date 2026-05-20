@@ -1,0 +1,12 @@
+# project2_pc_sim vision-capable Python dependencies
+#
+# Install this in the WSL bridge/runtime environment.
+# It includes the RF-only baseline and the bridge/runtime Python packages.
+-r requirements-rf.txt
+
+numpy
+opencv-python-headless
+
+# Install Rockchip's RKNN wheel separately inside the selected WSL runtime
+# when model execution is required for the retained bridge path.
+# Example: rknn-toolkit2 from the Rockchip release that matches the target flow.

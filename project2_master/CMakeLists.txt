@@ -10,9 +10,12 @@ option(BUILD_QT5_GUI "Build Qt5 C++ dashboard frontend" ON)
 
 if(BUILD_LINUX_APP)
   add_subdirectory(linux_app)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(rf_gateway_core PRIVATE _GNU_SOURCE)
+    target_compile_definitions(rf_gateway PRIVATE _GNU_SOURCE)
+  endif()
 endif()
 
 if(BUILD_QT5_GUI)
   add_subdirectory(qt_gui)
 endif()
-

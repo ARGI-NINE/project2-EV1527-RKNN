@@ -40,10 +40,8 @@ private:
 
     void drainBuffer(QByteArray *buffer, const QByteArray &chunk, const QString &source);
     void handleGatewayLine(const QString &line, const QString &source);
-    bool parseRfLine(const QString &line, RFEvent *event) const;
-    bool parseReplayFrameMarker(const QString &line, int *frameIndex) const;
-    bool parseReplayFrameMeta(const QString &line, int *frameIndex, double *wavSec) const;
-    qint64 computeFirstRfTimeoutMs() const;
+    bool parseGatewayEventLine(const QString &line, RFEvent *event) const;
+    qint64 computeFirstRfTimeoutMs(double replaySpeed) const;
 
     QString resolvePythonBin() const;
     QString resolveGatewayPath() const;

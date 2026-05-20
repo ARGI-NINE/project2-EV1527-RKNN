@@ -3,34 +3,28 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QFileInfo>
-#include <QRegularExpression>
-#include <QStringList>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 namespace dashboard {
 
 namespace {
 
+constexpr int kMaxBufferedDiagnosticsBytes = 8192;
+
 QString fixedGatewayPath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/rf_gateway");
 }
 
-QVector<int> parsePulseUsList(const QString &csv) {
-    QVector<int> pulses;
-    if (csv.isEmpty()) {
-        return pulses;
+QString scalarJsonString(const QJsonValue &value) {
+    if (value.isString()) {
+        return value.toString().trimmed();
     }
-
-    const QStringList parts = csv.split(',', QString::SkipEmptyParts);
-    pulses.reserve(parts.size());
-    for (const QString &part : parts) {
-        bool ok = false;
-        const int pulseUs = part.toInt(&ok);
-        if (!ok || pulseUs <= 0) {
-            return {};
-        }
-        pulses.append(pulseUs);
+    if (value.isDouble()) {
+        return QString::number(value.toDouble(), 'f', 0);
     }
-    return pulses;
+    return QString();
 }
 
 }  // namespace
@@ -59,6 +53,8 @@ void RFGatewayClient::stop() {
             gateway_->kill();
             gateway_->waitForFinished(500);
         }
+        flushProtocolBuffer();
+        gatewayStderrBuffer_.clear();
         gateway_->deleteLater();
         gateway_ = nullptr;
     }
@@ -122,7 +118,9 @@ void RFGatewayClient::startGateway() {
     }
 
     gateway_ = new QProcess(context_);
-    gateway_->setProcessChannelMode(QProcess::MergedChannels);
+    gateway_->setProcessChannelMode(QProcess::SeparateChannels);
+    gatewayStdoutBuffer_.clear();
+    gatewayStderrBuffer_.clear();
 
     QObject::connect(gateway_, &QProcess::started, context_, [this, gatewayPath, rfInputPath]() {
         if (backend_ != nullptr) {
@@ -136,30 +134,46 @@ void RFGatewayClient::startGateway() {
             return;
         }
 
-        gatewayBuffer_.append(QString::fromLocal8Bit(gateway_->readAllStandardOutput()));
-        int newlinePos = gatewayBuffer_.indexOf('\n');
-        while (newlinePos >= 0) {
-            const QString line = gatewayBuffer_.left(newlinePos).trimmed();
-            gatewayBuffer_.remove(0, newlinePos + 1);
-            if (!line.isEmpty()) {
-                handleGatewayLine(line);
-            }
-            newlinePos = gatewayBuffer_.indexOf('\n');
+        drainProtocolBuffer(gateway_->readAllStandardOutput());
+    });
+
+    QObject::connect(gateway_, &QProcess::readyReadStandardError, context_, [this]() {
+        if (gateway_ == nullptr) {
+            return;
         }
+
+        appendDiagnosticChunk(gateway_->readAllStandardError());
     });
 
     QObject::connect(gateway_, &QProcess::errorOccurred, context_, [this](QProcess::ProcessError error) {
         if (backend_ != nullptr) {
+            const QString diagnostics = takeBufferedDiagnostics();
+
             backend_->updateSerialStatus(false);
-            backend_->addLog("ERROR", "SYSTEM", QString("rf_gateway 运行异常: %1").arg(static_cast<int>(error)));
+            backend_->addLog(
+                "ERROR",
+                "SYSTEM",
+                diagnostics.isEmpty()
+                    ? QString("rf_gateway 运行异常: %1").arg(static_cast<int>(error))
+                    : QString("rf_gateway 运行异常: %1 stderr=%2").arg(static_cast<int>(error)).arg(diagnostics)
+            );
         }
     });
 
     QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), context_, [this](int code, QProcess::ExitStatus status) {
-        Q_UNUSED(status);
+        const QString diagnostics = takeBufferedDiagnostics();
+
+        flushProtocolBuffer();
         if (backend_ != nullptr) {
             backend_->updateSerialStatus(false);
-            backend_->addLog("WARN", "SYSTEM", QString("rf_gateway 已退出，code=%1").arg(code));
+            if ((status != QProcess::NormalExit || code != 0) && !diagnostics.isEmpty()) {
+                backend_->addLog("ERROR", "SYSTEM", QString("rf_gateway fatal stderr: %1").arg(diagnostics));
+            }
+            backend_->addLog(
+                (status == QProcess::NormalExit && code == 0) ? "WARN" : "ERROR",
+                "SYSTEM",
+                QString("rf_gateway 已退出，code=%1").arg(code)
+            );
         }
     });
 
@@ -168,95 +182,224 @@ void RFGatewayClient::startGateway() {
     gateway_->start();
 }
 
-void RFGatewayClient::handleGatewayLine(const QString &line) {
+void RFGatewayClient::drainProtocolBuffer(const QByteArray &chunk) {
+    if (chunk.isEmpty()) {
+        return;
+    }
+
+    gatewayStdoutBuffer_.append(chunk);
+    while (true) {
+        const int newlinePos = gatewayStdoutBuffer_.indexOf('\n');
+        QByteArray lineBytes;
+        QString line;
+
+        if (newlinePos < 0) {
+            break;
+        }
+
+        lineBytes = gatewayStdoutBuffer_.left(newlinePos);
+        gatewayStdoutBuffer_.remove(0, newlinePos + 1);
+        if (!lineBytes.isEmpty() && lineBytes.endsWith('\r')) {
+            lineBytes.chop(1);
+        }
+
+        line = QString::fromUtf8(lineBytes).trimmed();
+        if (line.isEmpty()) {
+            continue;
+        }
+
+        handleProtocolLine(line);
+    }
+}
+
+void RFGatewayClient::flushProtocolBuffer() {
+    QString line;
+
+    if (gatewayStdoutBuffer_.isEmpty()) {
+        return;
+    }
+
+    line = QString::fromUtf8(gatewayStdoutBuffer_).trimmed();
+    gatewayStdoutBuffer_.clear();
+    if (line.isEmpty()) {
+        return;
+    }
+
+    handleProtocolLine(line);
+}
+
+void RFGatewayClient::appendDiagnosticChunk(const QByteArray &chunk) {
+    if (chunk.isEmpty()) {
+        return;
+    }
+
+    gatewayStderrBuffer_.append(chunk);
+    if (gatewayStderrBuffer_.size() > kMaxBufferedDiagnosticsBytes) {
+        gatewayStderrBuffer_.remove(0, gatewayStderrBuffer_.size() - kMaxBufferedDiagnosticsBytes);
+    }
+}
+
+QString RFGatewayClient::takeBufferedDiagnostics() {
+    QString diagnostics;
+
+    if (gatewayStderrBuffer_.isEmpty()) {
+        return QString();
+    }
+
+    diagnostics = QString::fromUtf8(gatewayStderrBuffer_).trimmed();
+    diagnostics.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+    diagnostics.replace(QLatin1Char('\n'), QLatin1String(" | "));
+    gatewayStderrBuffer_.clear();
+    return diagnostics;
+}
+
+bool RFGatewayClient::parseProtocolEnvelope(
+    const QString &line,
+    QString *type,
+    QString *topic,
+    bool *mqttPublished,
+    QJsonObject *payload
+) const {
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(line.toUtf8(), &parseError);
+    const QJsonObject root = doc.object();
+
+    if (type == nullptr || topic == nullptr || mqttPublished == nullptr || payload == nullptr) {
+        return false;
+    }
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return false;
+    }
+
+    *type = scalarJsonString(root.value(QStringLiteral("type")));
+    *topic = scalarJsonString(root.value(QStringLiteral("topic")));
+    *mqttPublished = root.value(QStringLiteral("mqtt_published")).toBool(false);
+    if (type->isEmpty() || !root.value(QStringLiteral("payload")).isObject()) {
+        return false;
+    }
+
+    *payload = root.value(QStringLiteral("payload")).toObject();
+    return true;
+}
+
+bool RFGatewayClient::parseRFEventPayload(const QJsonObject &payload, RFEvent *event, QVector<int> *pulses) const {
+    const QString address = scalarJsonString(payload.value(QStringLiteral("addr")));
+    const QString key = scalarJsonString(payload.value(QStringLiteral("key")));
+    const QString source = scalarJsonString(payload.value(QStringLiteral("src")));
+    const QJsonValue confValue = payload.value(QStringLiteral("conf"));
+    const QJsonValue pulseArrayValue = payload.value(QStringLiteral("pulse_us"));
+    const QJsonArray pulseArray = pulseArrayValue.toArray();
+
+    if (event == nullptr || pulses == nullptr) {
+        return false;
+    }
+    if (address.isEmpty() || key.isEmpty() || source.isEmpty() || !confValue.isDouble() || !pulseArrayValue.isArray()) {
+        return false;
+    }
+
+    event->timestamp = QDateTime::currentDateTime();
+    event->address = address;
+    event->key = key;
+    event->confidence = confValue.toDouble();
+    event->source = source;
+    event->frameSeq = payload.value(QStringLiteral("seq")).isDouble()
+        ? static_cast<qint64>(payload.value(QStringLiteral("seq")).toDouble(-1.0))
+        : -1;
+    event->decodeUs = payload.value(QStringLiteral("decode_us")).isDouble()
+        ? static_cast<qint64>(payload.value(QStringLiteral("decode_us")).toDouble(-1.0))
+        : -1;
+
+    pulses->clear();
+    pulses->reserve(pulseArray.size());
+    for (const QJsonValue &value : pulseArray) {
+        const int pulseUs = value.toInt(-1);
+        if (!value.isDouble() || pulseUs <= 0) {
+            pulses->clear();
+            return false;
+        }
+        pulses->append(pulseUs);
+    }
+
+    return true;
+}
+
+void RFGatewayClient::handleProtocolLine(const QString &line) {
+    QString type;
+    QString topic;
+    QJsonObject payload;
+    bool mqttPublished = false;
+
     if (backend_ == nullptr) {
         return;
     }
 
-    static const QRegularExpression rfExpr(
-        R"(\[RF\]\s+addr=([^\s]+)\s+key=([^\s]+)\s+conf=([0-9.]+)\s+source=([^\s]+)\s+pulses=([0-9]+)(?:\s+seq=([0-9]+))?(?:\s+decode_us=([0-9]+))?(?:\s+pulse_us=([0-9,]+))?)"
-    );
-    static const QRegularExpression runningExpr(R"(rf_gateway\s+running:\s+rf=([^\s]+))");
-    static const QRegularExpression drvStatsExpr(
-        R"(\[DRV_STATS\]\s+frame_ok=(\d+)\s+crc_err=(\d+)\s+len_err=(\d+)\s+drop=(\d+)\s+online=(\d+)\s+seq=(\d+)\s+queue=(\d+)/(\d+))"
-    );
-    static const QRegularExpression finalStatsExpr(
-        R"(\[RF_STATS\].*?\bdrv_drop=(\d+)\b)"
-    );
-
-    const QRegularExpressionMatch runningMatch = runningExpr.match(line);
-    if (runningMatch.hasMatch()) {
-        backend_->updateSerialStatus(false, runningMatch.captured(1));
-        backend_->addLog("INFO", "SYSTEM", line);
+    if (!parseProtocolEnvelope(line, &type, &topic, &mqttPublished, &payload)) {
+        backend_->incrementParseError();
+        backend_->addLog("WARN", "RF", QString("Invalid rf_gateway protocol JSON: %1").arg(line));
         return;
     }
 
-    const QRegularExpressionMatch drvStatsMatch = drvStatsExpr.match(line);
-    if (drvStatsMatch.hasMatch()) {
-        const int crcErr = drvStatsMatch.captured(2).toInt();
-        const int lenErr = drvStatsMatch.captured(3).toInt();
-        const int driverDrop = drvStatsMatch.captured(4).toInt();
-        const bool linkOnline = drvStatsMatch.captured(5).toInt() != 0;
-        backend_->updateSerialStatus(linkOnline, resolvedRfInputPath());
-        backend_->updateProtocolStats(
-            crcErr,
-            crcErr + lenErr,     /* parseErrors = crc_err + len_err */
-            driverDrop
-        );
-        backend_->addLog("INFO", "RF", line);
-        return;
-    }
-
-    const QRegularExpressionMatch finalStatsMatch = finalStatsExpr.match(line);
-    if (finalStatsMatch.hasMatch()) {
-        backend_->addLog("INFO", "RF", line);
-        return;
-    }
-
-    const QRegularExpressionMatch rfMatch = rfExpr.match(line);
-    if (rfMatch.hasMatch()) {
-        const QVector<int> pulses = parsePulseUsList(rfMatch.captured(8));
+    if (type == QStringLiteral("rf_event")) {
         RFEvent event;
-        event.timestamp = QDateTime::currentDateTime();
-        event.address = rfMatch.captured(1);
-        event.key = rfMatch.captured(2);
-        event.confidence = rfMatch.captured(3).toDouble();
-        event.source = rfMatch.captured(4);
-        if (!rfMatch.captured(6).isEmpty())
-            event.frameSeq = rfMatch.captured(6).toLongLong();
-        if (!rfMatch.captured(7).isEmpty())
-            event.decodeUs = rfMatch.captured(7).toLongLong();
+        QVector<int> pulses;
 
-        backend_->updateSerialStatus(true, resolvedRfInputPath());
+        if (!parseRFEventPayload(payload, &event, &pulses)) {
+            backend_->incrementParseError();
+            backend_->addLog("WARN", "RF", QString("Invalid rf_event payload: %1").arg(line));
+            return;
+        }
+
+        backend_->updateSerialStatus(true, scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
+            ? resolvedRfInputPath()
+            : scalarJsonString(payload.value(QStringLiteral("rf_input"))));
         backend_->addRFEvent(event, pulses);
         backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
         return;
     }
 
-    if (line.contains("decode failed", Qt::CaseInsensitive)) {
-        backend_->incrementDrop();
-        backend_->addLog("WARN", "RF", line);
+    if (type == QStringLiteral("device_status")) {
+        const QString rfInputPath = scalarJsonString(payload.value(QStringLiteral("rf_input")));
+        const bool rfOnline = payload.value(QStringLiteral("rf_online")).toBool(false);
+        const int crcErrors = payload.value(QStringLiteral("driver_crc_err")).toInt(-1);
+        const int driverDropFrames = payload.value(QStringLiteral("app_drv_drop")).toInt(-1);
+
+        backend_->updateSerialStatus(rfOnline, rfInputPath.isEmpty() ? resolvedRfInputPath() : rfInputPath);
+        backend_->updateProtocolStats(crcErrors, -1, driverDropFrames);
+        backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
         return;
     }
 
-    if (line.contains("parse", Qt::CaseInsensitive) && line.contains("fail", Qt::CaseInsensitive)) {
-        backend_->incrementParseError();
-        backend_->addLog("WARN", "RF", line);
+    if (type == QStringLiteral("rf_stats")) {
+        const int crcErrors = payload.value(QStringLiteral("driver_crc_err")).toInt(-1);
+        const int parseErrors =
+            payload.value(QStringLiteral("decode_no_frame")).toInt(0) +
+            payload.value(QStringLiteral("decode_err")).toInt(0);
+        const int driverDropFrames = payload.value(QStringLiteral("drv_drop")).toInt(-1);
+
+        if (payload.contains(QStringLiteral("driver_online"))) {
+            backend_->updateSerialStatus(
+                payload.value(QStringLiteral("driver_online")).toBool(false),
+                scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
+                    ? resolvedRfInputPath()
+                    : scalarJsonString(payload.value(QStringLiteral("rf_input")))
+            );
+        }
+        backend_->updateProtocolStats(crcErrors, parseErrors, driverDropFrames);
+        backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
         return;
     }
 
-    if (line.contains("CRC", Qt::CaseInsensitive)) {
-        backend_->incrementCrcError();
-        backend_->addLog("WARN", "RF", line);
-        return;
-    }
-
-    if (line.contains("[MQTT", Qt::CaseInsensitive)) {
-        backend_->addLog("INFO", "MQTT", line);
-        return;
-    }
-
-    backend_->addLog("INFO", "SYSTEM", line);
+    backend_->incrementParseError();
+    backend_->addLog("WARN", "RF", QString("Unknown rf_gateway protocol type: %1").arg(line));
 }
 
 }  // namespace dashboard

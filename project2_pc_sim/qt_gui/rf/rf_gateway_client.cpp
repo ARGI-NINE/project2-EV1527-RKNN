@@ -10,7 +10,6 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QRegularExpression>
 
 namespace {
 
@@ -19,20 +18,29 @@ constexpr int kPrepTimeoutSeconds = kPrepTimeoutMs / 1000;
 constexpr qint64 kMinFirstRfTimeoutMs = 15000;
 constexpr qint64 kFirstRfTimeoutGraceMs = 5000;
 
-qint64 extractLongLongField(const QString &line, const QString &key, qint64 fallback = -1) {
-    static const QRegularExpression re(QStringLiteral("([A-Za-z0-9_]+)=([^\\s]+)"));
-    QRegularExpressionMatchIterator it = re.globalMatch(line);
-    while (it.hasNext()) {
-        const QRegularExpressionMatch match = it.next();
-        if (match.captured(1) != key) {
-            continue;
-        }
-
-        bool ok = false;
-        const qint64 value = match.captured(2).toLongLong(&ok);
-        return ok ? value : fallback;
+QString scalarJsonString(const QJsonValue &value) {
+    if (value.isString()) {
+        return value.toString().trimmed();
     }
-    return fallback;
+    if (value.isDouble()) {
+        return QString::number(value.toDouble(), 'f', 0);
+    }
+    return QString();
+}
+
+bool resolveReplaySpeed(double configuredSpeed, double *replaySpeed, QString *errorMessage) {
+    if (configuredSpeed <= 0.0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QString("--wav-speed must be > 0; got %1")
+                                .arg(QString::number(configuredSpeed, 'f', 3));
+        }
+        return false;
+    }
+
+    if (replaySpeed != nullptr) {
+        *replaySpeed = configuredSpeed;
+    }
+    return true;
 }
 
 }  // namespace
@@ -112,6 +120,12 @@ void RFGatewayClient::startGatewayProcess() {
 
     if (options_.wavPath.trimmed().isEmpty()) {
         failStart(QStringLiteral("--wav-input is required in fixed-chain mode"));
+        return;
+    }
+
+    QString replaySpeedError;
+    if (!resolveReplaySpeed(options_.wavSpeed, nullptr, &replaySpeedError)) {
+        failStart(replaySpeedError);
         return;
     }
 
@@ -238,6 +252,13 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
         return;
     }
 
+    double replaySpeed = 0.0;
+    QString replaySpeedError;
+    if (!resolveReplaySpeed(options_.wavSpeed, &replaySpeed, &replaySpeedError)) {
+        failStart(replaySpeedError);
+        return;
+    }
+
     if (!gatewayConnected_) {
         QObject::connect(&gatewayProcess_, &QProcess::readyReadStandardOutput, context_, [this]() {
             onGatewayStdout();
@@ -282,7 +303,6 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
     gatewayStdoutBuffer_.clear();
     gatewayStderrBuffer_.clear();
     replayStderrBuffer_.clear();
-    replayWavSecByIdx_.clear();
 
     gatewayProcess_.setProgram(gatewayPath);
     gatewayProcess_.setArguments(gatewayArgs);
@@ -294,7 +314,7 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
         QStringLiteral("--pulse-json"),
         runtimePulseJsonPath_,
         QStringLiteral("--speed"),
-        QString::number(options_.wavSpeed <= 0.0 ? 1.0 : options_.wavSpeed, 'f', 3)
+        QString::number(replaySpeed, 'f', 3)
     };
     if (options_.wavLoop) {
         replayArgs << QStringLiteral("--loop");
@@ -321,7 +341,7 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
 
     lastStartError_.clear();
     awaitingFirstRf_ = true;
-    firstRfTimeoutMs_ = computeFirstRfTimeoutMs();
+    firstRfTimeoutMs_ = computeFirstRfTimeoutMs(replaySpeed);
     firstRfTimer_.start(firstRfTimeoutMs_);
 
     backend_->updateSerialStatus(true, QStringLiteral("proc://rf_gateway/stdin"));
@@ -330,7 +350,7 @@ void RFGatewayClient::startGatewayWithRealtimeInput(const QString &gatewayPath) 
         QStringLiteral("RF"),
         QString("Starting realtime WAV replay: frames=%1 speed=%2 loop=%3 first_event_timeout_ms=%4")
             .arg(timelineFrameCount_)
-            .arg(QString::number(options_.wavSpeed <= 0.0 ? 1.0 : options_.wavSpeed, 'f', 3))
+            .arg(QString::number(replaySpeed, 'f', 3))
             .arg(options_.wavLoop ? QStringLiteral("on") : QStringLiteral("off"))
             .arg(firstRfTimeoutMs_)
     );
@@ -509,6 +529,34 @@ void RFGatewayClient::onPrepFinished(int exitCode, QProcess::ExitStatus exitStat
         failStart(QStringLiteral("No replayable frames extracted from WAV"));
         return;
     }
+    replayWavSecByIdx_.clear();
+    for (const QJsonValue &frameValue : frames) {
+        if (!frameValue.isObject()) {
+            continue;
+        }
+
+        const QJsonObject frameObj = frameValue.toObject();
+        const QJsonArray pulse = frameObj.value(QStringLiteral("pulse")).toArray();
+        if (pulse.isEmpty()) {
+            continue;
+        }
+
+        const QJsonValue idxValue = frameObj.contains(QStringLiteral("candidate_idx"))
+                                        ? frameObj.value(QStringLiteral("candidate_idx"))
+                                        : frameObj.value(QStringLiteral("idx"));
+        const QJsonValue wavSecValue = frameObj.contains(QStringLiteral("candidate_wav_sec"))
+                                           ? frameObj.value(QStringLiteral("candidate_wav_sec"))
+                                           : frameObj.value(QStringLiteral("wav_sec"));
+        if (!idxValue.isDouble() || !wavSecValue.isDouble()) {
+            continue;
+        }
+
+        const int frameIndex = static_cast<int>(idxValue.toDouble(-1.0));
+        const double wavSec = wavSecValue.toDouble(-1.0);
+        if (frameIndex > 0 && wavSec >= 0.0) {
+            replayWavSecByIdx_.insert(frameIndex, wavSec);
+        }
+    }
     const qint64 prepFinishedAtMs = QDateTime::currentMSecsSinceEpoch();
     (void)prepFinishedAtMs;
     backend_->addLog(
@@ -589,41 +637,24 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
         return;
     }
 
-    if (
-        text.startsWith(QStringLiteral("[RF]"), Qt::CaseInsensitive) &&
-        (
-            text.contains(QStringLiteral("decode failed"), Qt::CaseInsensitive) ||
-            text.contains(QStringLiteral("decode_failed"), Qt::CaseInsensitive)
-        )
-    ) {
-        backend_->incrementParseError();
-        backend_->addLog(QStringLiteral("WARN"), QStringLiteral("RF"), text);
-        return;
-    }
-
-    if (source == QStringLiteral("REPLAY_ERR")) {
-        int frameIndex = -1;
-        double wavSec = -1.0;
-        if (parseReplayFrameMeta(text, &frameIndex, &wavSec)) {
-            if (frameIndex > 0 && wavSec >= 0.0) {
-                replayWavSecByIdx_.insert(frameIndex, wavSec);
-            }
+    if (source == QStringLiteral("GATEWAY")) {
+        RFEvent event;
+        if (!parseGatewayEventLine(text, &event)) {
+            backend_->incrementParseError();
+            backend_->addLog(
+                QStringLiteral("WARN"),
+                QStringLiteral("RF"),
+                QString("Invalid rf_gateway JSON line: %1").arg(text)
+            );
             return;
         }
-        if (parseReplayFrameMarker(text, &frameIndex)) {
-            return;
-        }
-    }
 
-    RFEvent event;
-    if (parseRfLine(text, &event)) {
         if (awaitingFirstRf_) {
             awaitingFirstRf_ = false;
             firstRfTimer_.stop();
         }
 
-        event.frameSeq = extractLongLongField(text, QStringLiteral("seq"), -1);
-        if (event.frameSeq > 0) {
+        if (event.frameSeq > 0 && event.candidateWavSec < 0.0) {
             const int idx = static_cast<int>(event.frameSeq);
             if (replayWavSecByIdx_.contains(idx)) {
                 event.candidateWavSec = replayWavSecByIdx_.value(idx, -1.0);
@@ -644,9 +675,11 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
         if (event.candidateWavSec >= 0.0) {
             payloadObj.insert(QStringLiteral("wav_sec"), event.candidateWavSec);
         }
-        backend_->addMqttPublishLog(
-            QStringLiteral("home/rf433/report"),
-            QString::fromUtf8(QJsonDocument(payloadObj).toJson(QJsonDocument::Compact))
+        backend_->addLog(
+            QStringLiteral("INFO"),
+            QStringLiteral("RF"),
+            QString("RF replay report generated locally; not published via MQTT: %1")
+                .arg(QString::fromUtf8(QJsonDocument(payloadObj).toJson(QJsonDocument::Compact)))
         );
         return;
     }
@@ -668,87 +701,44 @@ void RFGatewayClient::handleGatewayLine(const QString &line, const QString &sour
     backend_->addLog(level, QStringLiteral("RF"), text);
 }
 
-bool RFGatewayClient::parseRfLine(const QString &line, RFEvent *event) const {
+bool RFGatewayClient::parseGatewayEventLine(const QString &line, RFEvent *event) const {
     if (event == nullptr) {
         return false;
     }
 
-    static const QRegularExpression re(
-        QStringLiteral("^\\[RF\\]\\s+addr=([^\\s]+)\\s+key=([^\\s]+)\\s+conf=([0-9]*\\.?[0-9]+)\\s+source=([^\\s]+).*$")
-    );
-    const QRegularExpressionMatch m = re.match(line);
-    if (!m.hasMatch()) {
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(line.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
         return false;
     }
 
-    bool confOk = false;
-    const double conf = m.captured(3).toDouble(&confOk);
-    if (!confOk) {
+    const QJsonObject obj = doc.object();
+    const QString address = scalarJsonString(obj.value(QStringLiteral("addr")));
+    const QString key = scalarJsonString(obj.value(QStringLiteral("key")));
+    const QString source = scalarJsonString(obj.value(QStringLiteral("src")));
+    const QJsonValue confValue = obj.value(QStringLiteral("conf"));
+
+    if (address.isEmpty() || key.isEmpty() || source.isEmpty() || !confValue.isDouble()) {
         return false;
     }
 
     event->timestamp = QDateTime::currentDateTime();
-    event->address = m.captured(1);
-    event->key = m.captured(2);
-    event->confidence = conf;
-    event->source = m.captured(4);
+    event->address = address;
+    event->key = key;
+    event->confidence = confValue.toDouble();
+    event->source = source;
+    event->frameSeq = -1;
+    event->candidateWavSec = -1.0;
 
-    return true;
-}
-
-bool RFGatewayClient::parseReplayFrameMarker(
-    const QString &line,
-    int *frameIndex) const {
-    if (frameIndex == nullptr) {
-        return false;
+    const QJsonValue seqValue = obj.value(QStringLiteral("seq"));
+    if (seqValue.isDouble()) {
+        event->frameSeq = static_cast<qint64>(seqValue.toDouble(-1.0));
+    }
+    const QJsonValue wavSecValue = obj.value(QStringLiteral("wav_sec"));
+    if (wavSecValue.isDouble()) {
+        event->candidateWavSec = wavSecValue.toDouble(-1.0);
     }
 
-    static const QRegularExpression markerRe(
-        QStringLiteral(
-            "^FRAME_TS\\s+idx=(\\d+)$"
-        )
-    );
-    const QRegularExpressionMatch m = markerRe.match(line);
-    if (!m.hasMatch()) {
-        return false;
-    }
-
-    bool idxOk = false;
-    const int idx = m.captured(1).toInt(&idxOk);
-    if (!idxOk) {
-        return false;
-    }
-
-    *frameIndex = idx;
-    return true;
-}
-
-bool RFGatewayClient::parseReplayFrameMeta(
-    const QString &line,
-    int *frameIndex,
-    double *wavSec) const {
-    if (frameIndex == nullptr || wavSec == nullptr) {
-        return false;
-    }
-
-    static const QRegularExpression markerRe(
-        QStringLiteral("^FRAME_META\\s+idx=(\\d+)\\s+wav_sec=([0-9]*\\.?[0-9]+)$")
-    );
-    const QRegularExpressionMatch m = markerRe.match(line);
-    if (!m.hasMatch()) {
-        return false;
-    }
-
-    bool idxOk = false;
-    bool secOk = false;
-    const int idx = m.captured(1).toInt(&idxOk);
-    const double sec = m.captured(2).toDouble(&secOk);
-    if (!idxOk || !secOk) {
-        return false;
-    }
-
-    *frameIndex = idx;
-    *wavSec = sec;
     return true;
 }
 
@@ -756,8 +746,7 @@ bool RFGatewayClient::parseReplayFrameMeta(
 
 
 
-qint64 RFGatewayClient::computeFirstRfTimeoutMs() const {
-    const double replaySpeed = options_.wavSpeed <= 0.0 ? 1.0 : options_.wavSpeed;
+qint64 RFGatewayClient::computeFirstRfTimeoutMs(double replaySpeed) const {
     // Rough estimate: assume ~50ms per frame at speed=1
     const qint64 estimatedMs = static_cast<qint64>(timelineFrameCount_ * 50.0 / replaySpeed);
     return qMax(kMinFirstRfTimeoutMs, estimatedMs + kFirstRfTimeoutGraceMs);

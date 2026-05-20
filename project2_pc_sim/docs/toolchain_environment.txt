@@ -214,10 +214,12 @@ The retained RF chain is orchestrated by the Qt process:
 1. Qt starts `python\wav_to_pulses.py`
 2. Qt writes `%TEMP%\project2_pc_sim_runtime\pulse_runtime.txt`
 3. Qt writes `%TEMP%\project2_pc_sim_runtime\pulse_runtime.json`
-4. Qt starts `rf_gateway.exe --rf-input - --stable-repeat 1 --min-publish-confidence 0.92`
-5. Qt starts `python\replay_pulse_timeline.py`
-6. replay sends timed AA55 frames to `rf_gateway` through stdin
-7. `rf_gateway` emits decoded RF events consumed by the Qt RF page
+4. Qt preloads `pulse_runtime.json` and builds an in-memory `candidate_idx/idx -> candidate_wav_sec/wav_sec` lookup before starting replay
+5. Qt starts `rf_gateway.exe --rf-input - --stable-repeat 1 --min-publish-confidence 0.92`
+6. Qt starts `python\replay_pulse_timeline.py`
+7. replay sends timed AA55 frames to `rf_gateway` through stdin; it does not emit `FRAME_TS` or `FRAME_META`
+8. `rf_gateway` emits one decoded event per stdout line as JSON including `addr`, `key`, `conf`, `src`, `pulses`, and `seq`
+9. Qt parses those gateway stdout JSON lines, backfills `wav_sec` from the preloaded `seq -> wav_sec` map when needed, then updates the RF page and local logs
 
 The current Qt-side Stage-1 preprocessing invocation is:
 
@@ -231,17 +233,20 @@ The current Qt-side replay invocation is:
 python\replay_pulse_timeline.py --pulse-json <pulse_runtime.json> --speed <wav_speed> [--loop]
 ```
 
-The replay metadata Qt still consumes is:
+The current gateway invocation is:
 
-- `FRAME_TS`
-- `FRAME_META idx=<n> wav_sec=<t>`
+```text
+rf_gateway.exe --rf-input - --stable-repeat 1 --min-publish-confidence 0.92
+```
 
-Functional RF metadata retained in Qt:
+The current RF metadata path visible to Qt is:
 
-- candidate replay time / `wav_sec`
-- decoded `addr`
-- decoded `key`
-- `confidence`
+- gateway stdout JSON fields `addr`, `key`, `conf`, `src`, `seq`
+- Qt-backfilled candidate replay time / `wav_sec`
+
+There is no `FRAME_TS` / `FRAME_META` sideband path in the current replay chain.
+
+The RF replay report written by Qt is a local dashboard log generated after parsing the JSON event. It is not a real MQTT publish.
 
 This `wav_sec` metadata is retained RF replay metadata. It is not standalone profiling residue.
 
