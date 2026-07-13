@@ -1,251 +1,260 @@
 # project2 共享 RF 协议深读
 
-这份文档只看两组真实源码：
+这份文档只讲“硬件侧和 master 侧怎样约定一帧脉冲”。如果你想看 EV1527 解码、MQTT 或 Qt，请去后面的 driver/userland 文档。这里必须把边界收得很紧。
 
-- [project2_master/common/rf_protocol.h](D:/project/repos/project2/project2_master/common/rf_protocol.h)
-- [project2_master/common/rf_protocol.c](D:/project/repos/project2/project2_master/common/rf_protocol.c)
-- [project2_hardware/Hardware/RF_Protocol.h](D:/project/repos/project2/project2_hardware/Hardware/RF_Protocol.h)
-- [project2_hardware/Hardware/RF_Protocol.c](D:/project/repos/project2/project2_hardware/Hardware/RF_Protocol.c)
-
-先把边界说清楚：
-
-- 这不是 EV1527 解码文档。
-- 这不是 `RF_Capture.c` 的采集细节文档。
-- 这不是 `RF_Uart.c` 的串口 FIFO 文档。
-- 这是一份“协议 ABI + 编解码实现 + master/hardware 对齐关系”的深读。
-
-你要抓住的点是：
-
-1. `rf_frame_t` 是两端共享的数据模型。
-2. `rf_proto_encode()` 只负责把 `rf_frame_t` 变成字节流。
-3. `hardware/Hardware/RF_Protocol.c` 额外实现了一个流式 parser，但 live transmit 链路的核心仍然是 `encode`。
-4. master/hardware 不是“共用同一个头文件路径”，而是“共用同一套字节契约”。
+兼容说明：以下先补回 `HEAD` 版章节骨架，便于沿用旧目录、旧引用和旧阅读顺序；后文现有正文、源码摘录和细讲全部保留。
 
 ## 补强索引
 
+兼容旧版目录：下文现有正文继续覆盖共享 ABI、字节流格式、`encode()`、hardware parser、Linux driver parser 边界和推荐走读顺序，本轮新增代码块与细讲保持不删。
+
 ### 0. 快速索引：先读哪三段
 
-这段的作用是先把阅读路线压缩成最短路径。你不要一上来就啃完整个文件，先抓住三段就够了。
-
-| 首读路线 | 先看什么 | 要解决的问题 |
-|---|---|---|
-| master 侧首读 | `project2_master/common/rf_protocol.h` -> `project2_master/common/rf_protocol.c` | 先确认 `rf_frame_t`、`SYNC`、`LEN`、`CRC` 的 ABI 和编码规则，搞清楚“这帧到底长什么样” |
-| hardware 侧首读 | `project2_hardware/Hardware/RF_Protocol.h` -> `project2_hardware/Hardware/RF_Protocol.c` | 先确认 parser 状态机和 encode 是否对齐，搞清楚“这帧怎么从字节流里被捞回来” |
-| 对照首读 | `project2_master/common/rf_protocol.c` -> `project2_hardware/Hardware/RF_Protocol.c` | 先对照 encode 和 parser，搞清楚“同一套契约在两端是不是一字不差” |
-
-如果你只想用三段先抓主线，就按这个顺序：
-
-1. 先看 `common/rf_protocol.h`，解决“协议边界和结构体长什么样”。
-2. 再看 `common/rf_protocol.c`，解决“每个字段怎么落到字节上”。
-3. 最后看 `Hardware/RF_Protocol.c`，解决“流式输入怎么同步、怎么恢复、怎么出帧”。
+兼容旧版目录：对应下文现有 `## 1. 先把边界讲死`、`## 3. 共享数据模型：rf_frame_t`、`## 6. rf_proto_encode() 真正做了什么` 与 `## 11. 推荐的代码走读顺序`。
 
 ### 1. 术语与契约表
 
-这段的作用是把同一批词先统一口径。你要抓住的点是：`frame`、`pulse`、`payload` 不是随便混着叫的，它们各自指的是不同层。
-
-| 术语 | 这段的作用是 | 你要抓住的点是 | master 负责 | hardware 负责 |
-|---|---|---|---|---|
-| `frame` | 描述一帧完整业务数据 | 它等价于 `rf_frame_t`，不是串口字节流本身 | 生产/消费 `rf_frame_t` | 接收/还原 `rf_frame_t` |
-| `pulse` | 描述单个脉冲样本 | 它是 `uint16_t` 宽度值，不是 1 字节 payload | 按脉冲数组组织数据 | 按脉冲数组恢复数据 |
-| `payload` | 描述线上传输的原始字节段 | 它是 `LEN` 后面的连续字节，不是业务字段名 | `encode()` 写出 payload | `parser` 先缓存 payload，再重组 |
-| `sync` | 描述帧同步边界 | 它是 `0xAA 0x55`，不是可变头 | 固定写入 | 固定识别 |
-| `len` | 描述本帧脉冲数量 | 它不是字节数，而是 `pulse[]` 的元素数 | 写入脉冲数 | 读取脉冲数并校验上限 |
-| `crc` | 描述完整性校验 | 它只覆盖 `LEN + PAYLOAD`，不覆盖 `SYNC` | 计算并写尾部 | 逐字节累计并比对 |
-| `encode` | 描述结构化到字节流的转换 | 它是 master/common 的输出口 | `rf_proto_encode()` | 镜像一致的编码规则 |
-| `parser` | 描述字节流到结构体的恢复 | 它是 hardware 侧的流式补偿能力 | 不负责状态机 | `rf_proto_parser_*()` |
-
-你要抓住的边界是：
-
-- `master/common` 负责定义和输出契约。
-- `hardware/Hardware` 负责按同一契约接收、验证、恢复。
-- 两端共享的是字节规则，不是实现细节。
-- 不是“谁都能改一点再试”，而是“改一处就要同步对齐整条契约”。
-
----
+兼容旧版目录：对应当前正文里 `frame/pulse/payload/sync/len/crc/encode/parser` 的边界说明。
 
 ## 1. 阅读顺序
 
-建议按下面顺序读，不要反着跳：
-
-1. 先看 [project2_master/common/rf_protocol.h](D:/project/repos/project2/project2_master/common/rf_protocol.h)
-2. 再看 [project2_master/common/rf_protocol.c](D:/project/repos/project2/project2_master/common/rf_protocol.c)
-3. 对照看 [project2_hardware/Hardware/RF_Protocol.h](D:/project/repos/project2/project2_hardware/Hardware/RF_Protocol.h)
-4. 最后看 [project2_hardware/Hardware/RF_Protocol.c](D:/project/repos/project2/project2_hardware/Hardware/RF_Protocol.c)
-
-为什么这么排：
-
-- 先看头文件，先确认 ABI。
-- 再看实现，确认每个字段怎么落字节。
-- 再看 hardware 侧的镜像实现，确认哪里是完全对齐，哪里是扩展。
-- 先看接口，再看数据流，不要上来就盯循环体。
-
-如果你只想快速抓主线，直接记这一句：
-
-> 这段协议的作用，是把“脉冲宽度数组”变成“可在 UART 上传输的稳定字节流”，并且能在另一端按同样规则还原回来。
-
----
+兼容旧版目录：对应下文现有 `## 11. 推荐的代码走读顺序`。
 
 ## 2. 文件职责
 
+兼容旧版目录：对应下文现有 `## 2. 相关源文件`、`## 7. 为什么 master/common 不带 parser`、`## 8. hardware parser 与 Linux 驱动 parser 的关系`。
+
 ### 2.1 master/common 侧
 
-| 文件 | 职责 | 你要抓住的点 |
-|---|---|---|
-| `common/rf_protocol.h` | 定义共享 ABI、常量、结构体、公开函数声明 | 这是协议边界，不是业务逻辑 |
-| `common/rf_protocol.c` | 实现 XOR 校验和封包 | 这里只有“编码”，没有“流式解析” |
+兼容旧版目录：对应当前正文里 `project2_master/common/rf_protocol.h/.c` 的共享 ABI 和 `encode()` 责任。
 
 ### 2.2 hardware/Hardware 侧
 
-| 文件 | 职责 | 你要抓住的点 |
-|---|---|---|
-| `Hardware/RF_Protocol.h` | 在共享 ABI 的基础上追加 parser ABI | 这是一个更完整的协议镜像 |
-| `Hardware/RF_Protocol.c` | 实现同样的编码，并额外实现字节流解析状态机 | 编码和 master 对齐，parser 是 hardware 扩展 |
+兼容旧版目录：对应当前正文里 `project2_hardware/Hardware/RF_Protocol.h/.c` 的镜像编码与 parser 责任。
 
 ### 2.3 关系结论
 
-不是“master 一套协议，hardware 另一套协议”。
-
-而是：
-
-- `master/common` 定义最小共享协议模型
-- `hardware/Hardware` 在同一模型上补上反向解析能力
-
-这就是为什么两个目录里都有 `RF_PROTO_SYNC0`、`RF_PROTO_SYNC1`、`RF_BUFFER_SIZE`、`rf_frame_t`，并且 `encode` 的实现逐字节对齐。
-
----
+兼容旧版目录：对应当前正文里“共享同一套字节契约，而不是共享同一个实现”的边界总结。
 
 ## 3. 先看 ABI
 
+兼容旧版目录：对应下文现有 `## 1. 先把边界讲死`、`## 3. 共享数据模型：rf_frame_t`、`## 4. 线上的帧格式`、`## 5. CRC 规则为什么很重要`。
+
 ### 3.1 头文件前置条件
 
-先看这段：
-
-```c
-#include <stddef.h>
-#include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-...
-
-#ifdef __cplusplus
-}
-#endif
-```
-
-这段的作用是：
-
-- `stddef.h` 提供 `size_t`
-- `stdint.h` 提供 `uint8_t`、`uint16_t`
-- `extern "C"` 保证 C++ 侧链接名不被改写
-
-依赖：
-
-- 标准 C 头文件
-- C/C++ 混合编译环境
-
-输入：
-
-- 编译器预处理阶段的头文件包含
-
-输出：
-
-- 对外稳定的 C ABI
-
-去向：
-
-- master 侧和 hardware 侧都可以按同一套函数名/结构体名调用
-
-为什么这样设计：
-
-- 协议层本来就是“跨编译单元、跨工程、甚至跨语言”的边界
-- 这里必须先把 ABI 固定住，再谈实现
-
-你要抓住的点是：
-
-- 这不是“某个模块的私有辅助头”
-- 而是“协议契约头”
+兼容旧版目录：对应当前正文里共享头文件、类型、跨端约束与最小公开面说明。
 
 ### 3.2 共享常量
 
-先看常量：
-
-```c
-#define RF_PROTO_SYNC0 0xAAu
-#define RF_PROTO_SYNC1 0x55u
-#define RF_BUFFER_SIZE 1024u
-```
+兼容旧版目录：对应当前正文里同步字、缓冲区上限和协议字段规则说明。
 
 #### `RF_PROTO_SYNC0` / `RF_PROTO_SYNC1`
 
-作用：
-
-- 定义帧头同步字节
-
-依赖：
-
-- 流式接收端需要一个可重锁定的边界标记
-
-输入：
-
-- 编码端固定写入
-- 解析端逐字节匹配
-
-输出：
-
-- `0xAA 0x55` 这一段帧头
-
-去向：
-
-- `rf_proto_encode()` 写入输出缓冲区
-- `rf_proto_parser_consume()` 用它做状态机起点
-
-为什么这样设计：
-
-- 这是一种低成本的帧边界标记
-- 流里一旦丢字节，parser 还能靠同步字重新找回帧边界
-
-不是 X，而是 Y：
-
-- 不是为了“好看”
-- 而是为了“在字节流里快速重同步”
+兼容旧版目录：对应下文现有 `## 4. 线上的帧格式` 中的同步头说明。
 
 #### `RF_BUFFER_SIZE`
 
-作用：
-
-- 定义一帧最多能装多少个 `uint16_t` 脉冲
-
-依赖：
-
-- 结构体数组上限
-- 编码缓冲区上限
-- 解析缓存上限
-
-输入：
-
-- 编译期常量 `1024`
-
-输出：
-
-- 统一的最大帧容量约束
-
-去向：
-
-- `rf_frame_t.pulse[RF_BUFFER_SIZE]`
-- `rf_proto_encode()` 的长度校验
-- `rf_proto_parser_consume()` 的长度校验
-
-为什么这样设计：
-
-- 协议层最怕两端对“最大长度”理解不一致
-- 这里用一个宏把“模型容量”和“线上的最大负载”钉死
+兼容旧版目录：对应下文现有 `## 3. 共享数据模型：rf_frame_t` 与长度上限说明。
 
 ### 3.3 `rf_frame_t`
 
-先看结构体：
+兼容旧版目录：对应下文现有 `## 3. 共享数据模型：rf_frame_t`。
+
+### 2. 资源生命周期与所有权
+
+兼容旧版目录：对应当前正文里 `rf_frame_t`、payload、parser 输出和两端责任边界的说明。
+
+### 3.4 hardware 侧额外 ABI
+
+兼容旧版目录：对应下文现有 `## 8. hardware parser 与 Linux 驱动 parser 的关系`。
+
+#### `rf_parse_state_t`
+
+兼容旧版目录：对应当前正文里 parser 状态机阶段说明。
+
+#### `rf_proto_parser_t`
+
+兼容旧版目录：对应当前正文里 parser 上下文、payload 缓冲和 CRC 累积说明。
+
+## 4. master/common/rf_protocol.c
+
+兼容旧版目录：对应下文现有 `## 5. CRC 规则为什么很重要` 与 `## 6. rf_proto_encode() 真正做了什么`。
+
+### 4.1 `rf_proto_crc8()`
+
+兼容旧版目录：对应下文现有 `## 5. CRC 规则为什么很重要`。
+
+### 4.2 `rf_proto_encode()`
+
+兼容旧版目录：对应下文现有 `## 6. rf_proto_encode() 真正做了什么`。
+
+#### 1. 空指针和长度校验
+
+兼容旧版目录：对应当前正文里输入校验、长度上限和失败返回说明。
+
+#### 2. 计算总长度
+
+兼容旧版目录：对应当前正文里 `SYNC + LEN + PAYLOAD + CRC` 的总长度公式。
+
+#### 3. 写同步字与长度
+
+兼容旧版目录：对应下文现有 `## 4. 线上的帧格式` 与 `## 6. rf_proto_encode() 真正做了什么`。
+
+#### 4. 写 payload
+
+兼容旧版目录：对应当前正文里按小端写出脉冲数组的说明。
+
+#### 5. 计算 CRC
+
+兼容旧版目录：对应下文现有 `## 5. CRC 规则为什么很重要`。
+
+#### 6. 写 CRC 并返回
+
+兼容旧版目录：对应当前正文里尾部校验字节和返回长度说明。
+
+## 5. hardware/Hardware/RF_Protocol.c
+
+兼容旧版目录：对应下文现有 `## 8. hardware parser 与 Linux 驱动 parser 的关系`。
+
+### 5.1 `rf_proto_parser_init()`
+
+兼容旧版目录：对应当前正文里 parser 初始化、复位和重新同步说明。
+
+### 5.2 `rf_proto_parser_consume()`
+
+兼容旧版目录：对应当前正文里逐字节消费、校验和出帧逻辑。
+
+#### `RF_PARSE_SYNC0`
+
+兼容旧版目录：对应当前正文里等待第一个同步字节的说明。
+
+#### `RF_PARSE_SYNC1`
+
+兼容旧版目录：对应当前正文里第二个同步字节、保留重同步机会的说明。
+
+#### `RF_PARSE_LEN0`
+
+兼容旧版目录：对应当前正文里长度低字节与 CRC 初值说明。
+
+#### `RF_PARSE_LEN1`
+
+兼容旧版目录：对应当前正文里长度高字节、上限校验与失败复位说明。
+
+#### `RF_PARSE_PAYLOAD`
+
+兼容旧版目录：对应当前正文里 payload 累积与 CRC 递推说明。
+
+#### `RF_PARSE_CRC`
+
+兼容旧版目录：对应当前正文里尾部校验通过后重组 `rf_frame_t` 的说明。
+
+### 3. 解析边界条件
+
+兼容旧版目录：对应当前正文里同步丢失、长度非法、CRC 错误、恢复路径和上层可见性的说明。
+
+## 6. master/hardware 对齐关系
+
+兼容旧版目录：对应下文现有 `## 7. 为什么 master/common 不带 parser`、`## 8. hardware parser 与 Linux 驱动 parser 的关系`、`## 10. 这条边界对后续文档有什么影响`。
+
+### 6.1 先看对齐表
+
+兼容旧版目录：对应当前正文里同步字、长度、payload、CRC 和 parser 责任对照。
+
+### 6.2 真正对齐的是什么
+
+兼容旧版目录：对应当前正文里“共享的是字节契约，不是上层解码结果”的说明。
+
+### 6.3 为什么 hardware 多出 parser
+
+兼容旧版目录：对应下文现有 `## 7. 为什么 master/common 不带 parser` 与 `## 8. hardware parser 与 Linux 驱动 parser 的关系`。
+
+### 6.4 对齐方式不是共享实现，而是共享契约
+
+兼容旧版目录：对应下文现有 `## 10. 这条边界对后续文档有什么影响`。
+
+## 7. 数据流总图
+
+兼容旧版目录：对应当前正文里编码链、parser 链和 master 侧消费链的串联说明。
+
+### 7.1 hardware 侧主链路
+
+兼容旧版目录：对应当前正文里 `rf_frame_t -> encode -> UART` 的发送链。
+
+### 7.2 hardware 侧镜像链路
+
+兼容旧版目录：对应当前正文里 `UART bytes -> parser -> rf_frame_t` 的恢复链。
+
+### 7.3 master 侧消费链路
+
+兼容旧版目录：对应当前正文里 Linux driver / userland / Qt 继续消费共享脉冲帧的说明。
+
+## 8. 逐项对照结论
+
+兼容旧版目录：对应下文现有 `## 9. 共享协议不包含什么` 与 `## 10. 这条边界对后续文档有什么影响`。
+
+### 8.1 这份协议的边界
+
+兼容旧版目录：对应下文现有 `## 1. 先把边界讲死`。
+
+### 8.2 最敏感的几个约束
+
+兼容旧版目录：对应当前正文里同步字、长度、小端 payload、CRC 覆盖范围和 parser 语义说明。
+
+### 8.3 你要抓住的最终结论
+
+兼容旧版目录：对应下文现有 `## 10. 这条边界对后续文档有什么影响` 与 `## 11. 推荐的代码走读顺序` 的收束。
+
+## 9. 最后一眼只看代码
+
+兼容旧版目录：对应当前正文里 `rf_frame_t`、线上的帧格式、`rf_proto_encode()` 和 parser 状态机的代码摘录。
+
+### 4. 最后一眼只看代码
+
+兼容旧版目录：对应当前正文里保留的真实源码片段与最小阅读骨架。
+
+## 1. 先把边界讲死
+
+共享协议只到 pulse frame 为止。
+
+它定义的是：
+
+- 帧同步头是什么
+- 长度字段怎么编码
+- 每个脉冲宽度怎么落到字节流
+- CRC 怎么算
+
+它不定义：
+
+- `addr`
+- `key`
+- `conf` / `confidence`
+- `source`
+- MQTT topic
+- Qt 页面展示字段
+
+因此，任何 `addr/key/conf` 都只能写成“上层解码结果”，不能写成“共享协议字段”。
+
+## 2. 相关源文件
+
+master 侧：
+
+- `project2_master/common/rf_protocol.h`
+- `project2_master/common/rf_protocol.c`
+
+hardware 侧：
+
+- `project2_hardware/Hardware/RF_Protocol.h`
+- `project2_hardware/Hardware/RF_Protocol.c`
+
+观察这四个文件时，你会看到一个很清楚的分工：
+
+- master 公共头里只保留最小 ABI 和编码函数
+- hardware 侧除了同样的编码函数，还提供了字节流 parser
+- Linux 驱动没有直接复用 hardware 的 parser 源码，而是按同一套规则实现了自己的状态机
+
+## 3. 共享数据模型：`rf_frame_t`
+
+两个世界共同认识的数据结构是：
 
 ```c
 typedef struct {
@@ -254,148 +263,72 @@ typedef struct {
 } rf_frame_t;
 ```
 
-这段的作用是：
+读这个结构时要抓住三个事实：
 
-- 定义“一帧脉冲数据”的共享内存模型
+1. 它只是一组脉冲宽度，单位是微秒级整型值。
+2. 它没有时间戳、没有序号、没有解码语义。
+3. `len` 只表示数组里前多少个 `pulse[]` 元素有效。
 
-依赖：
+也就是说，共享 ABI 的最小语义是：
 
-- `RF_BUFFER_SIZE`
-- `uint16_t`
+“这里有一帧高低电平交替脉冲，它包含 `len` 个脉冲宽度值。”
 
-输入：
-
-- 采集侧的脉冲宽度序列
-- 接收侧解包后的脉冲宽度序列
-
-输出：
-
-- 一个可以被 encode/decode 两端共同理解的帧对象
-
-去向：
-
-- hardware 侧：`RF_Capture` 产出它，`RF_Uart` 消费它
-- master 侧：驱动/应用层消费它，业务解码器继续处理它
-
-为什么这样设计：
-
-- `pulse[]` 保存真实脉冲宽度，不做提前业务化
-- `len` 单独记录有效元素数，避免 sentinel 风格的歧义
-
-你要抓住的点是：
-
-- 这不是“协议包结构体”
-- 这是“脉冲数据模型”
-
-它描述的是语义层的帧，不是线上字节流本身。
-
-### 2. 资源生命周期与所有权
-
-这段的作用是把“谁创建、谁持有、谁释放、谁转交”说死。你要抓住的点是：`rf_frame_t` 和 `rf_proto_parser_t` 都不是协议层偷偷帮你分配、偷偷帮你销毁的对象。
-
-| 对象 | 创建 | 持有 | 释放 | 转交 |
-|---|---|---|---|---|
-| `rf_frame_t` | 通常由上游采集侧、调用方栈上或堆上创建 | 创建者持有到 `encode` 或业务消费完成 | 创建者负责释放或出栈 | 作为 `rf_proto_encode()` 的输入传给编码层；也作为 `parser` 的输出交给上层 |
-| `rf_proto_parser_t` | 由 hardware 侧调用方创建并初始化 | 调用方跨字节持有同一个 parser 实例 | 调用方负责销毁或让其出作用域 | 不“转交所有权”，只在 `consume()` 中更新内部状态 |
-| 编码输出 `out` buffer | 由调用方准备 | 调用方持有容量和生命周期 | 调用方释放 | 只被 `rf_proto_encode()` 写入，不被协议层接管 |
-| 接收侧 buffer/queue | 由上游通信层或驱动层创建 | 队列所有者持有 | 队列所有者释放 | 协议层只消费其中的字节，不接管队列本身 |
-
-顺着这张表再看一遍实现，就会很清楚：
-
-1. `rf_frame_t` 不是协议层的临时中间件，它就是业务帧本体。
-2. `rf_proto_parser_t` 是状态机上下文，不是一次性函数局部变量。
-3. `rf_proto_encode()` 不申请内存，也不回收内存，只写调用方给的 `out`。
-4. `rf_proto_parser_consume()` 不回收队列，它只决定当前字节是推进状态，还是把当前帧作废。
-5. buffer/queue 的所有权边界不在协议层里，协议层只认“输入”和“输出”。
-
-不是 X，而是 Y：
-
-- 不是“协议层帮你管理对象生命周期”。
-- 而是“协议层只定义对象在什么时刻有效、什么时刻失效”。
-
-### 3.4 hardware 侧额外 ABI
-
-hardware 头文件比 master 多了这一段：
+来源：`project2_master/common/rf_protocol.h`，结构：`rf_frame_t`，作用：定义 master/common 暴露给上下游的最小共享脉冲帧模型。
 
 ```c
-typedef enum {
-    RF_PARSE_SYNC0 = 0,
-    RF_PARSE_SYNC1,
-    RF_PARSE_LEN0,
-    RF_PARSE_LEN1,
-    RF_PARSE_PAYLOAD,
-    RF_PARSE_CRC
-} rf_parse_state_t;
+#define RF_PROTO_SYNC0 0xAAu
+#define RF_PROTO_SYNC1 0x55u
+#define RF_BUFFER_SIZE 1024u
 
 typedef struct {
-    rf_parse_state_t state;
-    uint16_t expected_pulses;
-    uint16_t payload_index;
-    uint8_t payload[RF_BUFFER_SIZE * 2u];
-    uint8_t crc;
-} rf_proto_parser_t;
+    uint16_t pulse[RF_BUFFER_SIZE];
+    uint16_t len;
+} rf_frame_t;
+
+uint8_t rf_proto_crc8(const uint8_t *data, size_t len);
+size_t rf_proto_encode(const rf_frame_t *frame, uint8_t *out, size_t out_capacity);
 ```
 
-#### `rf_parse_state_t`
+这段头文件非常重要，因为它把 shared 层边界收得很死：
 
-作用：
+- 共享层只公开 `pulse[] + len`。
+- 共享层只公开“编码函数”，没有公开 parser、时间戳、序号或 decode 结果。
+- 这意味着 `addr/key/conf`、`timestamp_ns/seq` 这些字段天然都不属于 shared 层。
 
-- 描述字节流解析过程所处的阶段
+## 4. 线上的帧格式
 
-依赖：
+当前代码约定的字节流格式可以直接写成下面这张表：
 
-- 帧格式固定为 `SYNC + LEN + PAYLOAD + CRC`
+| 字段 | 字节数 | 含义 |
+| --- | --- | --- |
+| `SYNC0` | 1 | 固定 `0xAA` |
+| `SYNC1` | 1 | 固定 `0x55` |
+| `LEN_LO` | 1 | 脉冲数低字节 |
+| `LEN_HI` | 1 | 脉冲数高字节 |
+| `PAYLOAD` | `len * 2` | 每个脉冲宽度按 `uint16_t` 小端写入 |
+| `CRC` | 1 | 对 `LEN + PAYLOAD` 做逐字节 XOR |
 
-输入：
+写成公式就是：
 
-- 每一个串口字节
+```text
+AA 55 LEN_LO LEN_HI PULSE0_LO PULSE0_HI ... PULSEN_LO PULSEN_HI CRC
+```
 
-输出：
+这里没有任何压缩语义，也没有 EV1527 专属字段。它只是把一帧脉冲宽度数组稳定地搬过 UART。
 
-- 状态机迁移
+## 5. CRC 规则为什么很重要
 
-去向：
+`rf_proto_crc8()` 的实现非常直接：对 `LEN` 和 `PAYLOAD` 的每个字节依次 XOR。
 
-- `rf_proto_parser_consume()`
+它的价值不是“强校验”，而是“廉价地挡掉显然坏帧”，这样：
 
-为什么这样设计：
+- hardware 侧 parser 可以在收包时发现错误
+- Linux 驱动也可以在内核里做同样的判断
+- userland 不需要再去面对碎片化字节流
 
-- 流式输入必须是状态机，而不是一次性 `memcpy`
-- 逐字节消费才能处理噪声、半包、粘包和错位
+对这份代码走读而言，更重要的是一致性：master/common、hardware 侧都用同一条 XOR 规则，所以“帧到底合法吗”这个判断不会在两端漂移。
 
-#### `rf_proto_parser_t`
-
-作用：
-
-- 保存 parser 的运行时上下文
-
-字段逐个看：
-
-| 字段 | 作用 | 依赖 | 去向 |
-|---|---|---|---|
-| `state` | 当前解析阶段 | `rf_parse_state_t` | `rf_proto_parser_consume()` |
-| `expected_pulses` | 期望的脉冲数 | 长度字段 | payload 收集和最终还原 |
-| `payload_index` | 已收集字节数 | payload 累积过程 | 边界判断 |
-| `payload[RF_BUFFER_SIZE * 2u]` | 原始脉冲字节缓存 | 每个脉冲 2 字节 | 最终重组为 `rf_frame_t.pulse[]` |
-| `crc` | 累积校验值 | LEN + PAYLOAD | 与尾部 CRC 比较 |
-
-为什么 payload 用 `uint8_t[]`：
-
-- parser 是按字节流工作，不是按 `uint16_t` 数组工作
-- 先缓存原始字节，再在 CRC 通过后重组，这样更贴近串口输入模型
-
-不是 X，而是 Y：
-
-- 不是“先直接写成 `uint16_t` 再校验”
-- 而是“先按线上的字节形式收齐，再做结构化还原”
-
----
-
-## 4. master/common/rf_protocol.c
-
-### 4.1 `rf_proto_crc8()`
-
-先看代码：
+来源：`project2_master/common/rf_protocol.c`，函数：`rf_proto_crc8()`，作用：对 `LEN + PAYLOAD` 做逐字节 XOR，得到帧尾校验字节。
 
 ```c
 uint8_t rf_proto_crc8(const uint8_t *data, size_t len) {
@@ -408,48 +341,27 @@ uint8_t rf_proto_crc8(const uint8_t *data, size_t len) {
 }
 ```
 
-这段的作用是：
+这里没有多项式、查表或分段权重，只有一条非常朴素的 XOR 规则。所以这层的目标确实只是“挡掉显然坏帧”，不是提供强纠错能力。
 
-- 对一段字节做逐字节 XOR 累积
+## 6. `rf_proto_encode()` 真正做了什么
 
-依赖：
+master/common 里的 `rf_proto_encode()` 只负责一件事：把 `rf_frame_t` 序列化成线上的字节流。
 
-- `uint8_t` 输入数组
-- `size_t` 长度
+它依次完成：
 
-输入：
+1. 校验输入指针和 `frame->len`
+2. 计算 payload 字节数 `len * 2`
+3. 写入 `AA 55`
+4. 以小端写入 `LEN`
+5. 逐个写入 `pulse[i]` 的低字节和高字节
+6. 对 `LEN + PAYLOAD` 计算 XOR CRC
+7. 把 CRC 写到帧尾
 
-- 任意字节段
+如果你在阅读时只想抓主干，可以把它理解成：
 
-输出：
+`rf_frame_t` -> “稳定、可在 UART 上传输的一行二进制帧”
 
-- 一个 8 位校验值
-
-去向：
-
-- `rf_proto_encode()` 用它生成尾部 CRC
-
-为什么这样设计：
-
-- 计算成本低
-- 逐字节接收端也能同步重算
-- 适合协议层的轻量一致性检查
-
-你要抓住的点是：
-
-- 这个函数名叫 `crc8`
-- 但实现本质上不是多项式 CRC，而是 XOR 累积
-
-换句话说：
-
-- 不是“工业级强校验”
-- 而是“协议级轻量完整性检查”
-
-这也是为什么 master/hardware 两端必须保持完全一致：一个字节错了，结果就不同。
-
-### 4.2 `rf_proto_encode()`
-
-先看代码：
+来源：`project2_master/common/rf_protocol.c`，函数：`rf_proto_encode()`，作用：把 `rf_frame_t` 按 `AA55 + LEN + PAYLOAD + CRC` 线协议写成字节流。
 
 ```c
 size_t rf_proto_encode(const rf_frame_t *frame, uint8_t *out, size_t out_capacity) {
@@ -489,331 +401,82 @@ size_t rf_proto_encode(const rf_frame_t *frame, uint8_t *out, size_t out_capacit
 }
 ```
 
-这段的作用是：
+这段实现和 `rf_frame_t` 一起构成了 shared 层的完整“正向合同”：
 
-- 把 `rf_frame_t` 序列化成线上字节流
+- `SYNC0/SYNC1` 固定为 `0xAA/0x55`。
+- `LEN` 是小端 `uint16_t`，不是文本或变长编码。
+- `PAYLOAD` 只是 `uint16_t` 脉冲宽度数组原样落字节，没有压缩、没有解码语义。
 
-依赖：
+## 7. 为什么 master/common 不带 parser
 
-- `RF_PROTO_SYNC0`
-- `RF_PROTO_SYNC1`
-- `RF_BUFFER_SIZE`
-- `rf_proto_crc8()`
+`project2_master/common/rf_protocol.h` 当前只暴露：
+
 - `rf_frame_t`
+- `rf_proto_crc8()`
+- `rf_proto_encode()`
 
-输入：
+它没有暴露 parser API。和它对照，hardware 侧的 `RF_Protocol.h` 额外定义了：
 
-- `frame`: 待发送脉冲帧
-- `out`: 输出缓冲区
-- `out_capacity`: 输出缓冲区容量
+- `rf_parse_state_t`
+- `rf_proto_parser_t`
+- `rf_proto_parser_init()`
+- `rf_proto_parser_consume()`
 
-输出：
+这说明 master/common 的定位是“最小共享 ABI”，不是“提供一份跨所有环境直接复用的 parser 实现”。
 
-- 成功时返回实际写入长度
-- 失败时返回 `0`
-
-去向：
-
-- hardware 侧传给 UART 模块
-- master/pc_sim 侧也可以复用同样的编码逻辑做回环/测试
-
-为什么这样设计：
-
-- 编码函数必须只做一件事：确定性地把结构化帧压成字节流
-- 失败路径统一返回 `0`，调用方只需要看“是否大于 0”
-
-逐步拆：
-
-#### 1. 空指针和长度校验
+来源：`project2_hardware/Hardware/RF_Protocol.h`，结构：`rf_parse_state_t` / `rf_proto_parser_t`，作用：证明 parser 能力目前只在 hardware 侧头文件暴露，不在 master/common 的共享头里暴露。
 
 ```c
-if (frame == NULL || out == NULL) {
-    return 0u;
-}
-if (frame->len == 0u || frame->len > RF_BUFFER_SIZE) {
-    return 0u;
-}
+typedef enum {
+    RF_PARSE_SYNC0 = 0,
+    RF_PARSE_SYNC1,
+    RF_PARSE_LEN0,
+    RF_PARSE_LEN1,
+    RF_PARSE_PAYLOAD,
+    RF_PARSE_CRC
+} rf_parse_state_t;
+
+typedef struct {
+    rf_parse_state_t state;
+    uint16_t expected_pulses;
+    uint16_t payload_index;
+    uint8_t payload[RF_BUFFER_SIZE * 2u];
+    uint8_t crc;
+} rf_proto_parser_t;
+
+uint8_t rf_proto_crc8(const uint8_t *data, size_t len);
+size_t rf_proto_encode(const rf_frame_t *frame, uint8_t *out, size_t out_capacity);
+void rf_proto_parser_init(rf_proto_parser_t *parser);
+int rf_proto_parser_consume(rf_proto_parser_t *parser, uint8_t byte, rf_frame_t *out_frame);
 ```
 
-作用：
+也就是说，shared 层真正跨目录共享的是 `rf_frame_t + crc8 + encode`；parser 只是某些运行环境各自需要的“本地实现能力”。
 
-- 防止非法输入继续写缓冲区
+从架构上看，这是合理的：
 
-依赖：
+- STM32 firmware 需要字节流 parser，因为它直接面对串口接收
+- Linux 驱动也需要 parser，但它在内核环境里工作，要自己维护锁、队列、统计和在线状态
+- 用户态 `rf_gateway` 已经不看原始字节流，只看 `/dev/rf433` 输出的整帧，所以根本不需要这个 parser
 
-- `rf_frame_t.len` 的有效范围约束
+## 8. hardware parser 与 Linux 驱动 parser 的关系
 
-输入：
-
-- 指针参数与帧长度
-
-输出：
-
-- 失败直接返回
-
-去向：
-
-- 上层判断封包是否可发送
-
-为什么这样设计：
-
-- 协议层不替调用方吞掉错误
-- 这里宁可早失败，也不要生成一包看起来“像样”但实际非法的字节流
-
-#### 2. 计算总长度
-
-```c
-bytes = (uint16_t)(frame->len * 2u);
-total = (size_t)2u + 2u + bytes + 1u;
-```
-
-作用：
-
-- 计算最终包长
-
-依赖：
-
-- 每个脉冲固定占 2 字节
-- 前缀有 2 字节同步字
-- 长度字段占 2 字节
-- 尾部有 1 字节 CRC
-
-输入：
-
-- `frame->len`
-
-输出：
-
-- `total`
-
-去向：
-
-- 容量检查
-- 返回值
-
-为什么这样设计：
-
-- 这是一个完全可预估的定长格式
-- 先算总长度，才能在写入前判断缓冲区是否足够
-
-总长度公式就是：
+hardware 侧 `rf_proto_parser_consume()` 和 Linux 驱动里的 `parser_feed_byte()` 虽然不共用源码，但状态机是同构的：
 
 ```text
-2(sync) + 2(len) + 2*len(payload) + 1(crc)
+SYNC0 -> SYNC1 -> LEN0 -> LEN1 -> PAYLOAD -> CRC
 ```
 
-`len = 1024` 时，最大包长是 `2053` 字节。
+它们共同遵守的规则包括：
 
-#### 3. 写同步字与长度
+- 只有看到 `0xAA 0x55` 才进入长度解析
+- `LEN` 是小端 `uint16_t`
+- `LEN == 0` 或超过上限都视为错误
+- payload 按脉冲宽度小端读取
+- CRC 不匹配直接丢弃当前帧并复位
 
-```c
-out[0] = RF_PROTO_SYNC0;
-out[1] = RF_PROTO_SYNC1;
-out[2] = (uint8_t)(frame->len & 0xFFu);
-out[3] = (uint8_t)((frame->len >> 8u) & 0xFFu);
-```
+你在读 driver 文档时可以把这一点当成“协议一致性检查清单”：即使实现位置不同，语义也必须保持一致。
 
-作用：
-
-- 生成帧头与长度字段
-
-依赖：
-
-- 小端序长度定义
-
-输入：
-
-- `frame->len`
-
-输出：
-
-- `AA 55 LEN_LO LEN_HI`
-
-去向：
-
-- 线上的固定协议头
-
-为什么这样设计：
-
-- 同步字负责找边界
-- 长度字段负责告诉接收端 payload 有多长
-
-你要抓住的点是：
-
-- 这不是“可选字段”
-- 这是 parser 必须依赖的最小元数据
-
-#### 4. 写 payload
-
-```c
-for (i = 0u; i < frame->len; ++i) {
-    const uint16_t p = frame->pulse[i];
-    const size_t off = (size_t)4u + (size_t)i * 2u;
-    out[off] = (uint8_t)(p & 0xFFu);
-    out[off + 1u] = (uint8_t)((p >> 8u) & 0xFFu);
-}
-```
-
-作用：
-
-- 把每个 `uint16_t` 脉冲按小端写入字节流
-
-依赖：
-
-- `frame->pulse[]`
-- `frame->len`
-
-输入：
-
-- 脉冲数组
-
-输出：
-
-- `len * 2` 字节的 payload
-
-去向：
-
-- CRC 计算输入
-- 串口最终发送内容
-
-为什么这样设计：
-
-- 主机和 MCU 都默认低字节在前
-- 这使得“数值语义”和“传输字节顺序”一一对应
-
-不是 X，而是 Y：
-
-- 不是把脉冲转成文本
-- 而是保持二进制原样传输，减少额外解释层
-
-#### 5. 计算 CRC
-
-```c
-crc = rf_proto_crc8(&out[2], (size_t)2u + bytes);
-```
-
-作用：
-
-- 对 `LEN + PAYLOAD` 做 XOR 校验
-
-依赖：
-
-- 已写入的长度字段和 payload
-
-输入：
-
-- 从 `out[2]` 开始的连续字节
-
-输出：
-
-- 一个尾部 CRC 字节
-
-去向：
-
-- `out[4 + bytes]`
-
-为什么这样设计：
-
-- 校验范围不包含同步字
-- 同步字用于重锁定，长度与 payload 才是内容一致性检查对象
-
-#### 6. 写 CRC 并返回
-
-```c
-out[4u + bytes] = crc;
-return total;
-```
-
-作用：
-
-- 完成封包
-
-依赖：
-
-- 前面所有写入步骤成功
-
-输入：
-
-- `crc`
-
-输出：
-
-- 完整协议包长度
-
-去向：
-
-- 调用方直接发送 `out[0..total-1]`
-
-为什么这样设计：
-
-- 返回总长度比返回布尔值更实用
-- 调用方不需要重新计算包长
-
----
-
-## 5. hardware/Hardware/RF_Protocol.c
-
-hardware 侧先看结论：
-
-- `rf_proto_crc8()` 和 `rf_proto_encode()` 与 master/common 的行为一致
-- 额外增加了 `rf_proto_parser_init()` 和 `rf_proto_parser_consume()`
-
-这说明什么：
-
-- 编码协议是共享契约
-- parser 是 hardware 侧补齐的反向能力
-
-### 5.1 `rf_proto_parser_init()`
-
-先看代码：
-
-```c
-void rf_proto_parser_init(rf_proto_parser_t *parser) {
-    if (parser == NULL) {
-        return;
-    }
-    memset(parser, 0, sizeof(*parser));
-    parser->state = RF_PARSE_SYNC0;
-}
-```
-
-这段的作用是：
-
-- 清零 parser 上下文
-- 把状态机重置到起点
-
-依赖：
-
-- `memset`
-- `rf_proto_parser_t`
-
-输入：
-
-- parser 指针
-
-输出：
-
-- 一个可以重新从 `SYNC0` 开始消费字节流的状态机
-
-去向：
-
-- 初始化阶段
-- 错误恢复阶段
-- 成功解析一帧后的复位阶段
-
-为什么这样设计：
-
-- parser 的职责不是“记住历史”，而是“尽快回到可消费状态”
-- 每次异常后直接重置，比保留半截脏状态更安全
-
-你要抓住的点是：
-
-- 这是一个状态机的“软复位”
-- 不是单纯的内存清零
-
-### 5.2 `rf_proto_parser_consume()`
-
-先看代码：
+来源：`project2_hardware/Hardware/RF_Protocol.c`，函数：`rf_proto_parser_consume()`，作用：hardware 侧按字节恢复 `rf_frame_t`。
 
 ```c
 int rf_proto_parser_consume(rf_proto_parser_t *parser, uint8_t byte, rf_frame_t *out_frame) {
@@ -882,454 +545,131 @@ int rf_proto_parser_consume(rf_proto_parser_t *parser, uint8_t byte, rf_frame_t 
 }
 ```
 
-这段的作用是：
-
-- 按字节消费串口数据
-- 识别完整帧
-- 校验通过后还原出 `rf_frame_t`
-
-依赖：
-
-- `rf_parse_state_t`
-- `rf_proto_parser_t`
-- `rf_frame_t`
-- `RF_PROTO_SYNC0`
-- `RF_PROTO_SYNC1`
-- `RF_BUFFER_SIZE`
-- `rf_proto_parser_init()`
-
-输入：
-
-- `byte`：当前串口字节
-- `parser`：状态机上下文
-- `out_frame`：输出帧对象
-
-输出：
-
-- `1`：成功解析出一帧
-- `0`：还在解析中
-- `-1`：出错并已复位
-
-去向：
-
-- 任何以字节流为输入的上层消费逻辑
-
-为什么这样设计：
-
-- 串口输入天然是流，不是包
-- parser 必须容忍噪声、半包和粘包
-- 解析函数的返回值设计成三态，调用方不用猜
-
-逐状态看。
-
-#### `RF_PARSE_SYNC0`
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`parser_feed_byte()`，作用：Linux driver 侧按同一协议状态机恢复一帧，并在 CRC 成功后转给 `parser_emit_frame()`。
 
 ```c
-case RF_PARSE_SYNC0:
-    if (byte == RF_PROTO_SYNC0) {
-        parser->state = RF_PARSE_SYNC1;
-    }
-    break;
-```
+static void parser_feed_byte(struct rf433_priv *priv, u8 byte)
+{
+	priv->last_byte_jiffies = jiffies;
 
-作用：
+	switch (priv->state) {
+	case RF_ST_SYNC0:
+		if (byte == SYNC0)
+			priv->state = RF_ST_SYNC1;
+		break;
 
-- 等待第一个同步字节
+	case RF_ST_SYNC1:
+		if (byte == SYNC1) {
+			priv->state       = RF_ST_LEN0;
+			priv->crc_accum   = 0;
+			priv->expected_pulses = 0;
+			priv->payload_idx = 0;
+		} else if (byte == SYNC0) {
+			/* stay in SYNC1 — consecutive 0xAA */
+		} else {
+			priv->state = RF_ST_SYNC0;
+		}
+		break;
 
-为什么这样设计：
+	case RF_ST_LEN0:
+		priv->expected_pulses = byte;
+		priv->crc_accum       = byte;
+		priv->state           = RF_ST_LEN1;
+		break;
 
-- 任何一帧的起点都先从 `0xAA` 开始
-- 没看到起点前，其他字节都只能视为噪声
+	case RF_ST_LEN1:
+		priv->expected_pulses |= (u16)byte << 8;
+		priv->crc_accum       ^= byte;
+		if (priv->expected_pulses == 0 ||
+		    priv->expected_pulses > RF433_MAX_PULSES) {
+			priv->stats.len_err++;
+			parser_reset(priv);
+		} else {
+			priv->state = RF_ST_PAYLOAD;
+		}
+		break;
 
-#### `RF_PARSE_SYNC1`
+	case RF_ST_PAYLOAD:
+		priv->payload_buf[priv->payload_idx++] = byte;
+		priv->crc_accum ^= byte;
+		if (priv->payload_idx >= (u16)(priv->expected_pulses * 2u))
+			priv->state = RF_ST_CRC;
+		break;
 
-```c
-case RF_PARSE_SYNC1:
-    if (byte == RF_PROTO_SYNC1) {
-        parser->state = RF_PARSE_LEN0;
-        parser->crc = 0u;
-        parser->expected_pulses = 0u;
-        parser->payload_index = 0u;
-    } else if (byte != RF_PROTO_SYNC0) {
-        parser->state = RF_PARSE_SYNC0;
-    }
-    break;
-```
-
-作用：
-
-- 等待第二个同步字节
-- 成功后顺手清空本帧的运行状态
-
-为什么这样设计：
-
-- 如果当前字节又是 `0xAA`，parser 保留它作为下一次同步起点的可能
-- 这就是“不是全丢，而是尽量保留重同步机会”
-
-你要抓住的点是：
-
-- 这里不是简单的“错了就重置”
-- 而是“尽量不浪费连续的同步字节”
-
-#### `RF_PARSE_LEN0`
-
-```c
-case RF_PARSE_LEN0:
-    parser->expected_pulses = byte;
-    parser->crc = byte;
-    parser->state = RF_PARSE_LEN1;
-    break;
-```
-
-作用：
-
-- 收集长度低字节
-
-依赖：
-
-- 小端长度定义
-
-为什么这样设计：
-
-- 先把低字节放进 `expected_pulses`
-- 同时把它作为 CRC 初值，和编码端保持一致
-
-#### `RF_PARSE_LEN1`
-
-```c
-case RF_PARSE_LEN1:
-    parser->expected_pulses |= (uint16_t)((uint16_t)byte << 8u);
-    parser->crc ^= byte;
-    if (parser->expected_pulses == 0u || parser->expected_pulses > RF_BUFFER_SIZE) {
-        rf_proto_parser_init(parser);
-        return -1;
-    }
-    parser->state = RF_PARSE_PAYLOAD;
-    break;
-```
-
-作用：
-
-- 收集长度高字节
-- 校验长度合法性
-
-依赖：
-
-- `RF_BUFFER_SIZE`
-
-为什么这样设计：
-
-- 长度一旦非法，后面的 payload 都没有意义
-- 这里提前失败，避免继续吃垃圾字节
-
-不是 X，而是 Y：
-
-- 不是“读完 payload 再检查长度”
-- 而是“长度字段一出错就立即拒绝”
-
-#### `RF_PARSE_PAYLOAD`
-
-```c
-case RF_PARSE_PAYLOAD:
-    parser->payload[parser->payload_index++] = byte;
-    parser->crc ^= byte;
-    if (parser->payload_index >= (uint16_t)(parser->expected_pulses * 2u)) {
-        parser->state = RF_PARSE_CRC;
-    }
-    break;
-```
-
-作用：
-
-- 累积 payload 字节
-- 同步更新 XOR 校验
-
-为什么这样设计：
-
-- 一边收包一边校验，成本最低
-- 不需要在最后再把整个 payload 重新扫一遍
-
-#### `RF_PARSE_CRC`
-
-```c
-case RF_PARSE_CRC: {
-    uint16_t i = 0u;
-    if (byte != parser->crc) {
-        rf_proto_parser_init(parser);
-        return -1;
-    }
-    out_frame->len = parser->expected_pulses;
-    for (i = 0u; i < parser->expected_pulses; ++i) {
-        const uint16_t lo = parser->payload[(size_t)i * 2u];
-        const uint16_t hi = parser->payload[(size_t)i * 2u + 1u];
-        out_frame->pulse[i] = (uint16_t)(lo | (uint16_t)(hi << 8u));
-    }
-    rf_proto_parser_init(parser);
-    return 1;
+	case RF_ST_CRC:
+		if (byte != priv->crc_accum) {
+			priv->stats.crc_err++;
+			parser_reset(priv);
+		} else {
+			parser_emit_frame(priv);
+			parser_reset(priv);
+		}
+		break;
+	}
 }
 ```
 
-作用：
+两段代码对照起来，shared 层的真实边界就非常清楚了：
 
-- 校验尾部 CRC
-- 把原始字节重组为 `rf_frame_t`
+- 两边都遵守同一个 `AA55 -> LEN -> PAYLOAD -> CRC` 规则，这是共享协议。
+- hardware 侧成功后写出 `rf_frame_t`，driver 侧成功后先写出 `struct rf433_frame`，但其中真正跨环境稳定的核心仍然只是 `pulse[] + len` 这层语义。
+- `timestamp_ns`、`seq`、`online`、`addr`、`key`、`stdout JSON envelope` 都发生在 shared 层之外。
 
-为什么这样设计：
+## 9. 共享协议不包含什么
 
-- 只有 CRC 过了，才把字节流提升回结构化帧
-- 这避免了半包污染上层业务
+这是最值得反复强调的一节。
 
-你要抓住的点是：
+### 9.1 不包含解码结果
 
-- parser 的输出不是“原始包”
-- 而是“已经验证过的 `rf_frame_t`”
+`addr`、`key`、`confidence` 出现在 `linux_app/main.c` 组装的 `rf_event.payload` 里，来源是：
 
-### 3. 解析边界条件
+- `rf_decode_frame()`
+- `rf_decode_ev1527_c_with_stats()`
 
-这段的作用是把异常路径一次说清楚。你要抓住的点是：parser 不是“尽量修一修”，而是“该丢就丢，该重置就重置”。
+它们是用户态把 pulse frame 进一步解释后的结果，不属于共享协议。
 
-| 边界条件 | 这段的作用是 | 实际行为 | 丢弃责任 |
-|---|---|---|---|
-| 同步字丢失 | 处理字节流里的噪声和错位 | 在 `SYNC0/SYNC1` 状态里继续找同步，不把噪声当有效帧 | parser 自己丢弃当前搜索上下文 |
-| 长度非法 | 防止越界和假包继续推进 | `expected_pulses == 0` 或 `> RF_BUFFER_SIZE` 时立即 `rf_proto_parser_init()` 并返回 `-1` | parser 直接判死，不把残包交上去 |
-| CRC 错误 | 防止错误 payload 进入上层业务 | 校验失败时立刻重置状态机并返回 `-1` | parser 丢弃整帧，上层不要尝试修复半包 |
-| 恢复路径 | 让下一帧可以重新同步 | 每次失败后都回到 `RF_PARSE_SYNC0`，重新等待下一次同步字 | parser 负责恢复到可继续消费的起点 |
-| 上层可见性 | 约束错误传播方式 | 只有成功时才返回 `1` 并输出 `rf_frame_t` | 上层只处理完整帧，不处理半成品 |
+### 9.2 不包含驱动扩展元数据
 
-把这几条合起来看，结论很直接：
+用户态最终从驱动读到的是 `struct rf433_frame`，它比 `rf_frame_t` 多了：
 
-1. 同步字丢了，先继续找同步，不是直接把整个通道判死。
-2. 长度不合法，立即丢帧，不要继续吃 payload。
-3. CRC 不对，整帧作废，不要把半包交给业务层。
-4. 恢复动作永远是 reset 到 `SYNC0`，不是“在当前坏状态里凑合往前走”。
-5. 丢弃责任在 parser，业务层只接收完整帧，不接收修补建议。
+- `timestamp_ns`
+- `seq`
 
----
+这些字段是 Linux 驱动为了用户态观察和统计追加的本地 ABI，不是 UART 共享协议的一部分。
 
-## 6. master/hardware 对齐关系
+### 9.3 不包含进程间 JSON 契约
 
-### 6.1 先看对齐表
+Qt 看到的 `stdout JSON envelope` 也是上层契约。它发生在：
 
-| 项 | master/common | hardware/Hardware | 是否对齐 |
-|---|---|---|---|
-| `RF_PROTO_SYNC0` | `0xAAu` | `0xAAu` | 是 |
-| `RF_PROTO_SYNC1` | `0x55u` | `0x55u` | 是 |
-| `RF_BUFFER_SIZE` | `1024u` | `1024u` | 是 |
-| `rf_frame_t` | `pulse[] + len` | `pulse[] + len` | 是 |
-| `rf_proto_crc8()` | XOR 累积 | XOR 累积 | 是 |
-| `rf_proto_encode()` | 结构化帧 -> 字节流 | 结构化帧 -> 字节流 | 是 |
-| `rf_parse_state_t` | 无 | 有 | hardware 扩展 |
-| `rf_proto_parser_t` | 无 | 有 | hardware 扩展 |
-| `rf_proto_parser_init()` | 无 | 有 | hardware 扩展 |
-| `rf_proto_parser_consume()` | 无 | 有 | hardware 扩展 |
+`/dev/rf433 -> rf_gateway -> JSON`
 
-### 6.2 真正对齐的是什么
+而不是：
 
-不是“文件内容完全一样”。
+`shared protocol -> JSON`
 
-而是下面这几个协议事实完全一样：
+## 10. 这条边界对后续文档有什么影响
 
-1. 同一对同步字
-2. 同一份长度定义
-3. 同一份 payload 小端布局
-4. 同一份 XOR 校验范围
-5. 同一份 `rf_frame_t` 语义
+一旦你把共享协议边界收在 pulse frame，上层文档就会更清晰：
 
-这就是 master/hardware 能对齐的根本原因。
+- driver 文档只解释“怎样把字节流变成 `/dev/rf433` 帧接口”
+- userland 文档只解释“怎样把驱动帧变成解码结果和 JSON”
+- Qt 文档只解释“怎样消费 JSON”
 
-### 6.3 为什么 hardware 多出 parser
+这能避免一个常见误读：把 `addr/key/conf` 误写成从硬件一路原生携带到 Qt 的字段。当前代码事实并不是这样。
 
-因为 hardware 侧天然会面对“字节流输入”这一类问题：
+## 11. 推荐的代码走读顺序
 
-- 串口来的可能是连续字节
-- 可能半包
-- 可能错位
-- 可能要做镜像验证
+如果你想靠源码验证本文结论，推荐这样读：
 
-所以 hardware 侧补了一个流式状态机。
+1. `project2_master/common/rf_protocol.h`
+   先看共享结构体和常量。
+2. `project2_master/common/rf_protocol.c`
+   再看编码函数如何落字节。
+3. `project2_hardware/Hardware/RF_Protocol.h`
+   看 parser 状态和上下文结构。
+4. `project2_hardware/Hardware/RF_Protocol.c`
+   看字节流如何还原成 `rf_frame_t`。
+5. `project2_master/linux_driver/rf433_drv.c`
+   对照 Linux 驱动里同构的 parser 状态机。
 
-但是你要注意：
-
-- hardware 侧 live transmit 的主链路重点仍然是 `RF_Capture -> rf_frame_t -> rf_proto_encode -> UART`
-- parser 是协议镜像和验证能力，不是当前发射主链路的核心出口
-
-### 6.4 对齐方式不是共享实现，而是共享契约
-
-这句话最重要。
-
-不是 X，而是 Y：
-
-- 不是“master 和 hardware 通过 include 同一个路径实现一致”
-- 而是“两个目录各自保留实现，但共同遵守同一份字节契约”
-
-这给后续维护带来一个直接结论：
-
-- 只改一端是不够的
-- 改 `SYNC`、`LEN`、`payload` 排布、CRC 规则时，必须同步检查 master/common、hardware/Hardware 以及所有依赖文档
-
----
-
-## 7. 数据流总图
-
-### 7.1 hardware 侧主链路
-
-```text
-RF_Capture.c 采集到脉冲
-  -> 形成 rf_frame_t
-  -> RF_Uart_SendFrame()
-  -> rf_proto_encode()
-  -> AA 55 + LEN + PAYLOAD + CRC
-  -> UART 发送
-```
-
-这条链路的作用是：
-
-- 把现场采到的脉冲宽度，稳定变成可上送的协议字节流
-
-依赖：
-
-- `rf_frame_t`
-- `rf_proto_encode()`
-
-输入：
-
-- 真实脉冲序列
-
-输出：
-
-- 串口字节流
-
-去向：
-
-- 上位机/主控接收端
-
-### 7.2 hardware 侧镜像链路
-
-```text
-UART 字节流
-  -> rf_proto_parser_init()
-  -> rf_proto_parser_consume()
-  -> rf_frame_t
-```
-
-这条链路的作用是：
-
-- 把线上的字节流按协议镜像回结构化帧
-
-依赖：
-
-- parser 状态机
-- `rf_frame_t`
-
-输入：
-
-- 连续字节
-
-输出：
-
-- 一帧经过校验的 `rf_frame_t`
-
-去向：
-
-- 解析验证
-- 单元测试
-- 协议一致性检查
-
-### 7.3 master 侧消费链路
-
-master 侧相关细节不在这份文档展开，但契约关系是固定的：
-
-- 驱动/应用拿到的是 `rf_frame_t`
-- 后续业务解码继续消费这个统一模型
-
-如果你要继续读更上层的链路，可以看：
-
-- [project2_master/README.md](D:/project/repos/project2/project2_master/README.md)
-- [project2_master/docs/project2_master_userland_deep_dive.md](D:/project/repos/project2/project2_master/docs/project2_master_userland_deep_dive.md)
-- [project2_master/docs/project2_master_driver_deep_dive.md](D:/project/repos/project2/project2_master/docs/project2_master_driver_deep_dive.md)
-- [project2_hardware/README.md](D:/project/repos/project2/project2_hardware/README.md)
-- [project2_hardware/Hardware/MASTER_INTEGRATION.md](D:/project/repos/project2/project2_hardware/Hardware/MASTER_INTEGRATION.md)
-
-这里只保留一句话：
-
-> `rf_frame_t` 是上层业务的统一入口，而 `rf_protocol.*` 只负责让它在字节流里可信地往返。
-
----
-
-## 8. 逐项对照结论
-
-### 8.1 这份协议的边界
-
-| 层次 | 负责什么 | 不负责什么 |
-|---|---|---|
-| `rf_protocol.h/c` | 帧模型、编码、校验、镜像解析 | EV1527 业务解码 |
-| `RF_Capture.c` | 采集脉冲并组织成帧 | 协议包格式定义 |
-| `RF_Uart.c` | 把协议包送上串口 | 脉冲采集 |
-| master 上层解码 | 把 `rf_frame_t` 继续解释为业务结果 | 串口字节帧定义本身 |
-
-### 8.2 最敏感的几个约束
-
-| 约束 | 为什么敏感 |
-|---|---|
-| `SYNC0/SYNC1` | 一变就无法重同步 |
-| `RF_BUFFER_SIZE` | 一变就影响最大帧长和缓存分配 |
-| payload 小端 | 一变就两端数值解释不一致 |
-| CRC 覆盖范围 | 一变就校验结果不一致 |
-| parser 返回值语义 | 一变就影响上层消费方式 |
-
-### 8.3 你要抓住的最终结论
-
-这份协议不是“串口里传几个字节”这么简单。
-
-它的本质是：
-
-1. 用 `rf_frame_t` 把脉冲序列抽象成稳定 ABI
-2. 用 `rf_proto_encode()` 把 ABI 变成可传输字节流
-3. 用 hardware 侧 parser 证明这套字节流可以被反向稳定恢复
-4. 用同一套 `SYNC + LEN + PAYLOAD + CRC` 契约，把 master 和 hardware 锁在一起
-
----
-
-## 9. 最后一眼只看代码
-
-如果你只想记最核心的结构，直接看下面的 `### 4. 最后一眼只看代码`。
-
-### 4. 最后一眼只看代码
-
-这段的作用是把最关键的骨架压到最短。你要抓住的点是：这套协议最核心的不是“多了多少处理分支”，而是“同一份 `rf_frame_t` 怎么稳定往返”。
-
-```c
-#define RF_PROTO_SYNC0 0xAAu
-#define RF_PROTO_SYNC1 0x55u
-#define RF_BUFFER_SIZE 1024u
-
-typedef struct {
-    uint16_t pulse[RF_BUFFER_SIZE];
-    uint16_t len;
-} rf_frame_t;
-```
-
-```c
-size_t rf_proto_encode(const rf_frame_t *frame, uint8_t *out, size_t out_capacity);
-void rf_proto_parser_init(rf_proto_parser_t *parser);
-int rf_proto_parser_consume(rf_proto_parser_t *parser, uint8_t byte, rf_frame_t *out_frame);
-```
-
-```c
-out[0] = RF_PROTO_SYNC0;
-out[1] = RF_PROTO_SYNC1;
-out[2] = (uint8_t)(frame->len & 0xFFu);
-out[3] = (uint8_t)((frame->len >> 8u) & 0xFFu);
-
-if (parser->expected_pulses == 0u || parser->expected_pulses > RF_BUFFER_SIZE) {
-    rf_proto_parser_init(parser);
-    return -1;
-}
-```
-
-最后要记住什么：
-
-- `rf_frame_t` 定义数据长什么样。
-- `rf_proto_encode()` 负责把它稳定写成字节流。
-- `rf_proto_parser_consume()` 负责把字节流稳定捞回 `rf_frame_t`。
-- 不是“字节流里碰运气”，而是“按同一套契约往返搬运”。
+读完这五步，再去看 driver 和 userland 文档，边界就不会乱。

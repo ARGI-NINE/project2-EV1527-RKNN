@@ -1,74 +1,187 @@
 # project2_master RF433 驱动深读
 
-本文只解释 `linux_driver/rf433_drv.c` 和 `linux_driver/rf433_ioctl.h`。  
-写法上尽量贴近 `rknpu_best/.../docs`：先贴代码，再解释。你要抓住的点是，这不是一份“文件概览”，而是一份按调用链往下拆的驱动读法。
+这份文档只读两类文件：
 
-不讲 `pc sim`，不讲 vendor，不讲生成文件，也不改其他源码。
+- `project2_master/linux_driver/rf433_drv.c`
+- `project2_master/linux_driver/rf433_ioctl.h`
+
+目标不是泛泛地讲“驱动里有什么函数”，而是把 `/dev/rf433` 这条接口怎样从 serdev 长出来读清楚。
+
+兼容说明：以下先补回 `HEAD` 版章节骨架，便于沿用旧目录、旧引用和旧阅读顺序；后文现有正文、源码摘录和细讲全部保留。
 
 ## 0. 快速阅读地图
 
-如果你是带着“先把用户态链路读通”的目标进来，不要按章节编号硬啃，先顺着这几段看：
-
-1. 先看 `2` 和 `4`，把 `probe()` 里资源是怎么挂起来的、核心私有对象里有哪些状态先抓住
-2. 再看 `5` 和 `6`，把协议解析是怎么把串口字节变成一帧的抓住
-3. 然后看 `7` 和 `8`，把 `/dev/rf433` 的 `read/poll/ioctl` 契约抓住
-4. 最后看 `9`、`10`、`11`，把在线状态、sysfs 观测面和退出收尾串起来
-
-你要抓住的点是：这份驱动不是“文件顺序”，而是“调用链顺序”。
-- 生产者链路是 `serdev receive_buf -> parser -> kfifo -> wake_up`
-- 消费者链路是 `read()/poll()/ioctl()/sysfs`
-- 收尾链路是 `del_timer_sync -> misc_deregister -> serdev_device_close -> kfifo_free`
-
-不是先背接口名，而是先背这条链。
+兼容旧版目录：下文现有正文继续覆盖驱动入口、parser、`/dev/rf433` ABI、在线状态和走读顺序，本轮新增代码块与细讲保持不删。
 
 ## 1. 先看整体位置
 
-这份驱动在系统里的角色很明确：
-
-- 它是一个 `serdev client driver`
-- 它同时注册了一个 `misc device`
-- 它在内核里完成 `AA55 + LEN + PAYLOAD + CRC` 的协议解析
-- 它把解析后的帧通过 `/dev/rf433` 暴露给用户态
-- 它还提供 `ioctl()`、`poll()` 和一组 sysfs 只读属性
-
-用户态看到的不是原始串口字节流，而是已经拼好的 `struct rf433_frame`。  
-不是“字节来了就原样往外抛”，而是“先在内核里拼成一帧，再按结构体交给用户态”。
+兼容旧版目录：对应下文现有 `## 1. 这份驱动在整条链上的位置`。
 
 ## 2. 驱动入口：从模块加载到 probe
 
-先看驱动注册和设备树匹配：
+兼容旧版目录：对应下文现有 `## 2. 入口：rf433_probe()`。
 
-```c
-static const struct of_device_id rf433_of_match[] = {
-	{ .compatible = "project2,rf433-receiver" },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, rf433_of_match);
+## 3. 设备节点怎么出来
 
-static struct serdev_device_driver rf433_driver = {
-	.driver = {
-		.name           = DRV_NAME,
-		.of_match_table = rf433_of_match,
-	},
-	.probe  = rf433_probe,
-	.remove = rf433_remove,
-};
-module_serdev_device_driver(rf433_driver);
+兼容旧版目录：对应当前正文里 `misc device`、`/dev/rf433`、`probe()` 注册顺序的说明。
+
+## 4. 核心对象：状态、队列、统计、在线状态
+
+兼容旧版目录：对应当前正文里 `struct rf433_priv`、parser 状态、队列和导出 ABI 的讲解。
+
+### 1. 资源生命周期总表
+
+兼容旧版目录：对应当前正文里 `serdev`、`kfifo`、`misc`、`timer` 的创建、回滚与收尾顺序。
+
+### 4.1 `struct rf433_frame`
+
+兼容旧版目录：对应当前正文里用户态帧结构、字段意义和 `read()` 返回契约。
+
+### 4.2 `struct rf433_stats`
+
+兼容旧版目录：对应当前正文里驱动统计字段和 `ioctl` 快照说明。
+
+### 4.3 `struct rf433_status`
+
+兼容旧版目录：对应当前正文里在线位、序号、队列深度与容量说明。
+
+## 5. AA55/LEN/PAYLOAD/CRC 解析状态机
+
+兼容旧版目录：对应当前正文里 parser 状态机、长度校验、CRC 校验和成帧过程。
+
+### 5.1 解析前的复位
+
+兼容旧版目录：对应当前正文里 parser 初始化与异常后回到起点的说明。
+
+### 5.2 按字节喂给状态机
+
+兼容旧版目录：对应当前正文里 `parser_feed_byte()` 的逐字节推进逻辑。
+
+### 5.3 把 payload 变成用户态帧
+
+兼容旧版目录：对应当前正文里 `payload` 转 `struct rf433_frame`、入队与唤醒的说明。
+
+## 6. 硬件侧数据怎么进来
+
+兼容旧版目录：对应下文现有 `## 6. serdev 回调只做一件事：喂 parser`。
+
+### 6.1 串口回调表
+
+兼容旧版目录：对应当前正文里 `serdev_device_ops`、`receive_buf` 和 RX-only 语义。
+
+## 7. file_operations：用户态怎么进来
+
+兼容旧版目录：对应当前正文里 `open/read/poll/ioctl/sysfs` 的导出接口说明。
+
+### 7.1 `open()`
+
+兼容旧版目录：对应当前正文里 `file->private_data` 绑定逻辑。
+
+### 7.2 `read()`
+
+兼容旧版目录：对应当前正文里按帧读取 `struct rf433_frame` 的说明。
+
+#### 非阻塞路径
+
+兼容旧版目录：对应当前正文里 `O_NONBLOCK` 与 `-EAGAIN` 语义。
+
+#### 阻塞路径
+
+兼容旧版目录：对应当前正文里等待队列、`-ERESTARTSYS` 和唤醒后的读取语义。
+
+### 7.3 `poll()`
+
+兼容旧版目录：对应当前正文里 `EPOLLIN | EPOLLRDNORM` 的可读事件说明。
+
+### 2. 并发与唤醒契约
+
+兼容旧版目录：对应当前正文里 `spinlock`、`waitqueue`、`wake_up_interruptible()` 的配合关系。
+
+## 8. ioctl ABI：每个命令到底干什么
+
+兼容旧版目录：对应下文现有 `## 8. /dev/rf433 对用户态导出的 ABI` 中的 `ioctl()` 说明。
+
+### 8.1 ioctl 一览表
+
+兼容旧版目录：对应当前正文里 `GET_STATS`、`CLR_STATS`、`GET_STATUS`、`FLUSH_QUEUE` 的总览。
+
+### 8.2 ioctl 实现
+
+兼容旧版目录：对应当前正文里 `rf433_misc_ioctl()` 的锁保护、快照与返回值说明。
+
+### 8.3 用户态怎么调用
+
+兼容旧版目录：对应当前正文里 `ioctl(fd, ...)` 调用方式和典型字段含义。
+
+## 9. 在线状态和定时器
+
+兼容旧版目录：对应下文现有 `## 7. 在线状态与半帧超时`。
+
+## 10. sysfs 只读属性：辅助观测口
+
+兼容旧版目录：对应下文现有 `### 8.5 sysfs` 及其观测面说明。
+
+### 3. 用户态 ABI 一览
+
+兼容旧版目录：对应当前正文里 `read/poll/ioctl/sysfs` 的整体职责拆分。
+
+### 4. 异常退出与 remove 收尾
+
+兼容旧版目录：对应当前正文里错误回滚、`remove()` 收尾和资源释放顺序说明。
+
+## 11. 驱动移除时怎么收尾
+
+兼容旧版目录：对应当前正文里设备移除、停止定时器、注销节点、关闭 `serdev`、释放队列的顺序。
+
+## 12. 按调用链串起来看
+
+兼容旧版目录：对应当前正文里从 UART 字节流到 `/dev/rf433` 再到用户态消费的主链梳理。
+
+## 13. 用户态应该怎么理解这个驱动
+
+兼容旧版目录：对应当前正文里“驱动只做到 pulse frame、用户态消费已解析结果”的边界说明。
+
+## 14. 一句话总结
+
+兼容旧版目录：对应当前正文末尾的总结合并阅读。
+
+## 1. 这份驱动在整条链上的位置
+
+先把位置立住：
+
+```text
+STM32 UART bytes
+  -> serdev receive callback
+  -> rf433 parser in kernel
+  -> kfifo of struct rf433_frame
+  -> misc device /dev/rf433
+  -> userspace rf_gateway
 ```
 
-这段的作用是：
+这说明它同时扮演两个角色：
 
-- 让设备树里 `compatible = "project2,rf433-receiver"` 的节点匹配到这个驱动
-- 让 `serdev` 框架在匹配成功后回调 `rf433_probe()`
-- 让模块加载和卸载时自动完成 `probe/remove` 的绑定
+- 向下，它是 serdev client driver，消费 UART 字节流
+- 向上，它是 misc device，向用户态提供帧接口
 
-你要抓住的点是：
+最重要的事实是：用户态看到的不是原始串口字节，而是已经在内核里拼好的 `struct rf433_frame`。
 
-- 这个驱动不是普通 `platform_driver`
-- 它不是自己去扫串口，而是靠 `serdev` 框架把底层 UART 设备交给它
-- `probe()` 才是整个初始化链路的起点
+## 2. 入口：`rf433_probe()`
 
-再看 `probe()` 的真实顺序：
+读这份驱动时，最好的起点是 `rf433_probe()`。
+
+它依次做了这些事：
+
+1. 分配 `struct rf433_priv`
+2. 初始化锁、等待队列和 parser 状态
+3. 分配帧队列 `kfifo`
+4. 把 `rf433_serdev_ops` 绑到 serdev 设备
+5. 打开 serdev，并设置 9600 波特率、无流控、无校验
+6. 注册 misc 设备，名字是 `rf433`
+7. 启动在线状态定时器
+
+因为 `misc.name = "rf433"`，所以用户态最终看到的设备节点通常就是 `/dev/rf433`。
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_probe()`，作用：把 parser、`kfifo`、serdev 和 `misc` 设备一次性挂起来，形成 `/dev/rf433`。
 
 ```c
 static int rf433_probe(struct serdev_device *serdev)
@@ -89,15 +202,19 @@ static int rf433_probe(struct serdev_device *serdev)
 	priv->last_byte_jiffies  = jiffies;
 
 	ret = kfifo_alloc(&priv->fifo, FRAME_FIFO_DEPTH, GFP_KERNEL);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "kfifo_alloc failed: %d\n", ret);
 		return ret;
+	}
 
 	serdev_device_set_drvdata(serdev, priv);
 	serdev_device_set_client_ops(serdev, &rf433_serdev_ops);
 
 	ret = serdev_device_open(serdev);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "serdev_device_open failed: %d\n", ret);
 		goto err_fifo;
+	}
 
 	serdev_device_set_baudrate(serdev, BAUD_RATE);
 	serdev_device_set_flow_control(serdev, false);
@@ -110,76 +227,37 @@ static int rf433_probe(struct serdev_device *serdev)
 	priv->misc.groups = rf433_groups;
 
 	ret = misc_register(&priv->misc);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "misc_register failed: %d\n", ret);
 		goto err_serdev;
+	}
 
 	timer_setup(&priv->online_timer, rf433_online_timer_fn, 0);
 	mod_timer(&priv->online_timer, jiffies + ONLINE_CHECK_SEC * HZ);
 
+	dev_info(dev, "rf433 serdev driver probed (%d baud)\n", BAUD_RATE);
 	return 0;
-
-err_serdev:
-	serdev_device_close(serdev);
-err_fifo:
-	kfifo_free(&priv->fifo);
-	return ret;
 }
 ```
 
-这段的作用是：
+这段实现把文档里的 7 个步骤压成了可执行事实：
 
-1. 分配并初始化每设备私有对象 `struct rf433_priv`
-2. 建立 `spinlock` 和 `waitqueue`
-3. 把解析状态机复位到初始态
-4. 分配帧队列 `kfifo`
-5. 绑定 `serdev` 回调
-6. 打开串口并设置参数
-7. 注册 misc 设备节点
-8. 启动在线检测定时器
+- `parser_reset(priv)` 说明 parser 初始态就是 probe 时建立的，不等第一帧来了再懒初始化。
+- `kfifo_alloc()` 和 `misc_register()` 说明 `/dev/rf433` 不是单纯的 serdev 回调，而是额外长出来的一层内核队列 ABI。
+- `priv->misc.groups = rf433_groups` 也解释了为什么这个驱动同时有字符设备接口和 sysfs 观测面。
 
-你要抓住的点是：
+## 3. 私有状态：`struct rf433_priv`
 
-- 初始化顺序是有意设计的，不是随便写的
-- `kfifo_alloc()` 在 `misc_register()` 前面，因为用户态入口挂出来之前，队列必须已经可用
-- `serdev_device_open()` 在串口参数设置链路上是关键一步，后面才有硬件数据进来
-- `misc_register()` 成功后，系统才会出现 `/dev/rf433`
+这份结构体是整条驱动的核心上下文。阅读时建议按职责拆开看：
 
-## 3. 设备节点怎么出来
-
-`miscdevice` 的配置就在 `probe()` 里：
-
-```c
-priv->misc.minor  = MISC_DYNAMIC_MINOR;
-priv->misc.name   = DRV_NAME;
-priv->misc.fops   = &rf433_misc_fops;
-priv->misc.parent = dev;
-priv->misc.groups = rf433_groups;
-```
-
-这里的含义是：
-
-- `minor = MISC_DYNAMIC_MINOR`：由内核动态分配次设备号
-- `name = "rf433"`：最终节点名就是 `/dev/rf433`
-- `fops`：用户态打开这个节点后，走哪组文件操作函数
-- `parent`：把 misc 设备挂在对应的 `serdev` 设备下面
-- `groups`：把 sysfs 属性组一起挂出去
-
-这段的作用是：
-
-- 把驱动的“数据入口”从内核对象变成一个标准字符设备节点
-- 让用户态只需要 `open("/dev/rf433")` 就能进入驱动
-
-不是“驱动自己开了一个特殊接口”，而是“借 misc device 给自己挂了一个标准字符设备外壳”。
-
-## 4. 核心对象：状态、队列、统计、在线状态
-
-先看私有上下文：
+来源：`project2_master/linux_driver/rf433_drv.c`，结构：`struct rf433_priv`，作用：集中保存 serdev 句柄、parser 状态、输出队列、统计和在线检测。
 
 ```c
 struct rf433_priv {
 	struct serdev_device *serdev;
 	struct miscdevice    misc;
 
+	/* parser state (accessed from serdev rx callback, protected by lock) */
 	spinlock_t           lock;
 	enum rf_parse_state  state;
 	u16                  expected_pulses;
@@ -187,12 +265,15 @@ struct rf433_priv {
 	u8                   payload_buf[RF433_MAX_PULSES * 2];
 	u8                   crc_accum;
 
+	/* frame output queue */
 	DECLARE_KFIFO_PTR(fifo, struct rf433_frame);
 	wait_queue_head_t    rdq;
 
+	/* statistics */
 	struct rf433_stats   stats;
 	u32                  seq;
 
+	/* online detection */
 	struct timer_list    online_timer;
 	unsigned long        last_frame_jiffies;
 	unsigned long        last_byte_jiffies;
@@ -200,142 +281,64 @@ struct rf433_priv {
 };
 ```
 
-这段的作用是把驱动运行时需要的东西一次性收在一个对象里。
+这份结构体本身已经把驱动分层写得很直白：
 
-你要抓住的点是：
+- `state/expected_pulses/payload_idx/payload_buf/crc_accum` 是纯 parser 状态，不掺用户态语义。
+- `fifo/rdq` 才是面向 `/dev/rf433` 的交付层。
+- `stats/seq/online_timer/last_frame_jiffies/last_byte_jiffies/online` 则是 Linux 驱动自己追加的运行时观测语义。
 
-- `state / expected_pulses / payload_idx / payload_buf / crc_accum` 组成了解析状态机
-- `fifo / rdq` 组成了用户态读队列
-- `stats / seq` 组成了运行统计
-- `last_frame_jiffies / last_byte_jiffies / online_timer / online` 组成了在线检测
+### 3.1 serdev 资源
 
-### 1. 资源生命周期总表
+- `struct serdev_device *serdev`
 
-这段的作用是把 `probe()` 里几个资源的“创建、绑定、释放顺序”一次看清楚。你要抓住的点是：**先准备生产/消费能力，再把设备节点挂出去，最后按相反顺序收尾**。
+这是向下连接 UART 的抓手。
 
-| 资源 | 创建 / 绑定 | 释放 / 回滚 | 你要记住的顺序 |
-|---|---|---|---|
-| `serdev` | `serdev_device_set_drvdata()`，`serdev_device_set_client_ops()`，`serdev_device_open()` | `serdev_device_close()` | 先把串口生产者接上，再谈用户态出口 |
-| `miscdevice` | 填 `minor/name/fops/parent/groups` 后 `misc_register()` | `misc_deregister()` | 节点只在注册成功后出现 |
-| `kfifo` | `kfifo_alloc()` | `kfifo_free()` | 先有队列，后有 `/dev/rf433` |
-| `timer` | `timer_setup()`，`mod_timer()` | `del_timer_sync()` | 先停定时器，再拆对象 |
-| `waitqueue` | `init_waitqueue_head()` | 无显式释放 | 这是睡眠/唤醒契约，不是独立资源 |
+### 3.2 parser 状态
 
-更直白一点：
-- `kfifo` 和 `waitqueue` 是“用户态读取面”的底座
-- `serdev` 是“硬件输入面”的底座
-- `miscdevice` 是“用户态看到的入口”
-- `timer` 是“在线状态和半帧超时”的巡检器
+- `state`
+- `expected_pulses`
+- `payload_idx`
+- `payload_buf[]`
+- `crc_accum`
 
-不是“注册完再慢慢补”，而是“队列、状态机、输入通道先准备好，最后一次性挂出设备节点”。
+这一组字段负责把串口字节流拼成一帧。
 
-### 4.1 `struct rf433_frame`
+### 3.3 输出队列
 
-```c
-struct rf433_frame {
-	__u64 timestamp_ns;
-	__u16 pulse_count;
-	__u16 reserved;
-	__u32 seq;
-	__u16 pulse[RF433_MAX_PULSES];
-};
-```
+- `DECLARE_KFIFO_PTR(fifo, struct rf433_frame)`
+- `wait_queue_head_t rdq`
 
-这段的作用是定义 `read()` 给用户态返回的一帧。
+这是驱动向用户态交付整帧的核心桥梁。
 
-字段含义如下：
+### 3.4 统计与在线状态
 
-| 字段 | 含义 |
-|---|---|
-| `timestamp_ns` | 帧完成时的实时时间戳 |
-| `pulse_count` | 本帧有效脉冲数量 |
-| `reserved` | 填充位，当前固定为 0 |
-| `seq` | 单调递增的帧序号 |
-| `pulse[]` | 解出来的脉冲数组，每个元素是一个 `u16` |
+- `struct rf433_stats stats`
+- `u32 seq`
+- `last_frame_jiffies`
+- `last_byte_jiffies`
+- `bool online`
 
-你要抓住的点是：
+这些字段分别服务于：
 
-- 用户态拿到的是“结构化帧”，不是裸串口数据
-- `pulse[]` 的元素不是字节，而是把 payload 的两个字节拼成一个 `u16`
+- 统计错误和掉帧
+- 生成单调序号
+- 判断是否长期无新帧
+- 避免 parser 卡死在半帧状态
 
-### 4.2 `struct rf433_stats`
+## 4. parser 是怎样把字节流变成帧的
 
-```c
-struct rf433_stats {
-	__u64 frame_ok;
-	__u64 crc_err;
-	__u64 len_err;
-	__u64 drop_cnt;
-};
-```
+### 4.1 `parser_reset()`
 
-这段的作用是记录驱动运行统计。
+这个函数把状态机恢复到起点：
 
-| 字段 | 含义 |
-|---|---|
-| `frame_ok` | 成功解析并入队的帧数 |
-| `crc_err` | CRC 不匹配次数 |
-| `len_err` | 长度非法次数 |
-| `drop_cnt` | 队列满时丢弃旧帧的次数 |
+- 回到 `RF_ST_SYNC0`
+- 清空期望脉冲数
+- 清空 payload 进度
+- 清空 CRC 累加器
 
-你要抓住的点是：
+任何长度错误、CRC 错误、超时半帧，最终都会走回这里。
 
-- 这些统计全部是在内核里维护的
-- `GET_STATS` 只是把快照拷给用户态
-
-### 4.3 `struct rf433_status`
-
-```c
-struct rf433_status {
-	__u8  online;
-	__u8  reserved[3];
-	__u32 seq;
-	__u32 queue_depth;
-	__u32 queue_capacity;
-};
-```
-
-这段的作用是对外暴露“当前驱动状态”。
-
-| 字段 | 含义 |
-|---|---|
-| `online` | 当前是否还认为硬件在线 |
-| `seq` | 当前帧序号 |
-| `queue_depth` | 队列中当前有多少帧 |
-| `queue_capacity` | 队列容量 |
-
-你要抓住的点是：
-
-- `queue_depth` 不是字节数，而是帧数
-- `queue_capacity` 固定来自 `FRAME_FIFO_DEPTH`
-
-## 5. AA55/LEN/PAYLOAD/CRC 解析状态机
-
-先看状态机定义：
-
-```c
-enum rf_parse_state {
-	RF_ST_SYNC0 = 0,
-	RF_ST_SYNC1,
-	RF_ST_LEN0,
-	RF_ST_LEN1,
-	RF_ST_PAYLOAD,
-	RF_ST_CRC,
-};
-
-#define SYNC0  0xAA
-#define SYNC1  0x55
-```
-
-这段的作用是把协议拆成几个严格的阶段。
-
-你要抓住的点是：
-
-- 这是一个按字节推进的同步状态机
-- 入口是 `0xAA 0x55`
-- 后面依次是长度、payload、CRC
-
-### 5.1 解析前的复位
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`parser_reset()`，作用：把 AA55 parser 拉回起始态。
 
 ```c
 static void parser_reset(struct rf433_priv *priv)
@@ -347,14 +350,30 @@ static void parser_reset(struct rf433_priv *priv)
 }
 ```
 
-这段的作用是把解析器打回起点。
+这里没有做任何“保留部分上下文继续猜”的动作，说明当前驱动选择的是严格丢弃坏半帧，而不是容错拼接。
 
-你要抓住的点是：
+### 4.2 `parser_feed_byte()`
 
-- 一旦长度非法、CRC 错误，或者定时器判断半帧超时，都会回到这里
-- 不是“继续硬解”，而是“直接丢弃当前半帧，等待下一次同步头”
+这是驱动里真正的逐字节状态机。它走的状态序列与共享协议文档一致：
 
-### 5.2 按字节喂给状态机
+```text
+RF_ST_SYNC0 -> RF_ST_SYNC1 -> RF_ST_LEN0 -> RF_ST_LEN1 -> RF_ST_PAYLOAD -> RF_ST_CRC
+```
+
+逐段理解：
+
+- `SYNC0/SYNC1`
+  只接受 `0xAA 0x55` 帧头。
+- `LEN0/LEN1`
+  组装小端脉冲数，并开始累计 CRC。
+- `PAYLOAD`
+  持续收 `pulse_count * 2` 个字节。
+- `CRC`
+  比较接收到的 CRC 与累加值，成功则出帧，失败则记错并复位。
+
+这条状态机做的事情很克制：只负责成帧，不负责 EV1527 解码。
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`parser_feed_byte()`，作用：逐字节消费 UART 数据，按共享协议状态机拼出一帧。
 
 ```c
 static void parser_feed_byte(struct rf433_priv *priv, u8 byte)
@@ -374,7 +393,7 @@ static void parser_feed_byte(struct rf433_priv *priv, u8 byte)
 			priv->expected_pulses = 0;
 			priv->payload_idx = 0;
 		} else if (byte == SYNC0) {
-			/* stay in SYNC1 */
+			/* stay in SYNC1 — consecutive 0xAA */
 		} else {
 			priv->state = RF_ST_SYNC0;
 		}
@@ -414,28 +433,32 @@ static void parser_feed_byte(struct rf433_priv *priv, u8 byte)
 			parser_reset(priv);
 		}
 		break;
-
-	default:
-		parser_reset(priv);
-		break;
 	}
 }
 ```
 
-这段的作用是把协议按字节一层层拆开。
+逐段对照代码看，有几个细节很关键：
 
-你要抓住的点是：
+- `last_byte_jiffies = jiffies` 不是装饰字段，后面的半帧超时逻辑直接依赖它。
+- `LEN1` 阶段一旦发现 `0` 或超上限，马上记 `len_err++` 并 reset，说明长度错误根本不会进入 payload 阶段。
+- `CRC` 成功路径不是直接把原始字节吐给用户态，而是立即调用 `parser_emit_frame()`，所以成帧责任完整停留在内核里。
 
-1. `SYNC0` 只认 `0xAA`
-2. `SYNC1` 只认 `0x55`
-3. 长度字段是小端两字节，先低后高
-4. CRC 是从 `LEN_LO` 开始一路 XOR 到 payload 结束
-5. payload 长度是 `expected_pulses * 2` 个字节
-6. 一旦长度非法或 CRC 错，立刻复位
+### 4.3 `parser_emit_frame()`
 
-不是“收到 payload 就结束”，而是“收到完整 payload 后还要再验一个 CRC 字节”。
+一旦 CRC 校验通过，驱动会：
 
-### 5.3 把 payload 变成用户态帧
+1. 新建一个 `struct rf433_frame`
+2. 写入 `timestamp_ns = ktime_get_real_ns()`
+3. 写入 `pulse_count`
+4. 递增并写入 `seq`
+5. 把 payload 字节两两还原成 `pulse[]`
+6. 推入 `kfifo`
+7. 更新 `frame_ok`
+8. 唤醒等待中的读者
+
+这里的关键补充是：`timestamp_ns` 和 `seq` 都是驱动层附加出来的本地元数据，不是共享脉冲协议的一部分。
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`parser_emit_frame()`，作用：把 parser 暂存的 payload 还原成 `struct rf433_frame`，并推入 `kfifo`。
 
 ```c
 static void parser_emit_frame(struct rf433_priv *priv)
@@ -455,6 +478,7 @@ static void parser_emit_frame(struct rf433_priv *priv)
 	}
 
 	if (kfifo_is_full(&priv->fifo)) {
+		/* Queue-full policy: drop oldest queued frame and keep latest realtime data. */
 		kfifo_skip(&priv->fifo);
 		priv->stats.drop_cnt++;
 	}
@@ -469,19 +493,26 @@ static void parser_emit_frame(struct rf433_priv *priv)
 }
 ```
 
-这段的作用是把协议帧转换成用户态可读的结构体帧。
+这段代码把“共享 pulse frame”和“驱动本地扩展”切得很清楚：
 
-你要抓住的点是：
+- `frame.pulse[]` 来自 payload 两字节一组的小端还原，这部分仍然是共享协议语义。
+- `timestamp_ns`、`seq`、`online`、`drop_cnt` 都是 Linux 驱动本地运行时语义。
+- `kfifo_is_full()` 时先 `kfifo_skip()` 再 `kfifo_in()`，明确说明它追求最新帧优先，而不是历史帧完整保留。
 
-- `payload_buf` 里是原始字节
-- `frame.pulse[i]` 里是 `u16` 脉冲值
-- 队列满时不是阻塞生产者，而是丢最旧帧，保最新实时数据
-- `wake_up_interruptible()` 是把阻塞在 `read()` 上的进程叫醒
-- `online` 在这里被置为真，说明一旦成功收帧，驱动就认为硬件在线
+## 5. serdev 回调只做一件事：喂 parser
 
-## 6. 硬件侧数据怎么进来
+`rf433_receive_buf()` 的逻辑非常纯：
 
-真正的输入入口是 `serdev` 回调：
+1. 取出 `rf433_priv`
+2. 加锁
+3. 按字节遍历输入缓冲
+4. 每个字节调用 `parser_feed_byte()`
+5. 解锁
+6. 返回已消费字节数
+
+这说明驱动的成帧逻辑完全在内核里完成，不会把碎片字节推给用户态补全。
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_receive_buf()`，作用：作为 serdev RX 回调，把一批串口字节逐个喂给 parser。
 
 ```c
 static int rf433_receive_buf(struct serdev_device *serdev,
@@ -500,87 +531,116 @@ static int rf433_receive_buf(struct serdev_device *serdev,
 }
 ```
 
-这段的作用是：
+这里没有任何中间缓存、工作队列或底半部搬运逻辑；驱动对 RX 的核心判断就是“持锁后立即逐字节推进状态机”。
 
-- `serdev` 收到 UART 数据后回调这个函数
-- 函数逐字节把数据喂给状态机
-- 返回值是 `count`，表示这批字节都被驱动消费了
+## 6. 队列策略：满了就丢最旧帧
 
-你要抓住的点是：
+`parser_emit_frame()` 里有一个非常值得记住的策略：
 
-- 硬件数据不是通过 `write()` 进入驱动
-- 它是从串口 RX 路径进来的
-- 整个解析过程在自旋锁保护下运行
+- 如果 `kfifo` 已满，先 `kfifo_skip()` 丢弃最旧的一帧
+- 然后把最新帧入队
+- 同时 `drop_cnt++`
 
-不是用户态“发命令写进去”，而是硬件“推字节上来，驱动被动消费”。
+这是一个明显偏实时性的策略。它说明当前驱动更在意“让用户态尽量看到最新 RF 数据”，而不是“绝不丢任何历史帧”。
 
-### 6.1 串口回调表
+后面的 `rf_gateway` 也会基于 `seq` 统计驱动侧是否出现跳号，从而形成用户态的 `drv_drop` 统计。
+
+## 7. 在线状态与半帧超时
+
+`rf433_online_timer_fn()` 每隔固定时间检查两件事：
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_online_timer_fn()`，作用：周期性刷新在线状态，并清理卡死在中间态的半帧。
 
 ```c
-static void rf433_write_wakeup_nop(struct serdev_device *serdev)
+static void rf433_online_timer_fn(struct timer_list *t)
 {
-	(void)serdev;
-}
+	struct rf433_priv *priv = from_timer(priv, t, online_timer);
+	unsigned long flags;
+	unsigned long now = jiffies;
 
-static const struct serdev_device_ops rf433_serdev_ops = {
-	.receive_buf = rf433_receive_buf,
-	.write_wakeup = rf433_write_wakeup_nop,
-};
-```
+	spin_lock_irqsave(&priv->lock, flags);
 
-这段的作用是说明驱动是 RX-only 的。
+	/* no frame for 5 seconds → offline */
+	if (time_after(now, priv->last_frame_jiffies + ONLINE_TIMEOUT_SEC * HZ))
+		priv->online = false;
 
-你要抓住的点是：
+	/* half-frame timeout: if we are mid-parse and 1 second elapsed since
+	 * last byte, reset the state machine to avoid stuck state. */
+	if (priv->state != RF_ST_SYNC0 &&
+	    time_after(now, priv->last_byte_jiffies + HALF_FRAME_TIMEOUT))
+		parser_reset(priv);
 
-- 驱动没有主动发送路径
-- `write_wakeup` 被显式写成 no-op
-- 这不是“忘了实现”，而是“刻意不提供 TX 语义”
+	spin_unlock_irqrestore(&priv->lock, flags);
 
-## 7. file_operations：用户态怎么进来
-
-先看文件操作表：
-
-```c
-static const struct file_operations rf433_misc_fops = {
-	.owner          = THIS_MODULE,
-	.open           = rf433_misc_open,
-	.read           = rf433_misc_read,
-	.poll           = rf433_misc_poll,
-	.unlocked_ioctl = rf433_misc_ioctl,
-	.compat_ioctl   = compat_ptr_ioctl,
-	.llseek         = no_llseek,
-};
-```
-
-这段的作用是把 `/dev/rf433` 的行为钉死。
-
-你要抓住的点是：
-
-- 有 `open/read/poll/ioctl`
-- 没有 `write`
-- 没有 seek
-- 32 位兼容路径用的是 `compat_ptr_ioctl`
-
-### 7.1 `open()`
-
-```c
-static int rf433_misc_open(struct inode *inode, struct file *filp)
-{
-	struct rf433_priv *priv =
-		container_of(filp->private_data, struct rf433_priv, misc);
-	filp->private_data = priv;
-	return 0;
+	mod_timer(&priv->online_timer, jiffies + ONLINE_CHECK_SEC * HZ);
 }
 ```
 
-这段的作用是把 `file->private_data` 从 `miscdevice` 指针换成 `struct rf433_priv *`。
+这也解释了为什么驱动的 `online` 语义是“最近收到过完整合法帧”，而不是“serdev 已经打开”。
 
-你要抓住的点是：
+### 7.1 有没有长期没有完整新帧
 
-- 后续 `read()`、`poll()`、`ioctl()` 都直接从 `filp->private_data` 拿私有上下文
-- 这是 `misc device` 常见写法
+如果超过 `ONLINE_TIMEOUT_SEC` 没有完整新帧，就把 `online = false`。
 
-### 7.2 `read()`
+这意味着驱动的在线语义是：
+
+“最近是否持续收到了合法完整帧”
+
+而不是：
+
+“驱动模块是否已经加载”或“进程是否还活着”
+
+### 7.2 parser 是否卡在半帧
+
+如果状态机不在起始态，且距离 `last_byte_jiffies` 已超过 `HALF_FRAME_TIMEOUT`，就强制 `parser_reset()`。
+
+这样可以避免因为串口中途断流而让 parser 永远挂在某个中间状态。
+
+## 8. `/dev/rf433` 对用户态导出的 ABI
+
+### 8.1 `struct rf433_frame`
+
+`rf433_ioctl.h` 里定义了用户态读到的整帧结构：
+
+- `timestamp_ns`
+- `pulse_count`
+- `reserved`
+- `seq`
+- `pulse[RF433_MAX_PULSES]`
+
+其中只有 `pulse_count` 和 `pulse[]` 属于“脉冲帧本体”，其余字段都是 Linux 侧为了观测性追加的元数据。
+
+来源：`project2_master/linux_driver/rf433_ioctl.h`，结构：`struct rf433_frame`，作用：定义 `read()` 每次交付给用户态的一整帧 ABI。
+
+```c
+struct rf433_frame {
+    __u64 timestamp_ns;          /* ktime_get_real_ns() at frame-complete */
+    __u16 pulse_count;           /* number of valid pulse entries         */
+    __u16 reserved;              /* padding, set to 0                     */
+    __u32 seq;                   /* monotonic frame sequence number       */
+    __u16 pulse[RF433_MAX_PULSES];
+};
+```
+
+这一定义直接证明了两件事：
+
+- `read()` 看到的不是可变长串口字节，而是固定外壳的 struct。
+- 共享协议里的 `rf_frame_t` 只关心 `pulse_count/pulse[]` 等价物，`timestamp_ns/seq` 是 Linux 驱动追加的 ABI 扩展。
+
+### 8.2 `read()`
+
+`rf433_misc_read()` 的语义是：
+
+- 调用者缓冲区必须至少容纳一个完整 `struct rf433_frame`
+- 非阻塞模式下，队列空则返回 `-EAGAIN`
+- 阻塞模式下，会睡眠等待直到队列非空
+- 成功时一次返回一整帧，而不是可变长字节片段
+
+所以用户态读 `/dev/rf433` 的正确理解是：
+
+“每次读一个定长外壳，里面用 `pulse_count` 标出有效脉冲数”
+
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_misc_read()`，作用：从 `kfifo` 取一帧并复制到用户缓冲区。
 
 ```c
 static ssize_t rf433_misc_read(struct file *filp, char __user *ubuf,
@@ -619,35 +679,13 @@ static ssize_t rf433_misc_read(struct file *filp, char __user *ubuf,
 }
 ```
 
-这段的作用是把队列里的一帧取出来拷给用户态。
+这里最关键的不是 `copy_to_user()`，而是 `return sizeof(frame)`。这行把 ABI 语义钉死成了“一次一整帧”。
 
-读法要分成两条路径看：
+### 8.3 `poll()`
 
-1. 非阻塞路径
-2. 阻塞路径
+`rf433_misc_poll()` 只有在队列非空时才返回 `EPOLLIN | EPOLLRDNORM`。这正是 `linux_app/rf_epoll.c` 能直接把 `/dev/rf433` 纳入 epoll 事件循环的原因。
 
-#### 非阻塞路径
-
-- `O_NONBLOCK` 打开时，先直接尝试 `kfifo_out()`
-- 队列空就返回 `-EAGAIN`
-
-#### 阻塞路径
-
-- 先在 `rdq` 上睡眠，等队列非空
-- 被信号打断就返回 `-ERESTARTSYS`
-- 醒来后再取一帧
-- 如果醒来后队列莫名其妙又空了，返回 `-EIO`
-
-你要抓住的点是：
-
-- `read()` 是“按帧读”，不是“按字节读”
-- 传入的 `count` 必须至少能放下一个 `struct rf433_frame`
-- 成功时返回值固定是 `sizeof(struct rf433_frame)`
-- `ppos` 没有被使用
-
-不是“读到多少返回多少”，而是“要么给你整帧，要么报错”。
-
-### 7.3 `poll()`
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_misc_poll()`，作用：把 `kfifo` 非空状态映射成标准可读事件。
 
 ```c
 static __poll_t rf433_misc_poll(struct file *filp, poll_table *wait)
@@ -664,62 +702,22 @@ static __poll_t rf433_misc_poll(struct file *filp, poll_table *wait)
 }
 ```
 
-这段的作用是让用户态可以用 `poll()` / `epoll()` 等待帧到达。
+`poll_wait()` 绑定的是 `rdq`，而唤醒点在 `parser_emit_frame()` 的 `wake_up_interruptible(&priv->rdq)`。所以 read/poll 是一套闭环，不是两条独立逻辑。
 
-你要抓住的点是：
+### 8.4 `ioctl()`
 
-- 只要队列非空，就返回可读事件
-- 这和 `read()` 的等待队列是同一套 `rdq`
+当前导出的控制面有四个：
 
-### 2. 并发与唤醒契约
+| ioctl | 作用 |
+| --- | --- |
+| `RF433_IOC_GET_STATS` | 读取 `frame_ok/crc_err/len_err/drop_cnt` |
+| `RF433_IOC_CLR_STATS` | 清空统计 |
+| `RF433_IOC_GET_STATUS` | 读取 `online/seq/queue_depth/queue_capacity` |
+| `RF433_IOC_FLUSH_QUEUE` | 清空帧队列 |
 
-这段的作用是把“谁保护谁、谁睡、谁叫醒谁”说清楚。你要抓住的点是：**`spinlock` 保护状态，`waitqueue` 负责睡眠，`wake_up_interruptible()` 负责把消费者叫醒**。
+这也是 `rf_gateway` 能定期组装 `device_status` 和 `rf_stats` 的基础。
 
-- `spin_lock_irqsave()` 包住 `parser_feed_byte()` 和 `parser_emit_frame()`，保护的是解析状态、统计字段、队列和在线状态这些共享数据
-- `read()` 阻塞路径不是自旋等，而是 `wait_event_interruptible(priv->rdq, !kfifo_is_empty(...))`
-- `poll()` 也是挂同一个 `rdq`，所以 `read()` 和 `poll()` 实际上共享同一套唤醒面
-- `parser_emit_frame()` 里先 `kfifo_in()`，再 `wake_up_interruptible(&priv->rdq)`，这就是“先放数据，再叫醒人”
-- `read()` 的非阻塞路径不睡眠，队列空就直接 `-EAGAIN`
-- `read()` 的阻塞路径被信号打断时返回 `-ERESTARTSYS`
-
-不是 timer 去叫醒 `read()`，而是“解析到完整帧以后”才叫醒等待者；timer 只负责在线判定和半帧超时修复，不负责数据就绪。
-
-你还要额外记住一条：
-- 这个 `wake_up_interruptible()` 既会唤醒阻塞的 `read()`，也会唤醒通过 `poll_wait()` 挂在同一个 waitqueue 上的等待者
-
-所以这里真正的并发契约不是“谁读谁写”，而是“生产者把帧放进 fifo，消费者在 rdq 上等帧”。
-
-## 8. ioctl ABI：每个命令到底干什么
-
-头文件里的 ioctl ABI 很直接：
-
-```c
-#define RF433_IOC_MAGIC  'R'
-
-#define RF433_IOC_GET_STATS    _IOR(RF433_IOC_MAGIC, 0x10, struct rf433_stats)
-#define RF433_IOC_CLR_STATS    _IO(RF433_IOC_MAGIC,  0x11)
-#define RF433_IOC_GET_STATUS   _IOR(RF433_IOC_MAGIC, 0x12, struct rf433_status)
-#define RF433_IOC_FLUSH_QUEUE  _IO(RF433_IOC_MAGIC,  0x13)
-```
-
-这段的作用是定义用户态和内核之间的固定控制协议。
-
-你要抓住的点是：
-
-- 魔数是 `'R'`
-- 命令号固定是 `0x10` 到 `0x13`
-- 其中两个是读回结构体，两个是无参数命令
-
-### 8.1 ioctl 一览表
-
-| 命令 | 宏定义 | 用户态参数 | 驱动行为 | 返回值 |
-|---|---|---|---|---|
-| `RF433_IOC_GET_STATS` | `_IOR('R', 0x10, struct rf433_stats)` | `struct rf433_stats *` | 拷贝 `frame_ok/crc_err/len_err/drop_cnt` 快照 | 成功返回 0，失败返回 `-EFAULT` |
-| `RF433_IOC_CLR_STATS` | `_IO('R', 0x11)` | 无 | 清零 `stats` | 成功返回 0 |
-| `RF433_IOC_GET_STATUS` | `_IOR('R', 0x12, struct rf433_status)` | `struct rf433_status *` | 拷贝 `online/seq/queue_depth/queue_capacity` 快照 | 成功返回 0，失败返回 `-EFAULT` |
-| `RF433_IOC_FLUSH_QUEUE` | `_IO('R', 0x13)` | 无 | 清空 `kfifo` | 成功返回 0 |
-
-### 8.2 ioctl 实现
+来源：`project2_master/linux_driver/rf433_drv.c`，函数：`rf433_misc_ioctl()`，作用：导出统计、状态和队列控制面。
 
 ```c
 static long rf433_misc_ioctl(struct file *filp, unsigned int cmd,
@@ -773,94 +771,11 @@ static long rf433_misc_ioctl(struct file *filp, unsigned int cmd,
 }
 ```
 
-这段的作用是把驱动状态、统计和队列控制暴露给用户态。
+这里的 `GET_STATUS` 和 `GET_STATS` 是用户态观测面的主入口；Qt 看到的很多状态字段并不是 read 帧自带，而是 `rf_gateway` 额外通过这些 ioctl 拉出来的。
 
-你要抓住的点是：
+### 8.5 sysfs
 
-- 所有受保护字段都是在自旋锁内快照
-- `GET_STATS` 和 `GET_STATUS` 都是先在内核里整理好结构体，再 `copy_to_user()`
-- 未知命令统一返回 `-ENOTTY`
-- `CLR_STATS` 只清统计，不清队列，不改 `seq`，不改 `online`
-- `FLUSH_QUEUE` 只清队列，不清统计，不改 `seq`，不改 `online`
-
-### 8.3 用户态怎么调用
-
-`GET_STATS` 的典型调用方式：
-
-```c
-struct rf433_stats st = {0};
-if (ioctl(fd, RF433_IOC_GET_STATS, &st) == 0) {
-	printf("ok=%llu crc=%llu len=%llu drop=%llu\n",
-	       st.frame_ok, st.crc_err, st.len_err, st.drop_cnt);
-}
-```
-
-`GET_STATUS` 的典型调用方式：
-
-```c
-struct rf433_status status = {0};
-if (ioctl(fd, RF433_IOC_GET_STATUS, &status) == 0) {
-	printf("online=%u seq=%u depth=%u cap=%u\n",
-	       status.online, status.seq,
-	       status.queue_depth, status.queue_capacity);
-}
-```
-
-`CLR_STATS` 和 `FLUSH_QUEUE` 的典型调用方式：
-
-```c
-ioctl(fd, RF433_IOC_CLR_STATS);
-ioctl(fd, RF433_IOC_FLUSH_QUEUE);
-```
-
-你要抓住的点是：
-
-- 用户态调用时，参数类型必须和头文件里定义的结构体对上
-- `ioctl()` 成功返回 0
-- `GET_*` 失败一般是用户缓冲区问题，返回 `-EFAULT`
-
-## 9. 在线状态和定时器
-
-先看定时器回调：
-
-```c
-static void rf433_online_timer_fn(struct timer_list *t)
-{
-	struct rf433_priv *priv = from_timer(priv, t, online_timer);
-	unsigned long flags;
-	unsigned long now = jiffies;
-
-	spin_lock_irqsave(&priv->lock, flags);
-
-	if (time_after(now, priv->last_frame_jiffies + ONLINE_TIMEOUT_SEC * HZ))
-		priv->online = false;
-
-	if (priv->state != RF_ST_SYNC0 &&
-	    time_after(now, priv->last_byte_jiffies + HALF_FRAME_TIMEOUT))
-		parser_reset(priv);
-
-	spin_unlock_irqrestore(&priv->lock, flags);
-
-	mod_timer(&priv->online_timer, jiffies + ONLINE_CHECK_SEC * HZ);
-}
-```
-
-这段的作用是做两个周期性检查：
-
-1. 超过一定时间没收完整帧，就把 `online` 置为 false
-2. 如果卡在半帧状态太久，就把解析器重置
-
-你要抓住的点是：
-
-- `ONLINE_TIMEOUT_SEC = 5`
-- `ONLINE_CHECK_SEC = 2`
-- `HALF_FRAME_TIMEOUT = HZ`，也就是大约 1 秒
-
-不是“定时器只是打印日志”，而是“定时器在维护驱动健康状态”。
-
-## 10. sysfs 只读属性：辅助观测口
-
-驱动还导出了一组 sysfs 只读属性：
+驱动还导出了只读 sysfs 属性：
 
 - `frame_ok`
 - `crc_err`
@@ -869,117 +784,100 @@ static void rf433_online_timer_fn(struct timer_list *t)
 - `online`
 - `seq`
 
-这些属性由 `miscdevice` 对应的 device 节点导出，作用和 ioctl 类似，都是给用户态看状态，但读法更像普通文件读取。
+它们的作用不是替代 `/dev/rf433`，而是提供运行时观察面。
 
-这段的作用是提供一个轻量的观测入口。
-
-你要抓住的点是：
-
-- 这不是主数据通道
-- 主数据通道还是 `/dev/rf433` 的 `read()`
-- sysfs 更适合快速看单项状态
-
-### 3. 用户态 ABI 一览
-
-这段的作用是把对外接口按“读、等、查、看”拆开。你要抓住的点是：**`read()` 是主数据通道，`poll()` 是就绪探针，`ioctl()` 是控制和快照，sysfs 是只读观测面**。
-
-| ABI | 返回什么 | 阻塞语义 | 可观测字段 / 行为 | 常见错误路径 |
-|---|---|---|---|---|
-| `read()` | 一整个 `struct rf433_frame`，成功时返回 `sizeof(struct rf433_frame)` | 队列空时阻塞；`O_NONBLOCK` 下不阻塞 | `timestamp_ns / pulse_count / seq / pulse[]` | `count` 太小返回 `-EINVAL`，非阻塞空队列返回 `-EAGAIN`，信号打断返回 `-ERESTARTSYS`，拷贝失败返回 `-EFAULT` |
-| `poll()` | 就绪掩码，典型是 `EPOLLIN | EPOLLRDNORM` | 不睡在 `poll()` 自己身上，靠 `rdq` 等通知 | 只告诉你“有没有新帧可读” | 正常路径不拷贝数据，基本没有用户缓冲区类错误 |
-| `ioctl()` | 成功返回 `0` | 不阻塞 | `GET_STATS` 看到 `frame_ok/crc_err/len_err/drop_cnt`，`GET_STATUS` 看到 `online/seq/queue_depth/queue_capacity`，`CLR_STATS` / `FLUSH_QUEUE` 改控制面 | 未知命令 `-ENOTTY`，用户缓冲区拷贝失败 `-EFAULT` |
-| `sysfs` | 文本快照 | 不阻塞 | `frame_ok / crc_err / len_err / drop_cnt / online / seq` 这些只读状态 | 节点消失后就是 VFS 层的不可访问，不是驱动再返回一帧数据 |
-
-你还要抓住两个边界：
-- `read()` 读的是“结构化帧”，不是字节流
-- sysfs 读的是“观测值”，不是主数据通道
-
-不是所有接口都在搬同一份数据，而是每个接口承担不同的用户态语义。
-
-### 4. 异常退出与 remove 收尾
-
-这段的作用是把“失败时怎么回滚”和“卸载时怎么收尾”说成一条顺序。你要抓住的点是：**probe 失败时按已初始化资源倒序回滚，remove 时先切断异步源，再拆用户态入口，最后释放底层对象**。
-
-probe 失败路径里，代码已经把回滚顺序写出来了：
-- `kfifo_alloc()` 失败时直接返回，这时还没有打开串口，也没有注册设备节点
-- `serdev_device_open()` 失败会跳到 `err_fifo`，只需要 `kfifo_free()`
-- `misc_register()` 失败会先 `serdev_device_close()`，再 `kfifo_free()`
-- `timer_setup()` 和 `mod_timer()` 只在 `misc_register()` 成功之后执行，所以 probe 中途失败时不需要去停一个根本没启动的定时器
-
-remove 的顺序也不是随便写的：
-1. `del_timer_sync()` 先停掉定时器，避免回调继续跑
-2. `misc_deregister()` 让 `/dev/rf433` 消失，阻止新的 `open()`
-3. `serdev_device_close()` 切断 RX 输入面，后续不再进 `receive_buf()`
-4. `kfifo_free()` 释放队列内存
-
-你还要抓住“设备节点消失前后”的状态差：
-- 在 `misc_deregister()` 之前，用户态还能继续看到 `/dev/rf433`
-- 在 `misc_deregister()` 之后，新的 `open()` 进不来，节点也不再暴露
-- 已经打开的 fd 不会因为节点消失立刻变成无效对象，但数据源已经被关掉了，所以后续只会看到空队列、等待信号或非阻塞返回
-
-不是“把内存先清了再说”，而是“先让异步生产者全部停下来，再拆入口，再释放对象”。
-
-## 11. 驱动移除时怎么收尾
+来源：`project2_master/linux_driver/rf433_drv.c`，宏与函数：`RF433_SYSFS_RO` / `online_show()`，作用：把统计字段和 `online` 映射成只读 sysfs 属性。
 
 ```c
-static void rf433_remove(struct serdev_device *serdev)
-{
-	struct rf433_priv *priv = serdev_device_get_drvdata(serdev);
+#define RF433_SYSFS_RO(_name, _field, _fmt)                            \
+static ssize_t _name##_show(struct device *dev,                        \
+			    struct device_attribute *attr, char *buf)   \
+{                                                                      \
+	struct rf433_priv *priv = container_of(                        \
+		(struct miscdevice *)dev_get_drvdata(dev),             \
+		struct rf433_priv, misc);                              \
+	unsigned long flags;                                           \
+	typeof(priv->_field) val;                                      \
+	spin_lock_irqsave(&priv->lock, flags);                        \
+	val = priv->_field;                                            \
+	spin_unlock_irqrestore(&priv->lock, flags);                   \
+	return sysfs_emit(buf, _fmt "\n", val);                        \
+}                                                                      \
+static DEVICE_ATTR_RO(_name)
 
-	del_timer_sync(&priv->online_timer);
-	misc_deregister(&priv->misc);
-	serdev_device_close(serdev);
-	kfifo_free(&priv->fifo);
+RF433_SYSFS_RO(frame_ok, stats.frame_ok, "%llu");
+RF433_SYSFS_RO(crc_err,  stats.crc_err,  "%llu");
+RF433_SYSFS_RO(len_err,  stats.len_err,  "%llu");
+RF433_SYSFS_RO(drop_cnt, stats.drop_cnt, "%llu");
+RF433_SYSFS_RO(seq,      seq,            "%u");
+
+static ssize_t online_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct rf433_priv *priv = container_of(
+		(struct miscdevice *)dev_get_drvdata(dev),
+		struct rf433_priv, misc);
+	unsigned long flags;
+	bool val;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	val = priv->online;
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	return sysfs_emit(buf, "%d\n", val ? 1 : 0);
 }
 ```
 
-这段的作用是按相反顺序释放资源。
+这套 sysfs 明确只暴露“当前值”，不暴露帧数据本体。所以它适合做健康检查和调试，不适合代替 `/dev/rf433` 消费业务帧。
 
-你要抓住的点是：
+## 9. 为什么这份驱动只做到 pulse frame
 
-- 先停定时器，避免回调继续跑
-- 再注销 misc 设备，避免用户态继续打开
-- 再关闭 serdev
-- 最后释放 FIFO
+就当前代码分层而言，这是一个刻意的边界：
 
-## 12. 按调用链串起来看
+- 驱动负责“字节流 -> 整帧脉冲”
+- 用户态负责“整帧脉冲 -> EV1527 解码结果 -> JSON/MQTT”
 
-如果把整个驱动串成一条链，实际顺序是：
+这样做的好处是：
 
-1. 设备树匹配到 `project2,rf433-receiver`
-2. `module_serdev_device_driver()` 触发 `rf433_probe()`
-3. `probe()` 分配 `rf433_priv`
-4. `probe()` 初始化锁、队列、状态机和定时器
-5. `probe()` 打开 `serdev` 并注册 `/dev/rf433`
-6. 硬件 RX 数据进入 `rf433_receive_buf()`
-7. `receive_buf()` 把每个字节喂给 `parser_feed_byte()`
-8. `parser_feed_byte()` 完成 `AA55/LEN/PAYLOAD/CRC` 校验
-9. 合法帧进入 `parser_emit_frame()`
-10. `parser_emit_frame()` 生成 `struct rf433_frame` 并放入 `kfifo`
-11. 用户态 `read()` 从 `/dev/rf433` 读出整帧
-12. 用户态 `ioctl()` 读取统计或状态，或者清空队列
-13. 定时器周期性维护 `online` 和半帧超时
+1. 内核不需要承担高层协议语义和业务策略。
+2. `rf_gateway` 可以自由调整稳定分组、去重和 JSON 输出，而不用碰内核。
+3. Qt 页面也只依赖稳定的用户态 JSON 契约，而不是直接依赖内核细节。
 
-你要抓住的点是：
+## 10. 驱动与 `rf_gateway` 的直接关系
 
-- 输入链路和输出链路在内核里被接到一起了
-- 输入是串口字节流，输出是结构化帧和状态快照
+把这一段单独拎出来，是因为它决定了后续文档怎么写。
 
-## 13. 用户态应该怎么理解这个驱动
+`rf_gateway` 从驱动取走的是：
 
-更准确地说，用户态不是在“解析协议”，而是在“消费已经解析好的结果”。
+- `pulse_count`
+- `pulse[]`
+- `timestamp_ns`
+- `seq`
 
-它能拿到的东西只有三类：
+然后它自己负责：
 
-- `read()`：一帧 `struct rf433_frame`
-- `poll()`：是否有新帧可读
-- `ioctl()`：统计、状态、清队列
+- 调用 EV1527 解码器
+- 生成 `addr`、`key`、`confidence`
+- 统计应用侧跳帧
+- 组装 `device_status/rf_stats/rf_event`
+- 输出 `stdout JSON envelope`
+- 旁路 MQTT publish
 
-不是原始串口字节，不是自己去找 `AA55`，也不是自己去算 CRC。  
-这些工作都已经在内核里做完了。
+所以 `/dev/rf433` 是 `rf_gateway` 的输入，不是 Qt 的输入。
 
-## 14. 一句话总结
+## 11. 推荐的走读顺序
 
-这份驱动的本质是：
+如果你打算对着代码读，建议按这个顺序：
 
-**用 `serdev` 接收硬件字节流，在内核里完成 `AA55/LEN/PAYLOAD/CRC` 解析，把合法帧装进 `kfifo`，再通过 `/dev/rf433`、`ioctl()` 和 sysfs 把结构化结果暴露给用户态。**
+1. `rf433_probe()`
+   先看资源怎样挂起来。
+2. `struct rf433_priv`
+   再看上下文里都维护了哪些状态。
+3. `parser_reset()` / `parser_feed_byte()` / `parser_emit_frame()`
+   看“字节流如何变整帧”。
+4. `rf433_receive_buf()`
+   看 serdev 如何把输入喂给 parser。
+5. `rf433_misc_read()` / `rf433_misc_poll()` / `rf433_misc_ioctl()`
+   看 `/dev/rf433` 的用户态契约。
+6. `rf433_online_timer_fn()`
+   最后补齐在线状态和半帧超时的运行时语义。

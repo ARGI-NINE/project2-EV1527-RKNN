@@ -1,137 +1,196 @@
-# `project2_master/qt_gui` 深读：Qt / vision 启动链路
+# `project2_master/qt_gui` Vision 深读
 
-本文只讲 `project2_master/qt_gui` 里的真实 master 侧代码，不讲 `pc sim`、vendor、生成文件，也不把离线回放当成主链路。
+这篇文档面向要读代码、改代码、排故障的工程师。重点不是“功能介绍”，而是把 `qt_gui` 里的本地视觉主链按真实代码拆开，讲清楚：
 
-先把总链路摆出来：
+- `VisionRuntime` 怎么启动。
+- `sourceThread / aiPool / postStreamFramePool / streamThread` 怎么分工。
+- MQTT publish 和 RTSP push 分别从哪里发起。
+- 哪些能力已经实现，哪些只是 TODO。
 
-```text
-main.cpp
-  -> AppOptions / Dark Palette
-  -> MainWindow
-     -> DashboardBackend
-     -> RFGatewayClient
-     -> VisionRuntime
-     -> RFStatusPage / VisionPage / SystemLogPage
-     -> WaveformWidget
-```
+本文只基于当前仓库事实，不把规划接口写成已交付能力。
 
-你要先抓住的点是：
-- `main.cpp` 只负责进程入口、参数校验和窗口启动，不做业务。
-- `MainWindow` 只负责组装 UI 和启动运行时，不做协议解析和推理。
-- `DashboardBackend` 是唯一的共享状态中枢，负责跨线程读写隔离。
-- `RFGatewayClient` 和 `VisionRuntime` 是两条生产链路，前者吃外部进程 stdout，后者吃本地摄像头帧。
-- 各个 `Page` 不是主动生产数据，而是定时从 `backend` 拉快照。
-- `WaveformWidget` 只是画脉冲，不负责解析 RF。
+下面这组标题按 `HEAD` 旧文档的原字符串与层级补回，作为兼容阅读地图；编号会和下文当前正文重复，但现有正文不删，只在其前面补回旧骨架。
 
 ## 0. 阅读地图：先读哪三段
 
-先把这三段当作顺序导航，不要从中间跳：
-- `main.cpp` -> 入口约束、参数、主题和主窗口创建。
-- `common_types.h` / `dashboard_backend.*` -> snapshot 的形状、写入点、读取点。
-- `rf_gateway_client.*` / `vision_runtime.*` -> 两条生产链路，分别看外部进程 stdout 和本地摄像头帧。
-如果只想先建立全局，先看 `0`、`4`、`9`。
-
-先按这个顺序读，不要反着啃：
-
-1. UI 入口：先看 `main.cpp`，再看 `MainWindow::setupUi()` / `setupRuntime()`。这段的作用是先把窗口壳子、页签、状态栏、定时器拼起来。
-2. 共享状态：先看 `common_types.h`，再看 `dashboard_backend.*`。这段的作用是先认清 snapshot 的形状，再看谁写、谁读。
-3. RF / vision runtime：先看 `rf_gateway_client.*`，再看 `vision_runtime.*`。这段的作用是把两条生产链路拆开看，一个吃外部进程 stdout，一个吃本地摄像头帧。
-
-你要抓住的点是：
-- 不是页面自己拉业务数据，而是后台先写，页面定时读。
-- 不是先啃控件细节，而是先看 `DashboardBackend` 怎么把状态收口。
-- 不是把 RF 和 vision 当成一条链路，而是两条链路分别生产，再汇进同一个状态中枢。
+兼容 `HEAD` 旧骨架时，仍建议按 `main.cpp -> main_window.* / dashboard_backend.* -> vision_runtime.*` 这三段读。当前这版正文把篇幅集中在 Vision 真实运行时，所以旧骨架里的 RF 页面、日志页面和状态栏 walkthrough 只保留为阅读地图，不再把它们和下文新增的 `workerLoop()` / RTSP / Vision MQTT 深挖混写。
 
 ## 1. 入口链路：`main.cpp`
 
-代码先看入口：
-
-```cpp
-int main(int argc, char *argv[]) {
-    QApplication app(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("rf_dashboard_qt5"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("1.0.0"));
-
-    QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Qt5 C++ Dashboard for RF Gateway + Vision monitor"));
-    parser.addHelpOption();
-    parser.addVersionOption();
-
-    const QString defaultRfInput = dashboard::defaultRFInputPath();
-    const QString defaultVisionDevice = dashboard::defaultVisionDevicePath();
-
-    parser.addOption(rfInputOption);
-    parser.addOption(visionDeviceOption);
-    parser.process(app);
-
-    dashboard::AppOptions options;
-    ...
-    dashboard::applyDarkPalette(app);
-
-    dashboard::MainWindow window(options);
-    window.show();
-    return app.exec();
-}
-```
-
-这段的作用是把整个进程边界钉死。
-
-依赖：
-- `QApplication` 提供 Qt Widgets 事件循环。
-- `QCommandLineParser` 负责启动参数解析。
-- `AppOptions` 提供运行时配置承载。
-- `applyDarkPalette()` 统一视觉风格。
-- `MainWindow` 是真正的 UI 入口。
-
-输入：
-- `argc/argv`
-- `--rf-input`
-- `--vision-device`
-
-输出：
-- 一个已经完成参数约束、主题初始化和主窗口构造的 Qt 应用。
-
-去向：
-- 参数通过后，进入 `MainWindow`。
-- `window.show()` 后进入 `app.exec()` 事件循环。
-
-为什么这样设计：
-- `main` 只做最早期的硬约束。它不碰 RF 协议，也不碰视觉推理。
-- `--rf-input` 在 master 侧不是自由配置，而是固定路径约束。
-- `--vision-device` 默认是本地 `/dev/video9`，但也允许可读的本地视频文件；两者都走同一个板侧本地运行时，不存在可接受的 stub 成功路径。
-
-你要抓住的点是：
-- `main.cpp` 的职责不是“启动所有功能”，而是“把能不能启动、从哪里启动”先判断清楚。
-- 这个入口已经把 master 侧的运行边界定住了：RF 用固定输入，视觉默认用本地摄像头，也允许切到可读本地视频文件。
+对应下文当前正文的 `## 2. 入口：main.cpp`。当前文档保留了 `--vision-device`、`--vision-rtsp-url`、`--disable-vision-rtsp` 的入口事实，以及 `AppOptions` 如何把这些 CLI 约束落进 `VisionRuntime`。
 
 ## 2. 启动参数与主题：`app_options.h` / `app_palette.*`
 
-先看 `AppOptions`：
+`HEAD` 版这里同时看 `AppOptions` 和 Qt 主题初始化。当前正文仍沿用同一条启动边界，只是把篇幅从 palette 细节转移到了 Vision CLI、RTSP 开关和本地输入合法性校验。
+
+## 3. 窗口组装：`main_window.*`
+
+### 3.1 `setupUi()`
+
+旧骨架里强调三页签和状态栏 UI 壳仍然存在；当前正文不重复铺开控件细节，而是把它当成已存在外壳。
+
+### 3.2 `setupRuntime()`
+
+对应下文当前正文的 `## 3. 组装层：MainWindow`。`rfClient_.start()` 和 `visionRuntime_.start()` 的启动关系没有改变，只是本文把解释重心放到了 Vision 侧。
+
+### 3.3 `updateStatusBar()`
+
+`HEAD` 版这里强调状态栏只读快照；当前正文在 `DashboardBackend`、`VisionSnapshot` 和错误路径段落里继续沿用同一边界。
+
+### 1. 组件职责表
+
+旧版把 `MainWindow`、`DashboardBackend`、`RFGatewayClient`、`VisionRuntime` 和各个 page 分成“组装 / 状态 / 生产 / 展示”四层。当前这版新增正文没有改掉这条责任线，只是把解释重心从 RF / UI 页转到了 `VisionRuntime` 主链。
+
+## 4. 共享状态中枢：`common_types.h` / `dashboard_backend.*`
+
+### 4.1 RF 写入
+
+RF 仍通过 `RFGatewayClient` 回写后端，但这份 Vision 深读不再展开 RF 协议细节。
+
+### 4.2 视觉写入
+
+对应下文当前正文的 `## 4`、`## 7.7`、`## 11.3`。`VisionSnapshot`、MQTT publish log 和错误态仍统一回写 `DashboardBackend`。
+
+### 4.3 日志和系统统计
+
+旧骨架中的日志 / 系统统计边界没有变：视觉链只追加日志与状态，不直接操纵页面对象。
+
+## 5. RF 链路：`rf_gateway_client.*`
+
+### 5.1 启动与停止
+
+### 5.2 固定路径与固定输入
+
+### 5.3 `QProcess` 信号链
+
+### 5.4 行解析
+
+这四节按 `HEAD` 旧标题保留为兼容阅读入口：RF 仍是独立链路，但这份深读的新增正文不把 RF 细节和 Vision 运行时混写。
+
+## 6. RF 页面与波形控件：`rf_status_page.*` / `waveform_widget.*`
+
+### 6.0 `RFGatewayClient` helper 链：启动外部进程与解析 stdout
+
+### 6.1 `RFStatusPage`
+
+### 6.2 `WaveformWidget`
+
+这些旧标题保留为 UI 总览锚点，提醒读者 Qt 页面对 RF / Vision 一律只读快照；本文后文只深挖 Vision 侧主链。
+
+## 7. 视觉链路：`vision_runtime.*` / `vision_page.*`
+
+### 7.1 `VisionRuntime`
+
+对应下文当前正文的 `## 5` 到 `## 16`，尤其是 `workerLoop()` 七阶段、RTSP 支路和 Vision MQTT publish。
+
+### 7.2 本地视觉链路
+
+对应下文当前正文的 `## 6`、`## 7`、`## 9`、`## 10`。当前版本的核心改动仍是“Qt 进程内本地运行时 + sourceThread / aiPool / post-stream 支路”。
+
+### 7.2.1 `VisionRuntime` helper 链：本地模型 / 相机 / 渲染辅助函数
+
+当前正文把这部分内容拆散到模型解析、输入打开、RTSP frame 构造和 MQTT publish 段落里，但 helper 边界没有消失。
+
+### 7.3 结果回传
+
+对应 `VisionSnapshot` 更新、`publishDetection()`、`publishStreamStatus()` 和 `backend_->addLog()`。
+
+### 7.4 `VisionPage`
+
+页面仍只消费 `DashboardBackend` 快照，不直接碰 worker 线程对象。
+
+## 8. 日志链路：`system_log_page.*`
+
+当前正文通过 `## 11.3` 和多处 `backend_->addLog()` 说明日志入口，但不再单独做页面 walkthrough。
+
+## 9. 结论：这套 UI 的真实职责边界
+
+结论没有变：`MainWindow` 组装，`DashboardBackend` 收口，`VisionRuntime` 负责本地视觉链，RTSP / MQTT / UI 是同一帧推理结果的不同扇出。
+
+## 2. 关键资源生命周期
+
+`worker_`、`sourceThread`、`streamThread`、`FrameCopyPool`、`PostStreamFramePool` 的生命周期在当前正文里比 `HEAD` 展开得更细，重点见下文 `## 7` 到 `## 10`。
+
+## 3. 数据契约与更新频率
+
+当前正文保留了 `VisionSnapshot`、MQTT topic/payload、RTSP status publish 的事实；旧版关于刷新频率的 UI 视角没有被否定，只是被更细的运行时解释覆盖。
+
+## 4. 最后一眼只看代码
+
+如果只想用旧版“扫一眼代码”的阅读法，优先看下文里的 `main.cpp`、`workerLoop()`、`copyPostInferFrameToPostStreamPool()`、`MppRtspEncoder::encodeAndPush()`、`publishDetection()` 这些实码段。
+
+## 1. 先给结论
+
+`qt_gui` 里的视觉链是一条“Qt 进程内本地运行时”：
+
+```text
+main.cpp
+  -> AppOptions
+  -> MainWindow
+     -> setupRuntime()
+        -> VisionRuntime::start()
+           -> std::thread worker_
+              -> VisionRuntime::workerLoop()
+                 -> 打开模型 / MQTT / 输入源
+                 -> sourceThread 采帧并送 aiPool
+                 -> 主循环 aiPool.get()
+                    -> VisionSnapshot
+                    -> Vision detection MQTT
+                    -> postStreamFramePool
+                 -> streamThread
+                    -> MppRtspEncoder
+                    -> RTSP stream status MQTT
+```
+
+最容易理解错的两点：
+
+1. `VisionRuntime` 不是外部子进程，而是 Qt 进程内的 C++ 线程。
+2. RTSP 推流拿到的是“推理后 annotated frame”，不是原始裸帧。
+
+## 2. 入口：`main.cpp`
+
+视觉链从 `qt_gui/app/main.cpp` 开始，但 `main.cpp` 只做参数解析和运行时组装，不做任何视觉业务。
+
+它处理的视觉相关开关只有三个：
+
+| 开关 | 默认值 | 含义 |
+|---|---|---|
+| `--vision-device` | `/dev/video9` | 视觉输入，允许 `/dev/video*` 或可读本地视频文件 |
+| `--vision-rtsp-url` | `rtsp://192.168.30.26:8554/rk3568-001/cam0` | RTSP push 目标地址 |
+| `--disable-vision-rtsp` | 无 | 禁用 RTSP 支路 |
+
+这里先做了两层约束。
+
+第一层是参数落地：
+
+- `visionDevice`
+- `visionRtspEnabled`
+- `visionRtspUrl`
+
+第二层是输入合法性：
+
+- `isAllowedVisionDevicePath(path)` 只认 `/dev/video*`
+- `isReadableVisionInputFile(path)` 只认存在、可读、普通文件
+- `isAllowedVisionInputPath(path)` 在这两者之间二选一
+
+这意味着当前代码支持两种真实输入：
+
+- 板端摄像头设备
+- 本地可读视频文件
+
+不支持任意 URL、管道、网络流地址直接塞进 `--vision-device`。
+
+代码来源：`project2_master/qt_gui/app/main.cpp`、`project2_master/qt_gui/core/app_options.h`
+函数：`main()`、`defaultVisionRtspUrl()`、`isAllowedVisionInputPath()`
+作用：定义 Vision CLI 开关、默认 RTSP URL、RTSP 开关落地方式，以及 `--vision-device` 的合法输入边界。
 
 ```cpp
-struct AppOptions {
-    QString rfInput;
-    QString visionDevice;
-};
-
-inline QString defaultRFInputPath() {
-    return QStringLiteral("/dev/rf433");
-}
-
 inline QString defaultVisionDevicePath() {
     return QStringLiteral("/dev/video9");
 }
 
-inline bool isAllowedVisionDevicePath(const QString &path) {
-    return path.startsWith(QStringLiteral("/dev/video"));
-}
-
-inline bool isReadableVisionInputFile(const QString &path) {
-    if (path.isEmpty()) {
-        return false;
-    }
-    const QFileInfo info(path);
-    return info.exists() && info.isFile() && info.isReadable();
+inline QString defaultVisionRtspUrl() {
+    return QStringLiteral("rtsp://192.168.30.26:8554/rk3568-001/cam0");
 }
 
 inline bool isAllowedVisionInputPath(const QString &path) {
@@ -140,70 +199,90 @@ inline bool isAllowedVisionInputPath(const QString &path) {
     }
     return isReadableVisionInputFile(path);
 }
-```
 
-这段的作用是把启动参数收口成两个字段。
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    QCommandLineParser parser;
 
-依赖：
-- `QString`
-- `QFileInfo`
+    const QString defaultVisionDevice = dashboard::defaultVisionDevicePath();
+    QCommandLineOption visionDeviceOption(
+        QStringLiteral("vision-device"),
+        QStringLiteral("Board-side vision input passed to the local runtime "
+                       "(default: %1; accepts /dev/video* or a readable local video file).")
+            .arg(defaultVisionDevice),
+        QStringLiteral("input"),
+        defaultVisionDevice
+    );
+    const QString defaultVisionRtspUrl = dashboard::defaultVisionRtspUrl();
+    QCommandLineOption visionRtspUrlOption(
+        QStringLiteral("vision-rtsp-url"),
+        QStringLiteral("RTSP push URL used by the local vision runtime when enabled (default: %1).")
+            .arg(defaultVisionRtspUrl),
+        QStringLiteral("url"),
+        defaultVisionRtspUrl
+    );
+    QCommandLineOption disableVisionRtspOption(
+        QStringLiteral("disable-vision-rtsp"),
+        QStringLiteral("Disable the RTSP push side-branch while keeping local vision inference and display active.")
+    );
+    parser.addOption(visionDeviceOption);
+    parser.addOption(visionRtspUrlOption);
+    parser.addOption(disableVisionRtspOption);
+    parser.process(app);
 
-输入：
-- `main.cpp` 解析后的命令行参数。
+    dashboard::AppOptions options;
+    options.visionDevice = parser.value(visionDeviceOption).trimmed();
+    if (options.visionDevice.isEmpty()) {
+        options.visionDevice = defaultVisionDevice;
+    }
+    options.visionRtspEnabled = !parser.isSet(disableVisionRtspOption);
+    options.visionRtspUrl = parser.value(visionRtspUrlOption).trimmed();
+    if (options.visionRtspEnabled && options.visionRtspUrl.isEmpty()) {
+        options.visionRtspUrl = defaultVisionRtspUrl;
+    }
+    if (!dashboard::isAllowedVisionInputPath(options.visionDevice)) {
+        QTextStream(stderr)
+            << "Invalid --vision-device: " << options.visionDevice
+            << " (master supports local /dev/video* devices or readable local video files)\n";
+        return 1;
+    }
 
-输出：
-- `rfInput`
-- `visionDevice`
-
-去向：
-- `MainWindow` 构造函数。
-- `RFGatewayClient` 和 `VisionRuntime` 的初始化。
-
-为什么这样设计：
-- 这里没有业务逻辑，只有配置载体。
-- 默认路径和允许规则都放在这里，避免入口和运行时到处散落常量。
-- `isAllowedVisionDevicePath()` 和 `isAllowedVisionInputPath()` 的分工是“设备路径快速判定”和“启动前总入口校验”。
-
-再看主题：
-
-```cpp
-void applyDarkPalette(QApplication &app) {
-    app.setStyle(QStringLiteral("Fusion"));
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor(30, 30, 30));
-    ...
-    app.setPalette(palette);
-    app.setStyleSheet(QStringLiteral(...));
+    dashboard::MainWindow window(options);
+    window.show();
+    return app.exec();
 }
 ```
 
-这段的作用是把整个 Qt 应用的视觉基调统一掉。
+这段代码把文档里的 CLI 事实全部钉死了：RTSP 不是单独配置文件控制，而是 `main()` 里直接落到 `AppOptions.visionRtspEnabled` 和 `AppOptions.visionRtspUrl`；`--disable-vision-rtsp` 只是关闭推流支路，不会让 `MainWindow` 放弃创建 `VisionRuntime`。同时 `--vision-device` 只接受 `/dev/video*` 或可读本地文件，网络 URL 不在当前实现范围内。
 
-依赖：
-- `QApplication`
-- `QPalette`
-- `QColor`
+## 3. 组装层：`MainWindow`
 
-输入：
-- 当前应用实例。
+`MainWindow` 构造函数同时实例化两条生产链：
 
-输出：
-- 统一的 Fusion 样式、深色调色板和控件样式表。
+- `RFGatewayClient rfClient_`
+- `VisionRuntime visionRuntime_`
 
-去向：
-- 所有页面、表格、按钮、状态栏、文本框都继承这一套风格。
+视觉相关的关键点在 `setupRuntime()`：
 
-为什么这样设计：
-- 这个工程的 UI 是仪表盘，不是文档编辑器。统一深色主题能让状态、波形、图像、日志更容易区分。
-- 主题在 `MainWindow` 创建前设置，避免页面先按默认风格渲染再被切换。
+- 先记系统日志。
+- 记一条视觉链接入日志，说明当前使用的 `visionDevice`。
+- 调 `visionRuntime_.start()`。
 
-你要抓住的点是：
-- `AppOptions` 管配置，`applyDarkPalette()` 管外观。
-- 这两者都属于“启动期公共约束”，不是业务模块。
+这说明 `MainWindow` 只负责：
 
-## 3. 窗口组装：`main_window.*`
+- 把运行时挂起来。
+- 把页面绑到 `DashboardBackend`。
 
-先看构造关系：
+它不负责：
+
+- 采帧。
+- 推理。
+- MQTT 发布。
+- RTSP 编码。
+
+代码来源：`project2_master/qt_gui/app/main_window.cpp`
+函数：`MainWindow::MainWindow()`、`setupRuntime()`
+作用：把 `DashboardBackend`、`RFGatewayClient`、`VisionRuntime` 组装到同一个 Qt 进程里，并在窗口层触发运行时启动。
 
 ```cpp
 MainWindow::MainWindow(const AppOptions &options, QWidget *parent)
@@ -214,1063 +293,1222 @@ MainWindow::MainWindow(const AppOptions &options, QWidget *parent)
     setupUi();
     setupRuntime();
 }
-```
-
-这段的作用是把所有运行时对象在一个地方组装起来。
-
-依赖：
-- `DashboardBackend`
-- `RFGatewayClient`
-- `VisionRuntime`
-- 三个页面类
-
-输入：
-- `AppOptions`
-- `QWidget *parent`
-
-输出：
-- 一个已经完成对象绑定的主窗口实例。
-
-去向：
-- 页面只读 `backend_`。
-- `rfClient_` 和 `visionRuntime_` 写 `backend_`。
-
-为什么这样设计：
-- `backend_` 先作为成员存在，后面的 client/runtime 才有共享状态可写。
-- `rfClient_` 明确拿到 `this` 作为 QObject 上下文，方便 `QProcess` 信号槽生命周期管理。
-- `visionRuntime_` 不挂 Qt 信号槽，而是单独线程运行，避免把推理线程和 UI 线程缠在一起。
-
-### 3.1 `setupUi()`
-
-`setupUi()` 的职责是把页面和状态栏摆出来：
-
-```cpp
-auto *tabs = new QTabWidget(this);
-rfPage_ = new RFStatusPage(&backend_, tabs);
-visionPage_ = new VisionPage(&backend_, tabs);
-logPage_ = new SystemLogPage(&backend_, tabs);
-tabs->addTab(rfPage_, QStringLiteral("RF 状态"));
-tabs->addTab(visionPage_, QStringLiteral("视觉监控"));
-tabs->addTab(logPage_, QStringLiteral("系统日志"));
-setCentralWidget(tabs);
-
-statusLabel_ = new QLabel(QStringLiteral("系统启动中..."), this);
-statusBar()->addPermanentWidget(statusLabel_);
-QObject::connect(&statusTimer_, &QTimer::timeout, this, [this]() { updateStatusBar(); });
-statusTimer_.start(2000);
-```
-
-这段的作用是把 UI 组装成“一个窗口、三个页签、一个状态栏”。
-
-依赖：
-- `QTabWidget`
-- `QStatusBar`
-- `QTimer`
-
-输入：
-- `backend_` 的只读指针。
-
-输出：
-- `RFStatusPage`
-- `VisionPage`
-- `SystemLogPage`
-- 状态栏定时刷新
-
-去向：
-- 所有页面都通过 `backend_` 拉快照。
-- 状态栏 2 秒刷新一次。
-
-为什么这样设计：
-- 页面不是互相通信，而是统一从 `backend_` 读。
-- 这种结构把“生产数据”和“展示数据”分开，页面刷新不会反向影响运行时。
-
-### 3.2 `setupRuntime()`
-
-```cpp
-backend_.addLog("INFO", "SYSTEM", QStringLiteral("Qt5 前端已启动"));
-backend_.addLog("INFO", "VISION", QStringLiteral("板侧本地视觉链路已接入，默认使用 %1").arg(options_.visionDevice));
-
-rfClient_.start();
-visionRuntime_.start();
-updateStatusBar();
-```
-
-这段的作用是让 UI 启动后立刻进入可观测状态。
-
-依赖：
-- `DashboardBackend::addLog()`
-- `RFGatewayClient::start()`
-- `VisionRuntime::start()`
-
-输入：
-- 当前 `options_`
-
-输出：
-- 启动日志
-- RF 采集链路启动
-- 视觉运行时启动
-
-去向：
-- 日志页可立即看到启动记录。
-- RF 页和视觉页随后台状态变化刷新。
-
-为什么这样设计：
-- 先写日志，再拉起运行时，能让页面最早看到“发生了什么”。
-- `updateStatusBar()` 立刻跑一次，是为了避免空白窗口。
-
-### 3.3 `updateStatusBar()`
-
-```cpp
-const SystemStats stats = backend_.snapshotSystemStats();
-const RFSnapshot rf = backend_.snapshotRF();
-const VisionSnapshot vision = backend_.snapshotVisionState();
-
-statusLabel_->setText(
-    vision.statusReported
-        ? QString("运行 %1s | RF帧 %2 | Vision FPS %3 | CPU %4%")
-        : QString("运行 %1s | RF帧 %2 | Vision 未接入 | CPU %3%")
-);
-```
-
-这段的作用是把三个后台快照压成一行状态。
-
-依赖：
-- `SystemStats`
-- `RFSnapshot`
-- `VisionSnapshot`
-
-输入：
-- 后端快照。
-
-输出：
-- 状态栏文本。
-
-去向：
-- 仅展示给用户。
-
-为什么这样设计：
-- 状态栏不直接读线程内部变量，只读快照。
-- `vision.statusReported` 不是“成功”，而是“视觉线程已经回写过状态”。这一点要和 `modelLoaded`、`cameraOnline` 区分开。
-
-你要抓住的点是：
-- `MainWindow` 是胶水层，不是业务层。
-- 页面和运行时都不直接碰彼此，统一经过 `DashboardBackend`。
-
-### 1. 组件职责表
-
-先看这张表，再回头看 3.1 / 3.2 / 3.3。
-
-这段的作用是把边界卡死，避免后面读代码时把“谁负责生产”看成“谁负责展示”。
-
-| 组件 | 这段的作用是 | 输入 | 输出 | 不是它负责的 |
-| --- | --- | --- | --- | --- |
-| `MainWindow` | 组装 UI、拉起 runtime、维持状态栏节奏 | `AppOptions`、`DashboardBackend` | 页签、状态栏、启动调用 | 不是协议解析，也不是模型推理 |
-| `DashboardBackend` | 共享状态中枢，负责线程安全快照 | RF 事件、视觉快照、日志、系统统计 | `RFSnapshot` / `VisionSnapshot` / `SystemStats` / `LogEntry` | 不是设备 IO，也不是 UI 绘制 |
-| `RFGatewayClient` | 外部 `rf_gateway` 进程适配器 | 固定程序路径、`--rf-input`、stdout | RF 状态、`RFEvent`、日志 | 不是页面刷新器，也不是 RF 协议本体 |
-| `VisionRuntime` | 本地摄像头 + RKNN worker | `visionDevice`、本地模型、摄像头帧 | `VisionSnapshot`、视觉日志 | 不是 Qt 主线程任务，也不是页面对象 |
-| 各 `Page` | 只读快照渲染层 | `backend_->snapshot*()` | 控件文本、表格、图像 | 不是主动生产业务状态 |
-
-你要抓住的点是：
-- `MainWindow` 只负责把东西接起来，不负责把数据算出来。
-- `DashboardBackend` 不是缓存一份数据这么简单，它是整个 UI 的状态收口点。
-- `Page` 的职责是“读快照并渲染”，不是“直接摸运行时对象”。
-
-## 4. 共享状态中枢：`common_types.h` / `dashboard_backend.*`
-
-先看数据契约：
-
-```cpp
-struct RFEvent {
-    QDateTime timestamp;
-    QString address;
-    QString key;
-    double confidence = 0.0;
-    QString source;
-    qint64 frameSeq = -1;
-    qint64 decodeUs = -1;
-};
-
-struct VisionSnapshot {
-    QImage frame;
-    QStringList detections;
-    double fps = 0.0;
-    bool statusReported = false;
-    bool modelLoaded = false;
-    bool cameraOnline = false;
-    int frameCount = 0;
-    QString errorMsg;
-};
-```
-
-这段的作用是定义页面、运行时和后端之间共享的数据形状。
-
-依赖：
-- Qt 基础类型。
-
-输入：
-- RF 解析结果。
-- 视觉运行时结果。
-- 系统统计结果。
-
-输出：
-- 可被 UI 快照读取的数据结构。
-
-去向：
-- `RFSnapshot`
-- `VisionSnapshot`
-- `SystemStats`
-- `LogEntry`
-
-为什么这样设计：
-- 这些结构只描述“状态”，不包含复杂行为。
-- 页面和运行时如果直接共享原始对象，会把线程安全问题放大。
-
-再看后端：
-
-```cpp
-class DashboardBackend {
-public:
-    void updateSerialStatus(bool online, const QString &port = QString());
-    void addRFEvent(const RFEvent &event, const QVector<int> &pulses);
-    void updateWaveform(const QVector<int> &pulses);
-    void incrementCrcError();
-    void incrementParseError();
-    void updateProtocolStats(int crcErrors, int parseErrors, int driverDropFrames);
-    void incrementDrop();
-
-    void updateVisionState(const VisionSnapshot &snapshot);
-    void setVisionOffline(const QString &message);
-
-    void addLog(const QString &level, const QString &source, const QString &message);
-    void addMqttPublishLog(const QString &topic, const QString &payload);
-    void clearLogs();
-
-    RFSnapshot snapshotRF() const;
-    VisionSnapshot snapshotVisionState() const;
-    QVector<LogEntry> queryLogs(const QString &sourceFilter, int limit) const;
-    SystemStats snapshotSystemStats();
-};
-```
-
-这段的作用是把所有跨线程写入和 UI 读取都收口到一个 mutex 保护对象里。
-
-依赖：
-- `QMutex`
-- `QElapsedTimer`
-- `/proc/stat`
-- `/proc/meminfo`
-
-输入：
-- `RFGatewayClient` 的解析结果。
-- `VisionRuntime` 的运行时结果。
-- 页面按钮动作。
-
-输出：
-- 可查询的快照。
-
-去向：
-- `RFStatusPage`
-- `VisionPage`
-- `SystemLogPage`
-- `MainWindow::updateStatusBar()`
-
-为什么这样设计：
-- 后端是共享状态中枢，不是业务引擎。
-- 写入端只负责更新内存中的最新状态和有限历史。
-- 读取端只拿快照，不直接触碰运行时内部对象。
-
-几个关键点要单独拎出来：
-
-### 4.1 RF 写入
-
-`addRFEvent()` 会同时更新：
-- `lastDecode_`
-- `waveform_`
-- `eventHistory_`
-- `frameCount_`
-
-并且会限制：
-- `waveform_` 最多 `kMaxWaveform = 1024`
-- `eventHistory_` 最多 `kMaxHistory = 200`
-
-这段的作用是把“最新一次解码”与“历史轨迹”同时保留。
-
-为什么这样设计：
-- RF 页要看最近一次解码，也要看历史表和波形。
-- 只保留有限历史，避免 UI 刷新时无限增长。
-
-### 4.2 视觉写入
-
-`updateVisionState()` 会把视觉快照整体写入，并强制标记 `statusReported = true`。
-
-这句话要特别注意：
-- `statusReported` 表示“视觉运行时已经写过状态”
-- 不等于 `cameraOnline = true`
-- 也不等于 `modelLoaded = true`
-
-这段的作用是给页面一个“有状态可读”的标记。
-
-### 4.3 日志和系统统计
-
-`addLog()` 会追加时间戳、级别、来源和消息，并把日志数限制在 `kMaxLogs = 500`。
-
-`queryLogs()` 是按来源过滤后倒序取最新日志。
-
-`snapshotSystemStats()` 会按节流策略读取：
-- `/proc/stat` 算 CPU 占用
-- `/proc/meminfo` 算内存占用
-
-节流间隔是 1500ms，不是每次刷新都读文件。
-
-你要抓住的点是：
-- `DashboardBackend` 不是“缓存一份数据”这么简单，它是整个 UI 的状态交换层。
-- 页面看的是快照，运行时写的是状态，真正的耦合点只有 backend。
-
-## 5. RF 链路：`rf_gateway_client.*`
-
-先看这个类的定位：
-
-```cpp
-class RFGatewayClient {
-public:
-    RFGatewayClient(DashboardBackend *backend, const AppOptions &options, QObject *context);
-    ~RFGatewayClient();
-
-    void start();
-    void stop();
-};
-```
-
-这段的作用不是“解析 RF 协议”，而是“把外部 `rf_gateway` 进程接进来”。
-
-依赖：
-- `QProcess`
-- `DashboardBackend`
-- `AppOptions`
-
-输入：
-- 应用目录中的 `rf_gateway`
-- `--rf-input`
-
-输出：
-- 标准输出行
-- 进程生命周期事件
-- 转写成后端状态和日志的结果
-
-去向：
-- `DashboardBackend`
-
-为什么这样设计：
-- RF 侧是外部进程驱动，不是 Qt 内部对象直接采集。
-- 这样可以把硬件采集、协议解析和 UI 完全分离。
-
-### 5.1 启动与停止
-
-`start()` 只做一件事：调用 `startGateway()`。
-
-`stop()` 会：
-- kill 外部进程
-- 等待收尾
-- `deleteLater()`
-- 将串口/链路状态置为离线
-
-这段的作用是把生命周期收口。
-
-### 5.2 固定路径与固定输入
-
-```cpp
-QString fixedGatewayPath() {
-    return QCoreApplication::applicationDirPath() + QStringLiteral("/rf_gateway");
-}
-
-QString RFGatewayClient::resolvedRfInputPath() const {
-    const QString defaultPath = defaultRFInputPath();
-    if (options_.rfInput.isEmpty() || options_.rfInput == defaultPath) {
-        return defaultPath;
-    }
-    return defaultPath;
-}
-```
-
-这段的作用是把 master 侧 RF 入口固定住。
-
-依赖：
-- `QCoreApplication::applicationDirPath()`
-- `defaultRFInputPath()`
-
-输入：
-- 当前运行目录
-- 启动参数
-
-输出：
-- `rf_gateway` 的绝对路径
-- 实际使用的 RF 输入路径
-
-去向：
-- `QProcess::setProgram()`
-- `QProcess::setArguments()`
-
-为什么这样设计：
-- 这里不是开放式配置，而是强约束启动。
-- `resolvedRfInputPath()` 是启动链的一环：它先收口 `options_.rfInput`，再被 `buildGatewayArgs()` 复用；master 侧不接受任意 RF 输入路径。
-
-### 5.3 `QProcess` 信号链
-
-`startGateway()` 里最关键的是这几个连接：
-
-```cpp
-QObject::connect(gateway_, &QProcess::started, context_, ...);
-QObject::connect(gateway_, &QProcess::readyReadStandardOutput, context_, ...);
-QObject::connect(gateway_, &QProcess::readyReadStandardError, context_, ...);
-QObject::connect(gateway_, &QProcess::errorOccurred, context_, ...);
-QObject::connect(gateway_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), context_, ...);
-```
-
-这段的作用是把进程事件转成后端事件。
-
-输入：
-- 外部进程状态
-- stdout 行
-- stderr 诊断文本
-
-输出：
-- `updateSerialStatus()`
-- `addLog()`
-- `updateProtocolStats()`
-- `addRFEvent()`
-- `appendDiagnosticChunk()/takeBufferedDiagnostics()`
-- `incrementParseError()`
-
-去向：
-- `DashboardBackend`
-
-为什么这样设计：
-- 这里用的是 Qt 的事件回调，不是轮询。
-- 进程启动、退出和输出行都变成明确的状态更新，页面不需要知道进程细节。
-
-### 5.4 行解析
-
-`handleProtocolLine()` 按 JSON envelope 的 `type` 字段处理：
-
-- 非法 JSON / 缺少 `payload`
-  - `incrementParseError()`
-  - 记一条 `Invalid rf_gateway protocol JSON`
-- `type == "rf_event"`
-  - `parseRFEventPayload()` 解析 `addr/key/conf/src/seq/decode_us/pulse_us[]`
-  - `updateSerialStatus(true, rf_input)`
-  - `addRFEvent()` 写入事件和真实波形
-  - `addLog("INFO", "RF", line)`
-  - `mqtt_published == true` 时额外记 `addMqttPublishLog()`
-- `type == "device_status"`
-  - 从 `payload` 读取 `rf_online`、`driver_crc_err`、`app_drv_drop`
-  - `updateSerialStatus()` 和 `updateProtocolStats()`
-  - 记录 RF 日志 / MQTT 发布日志
-- `type == "rf_stats"`
-  - 从 `payload` 读取 `driver_crc_err`、`decode_no_frame`、`decode_err`、`drv_drop`
-  - `parseErrors = decode_no_frame + decode_err`
-  - 如有 `driver_online` 则同步在线状态
-  - 记录 RF 日志 / MQTT 发布日志
-- 未知 `type`
-  - `incrementParseError()`
-  - 记一条 `Unknown rf_gateway protocol type`
-
-这段的作用是把单行 JSON envelope 变成结构化状态。
-
-你要抓住的点是：
-- `rf_gateway` 输出不是给 UI 直接看的，而是给客户端解析器看的。
-- `RFGatewayClient` 负责“文本 -> 状态”，不是“文本 -> 页面”。
-- 页面只认 `DashboardBackend` 的结构化快照。
-
-## 6. RF 页面与波形控件：`rf_status_page.*` / `waveform_widget.*`
-
-### 6.0 `RFGatewayClient` helper 链：启动外部进程与解析 stdout
-
-这条链把“怎么启动 `rf_gateway`”和“怎么把 JSON stdout 变成事件”串在一起看：
-
-```text
-fixedGatewayPath()
-  -> resolveGatewayPath()
-  -> resolvedRfInputPath()
-  -> buildGatewayArgs()
-  -> startGateway()
-  -> QProcess::setProgram()/setArguments()/start()
-
-QProcess::readyReadStandardOutput
-  -> drainProtocolBuffer()
-  -> handleProtocolLine()
-  -> parseProtocolEnvelope()
-  -> parseRFEventPayload()
-  -> updateSerialStatus()/updateProtocolStats()/addRFEvent()/addLog()
-```
-
-这条链里最关键的是：`fixedGatewayPath()` 先给出二进制的固定落点，`resolveGatewayPath()` 再验证它真的存在；`resolvedRfInputPath()` 不接受任意注入，最终只会落回 `/dev/rf433`；`buildGatewayArgs()` 只负责拼参数，不掺杂解析逻辑；`parseProtocolEnvelope()` 负责拆顶层 `type/topic/mqtt_published/payload`，`parseRFEventPayload()` 再把 `pulse_us[]` 等字段收束成 `RFEvent + QVector<int>`，最后交给 `DashboardBackend` 去做快照写入。
-
-| 函数 | 作用 | 依赖 | 输入 | 输出 | 去向 | 为什么这样设计 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `fixedGatewayPath()` | 给出 `rf_gateway` 的固定安装路径 | `QCoreApplication::applicationDirPath()` | 无 | 可预期的二进制路径 | `resolveGatewayPath()` | master 侧不开放任意 gateway 注入，只认包内固定落点 |
-| `resolveGatewayPath()` | 校验固定路径是否真实存在且可执行 | `QFileInfo` | `fixedGatewayPath()` 的结果 | 绝对路径或空串 | `startGateway()` | 把“路径拼出来”与“路径可用”分开，失败更早暴露 |
-| `resolvedRfInputPath()` | 收敛 RF 输入路径；当前实现除默认值外一律回退到固定值 | `defaultRFInputPath()`、`options_.rfInput` | 命令行/默认值 | 进程参数用的输入路径 | `buildGatewayArgs()`、`startGateway()` | 让 master 的输入面保持收口，避免页面层误以为可任意传参 |
-| `buildGatewayArgs()` | 拼出 `rf_gateway` 的启动参数 | `resolvedRfInputPath()` | 当前 options | `QStringList` | `QProcess::setArguments()` | 把参数拼接独立出来，便于单独审查与测试 |
-| `parseProtocolEnvelope()` | 解析顶层 JSON envelope | `QJsonDocument`、`QJsonObject` | stdout 单行文本 | `type/topic/mqtt_published/payload` | `handleProtocolLine()` | 把 stdout ABI 固定成单行 JSON，而不是让页面层认识多套文本标签 |
-| `parseRFEventPayload()` | 把 `rf_event.payload` 里的真实字段还原成事件和波形 | `QJsonArray`、`QDateTime` | `payload.addr/key/conf/src/seq/decode_us/pulse_us[]` | `RFEvent`、`QVector<int>` | `handleProtocolLine()` -> `addRFEvent()` | 把 RF 事件解析边界收窄到一个 helper，避免事件写入里混进 JSON 细节 |
-
-`startGateway()` 的实际顺序是：
-
-```text
-resolveGatewayPath()
-  -> stop/cleanup old QProcess
-  -> QProcess::setProcessChannelMode(SeparateChannels)
-  -> connect(started/stdout/stderr/error/finished)
-  -> setProgram()
-  -> setArguments(buildGatewayArgs())
-  -> start()
-```
-
-stdout 这一侧则是：
-
-```text
-readyReadStandardOutput
-  -> append into gatewayBuffer_
-  -> split by newline
-  -> handleProtocolLine(line)
-  -> parseProtocolEnvelope() / parseRFEventPayload()
-  -> backend_->updateSerialStatus()
-  -> backend_->updateProtocolStats()
-  -> backend_->addRFEvent()
-  -> backend_->addLog()
-```
-
-这样拆的原因很简单：
-- 启动链只负责“把外部进程拉起来”，不负责理解协议。
-- 解析链只负责“把 JSON stdout 变成结构化事件”，不负责创建进程。
-- `DashboardBackend` 是唯一写入点，页面只读快照。
-
-### 6.1 `RFStatusPage`
-
-先看页面职责：
-
-```cpp
-class RFStatusPage : public QWidget {
-public:
-    explicit RFStatusPage(DashboardBackend *backend, QWidget *parent = nullptr);
-private:
-    void setupUi();
-    void refresh();
-};
-```
-
-这段的作用是展示 RF 状态，而不是生产 RF 数据。
-
-依赖：
-- `DashboardBackend`
-- `QTimer`
-- `QTableWidget`
-- `WaveformWidget`
-
-输入：
-- `backend_->snapshotRF()`
-
-输出：
-- 在线/离线状态
-- 帧数和错误计数
-- 最近一次解码结果
-- 历史事件表
-- 脉冲波形图
-
-去向：
-- 用户界面
-
-为什么这样设计：
-- 页面对 backend 做定时轮询，不直接绑定运行时对象。
-- 这样可以避免后台线程直接触碰 UI。
-
-`refresh()` 的核心逻辑是：
-
-```cpp
-const RFSnapshot snapshot = backend_->snapshotRF();
-statusDot_->setStyleSheet(snapshot.serialOnline ? "color: #4EC9B0;" : "color: #d9534f;");
-serialLabel_->setText(...);
-frameLabel_->setText(...);
-waveformWidget_->setPulses(snapshot.waveform);
-```
-
-这段的作用是把 RF 快照落成可读状态。
-
-特别要看这几个地方：
-- `waveformWidget_->setPulses(snapshot.waveform)` 是 RF 页和波形控件的唯一连接点。
-- 历史表来自 `snapshot.events`，不是实时追加。
-- 最近一次解码用 `snapshot.hasLastDecode` 判断是否有数据。
-
-### 6.2 `WaveformWidget`
-
-先看它的职责：
-
-```cpp
-class WaveformWidget : public QWidget {
-public:
-    explicit WaveformWidget(QWidget *parent = nullptr);
-    void setPulses(const QVector<int> &pulses);
-protected:
-    void paintEvent(QPaintEvent *event) override;
-private:
-    QVector<int> pulses_;
-};
-```
-
-这段的作用只是画图，不解析协议。
-
-依赖：
-- `QPainter`
-- `QVector<int>`
-
-输入：
-- 脉冲宽度序列
-
-输出：
-- 一个实时波形预览
-
-去向：
-- 仅绘制到当前控件上
-
-为什么这样设计：
-- 波形展示和 RF 解码是两条不同职责线。
-- 这里的任务是把脉冲时序做成视觉预览，不是重建协议帧。
-
-`setPulses()` 会把脉冲截断到 200 个并触发重绘。
-
-`paintEvent()` 的绘制顺序很清楚：
-- 先填背景
-- 再画网格
-- 再画边框
-- 再画 HIGH/LOW 标签
-- 最后按高低电平交替画线段
-
-你要抓住的点是：
-- 这里的横轴是脉冲比例，不是严格时间标尺。
-- 画的是“形状预览”，不是示波器级别的精确采样重建。
-
-## 7. 视觉链路：`vision_runtime.*` / `vision_page.*`
-
-### 7.1 `VisionRuntime`
-
-先看定位：
-
-```cpp
-class VisionRuntime {
-public:
-    VisionRuntime(DashboardBackend *backend, const AppOptions &options);
-    ~VisionRuntime();
-    void start();
-    void stop();
-private:
-    void workerLoop();
-};
-```
-
-这段的作用是把视觉链路放到独立线程里跑。
-
-依赖：
-- `DashboardBackend`
-- `AppOptions`
-- `std::thread`
-- `std::atomic<bool>`
-
-输入：
-- `options_.visionDevice`
-- 本地摄像头帧
-- RKNN 模型
-
-输出：
-- `VisionSnapshot`
-- 视觉日志
-
-去向：
-- `DashboardBackend`
-
-为什么这样设计：
-- 视觉推理是阻塞型工作，不能放 UI 线程。
-- 这里不用 Qt 信号槽驱动帧循环，而是直接用工作线程，逻辑更直观，也更适合持续抓帧。
-
-先看线程控制：
-
-```cpp
-void VisionRuntime::start() {
-    if (backend_ == nullptr || running_.exchange(true)) {
-        return;
-    }
-    worker_ = std::thread(&VisionRuntime::workerLoop, this);
-}
-
-void VisionRuntime::stop() {
-    if (!running_.exchange(false)) {
-        return;
-    }
-    if (worker_.joinable()) {
-        worker_.join();
-    }
-}
-```
-
-这段的作用是把生命周期和线程状态绑定在一起。
-
-### 7.2 本地视觉链路
-
-`workerLoop()` 在本地启用时，顺序是这样的：
-
-1. 记录启动日志，解析模型路径，初始化 `rkYolov5s`。
-2. 按 `options_.visionDevice` 分支：
-   - `/dev/video*` 走 `V4L2Capture::open()/startStream()`
-   - 可读本地视频文件走 `MppDecoder::open()`，并先 decode 一帧拿到真实几何尺寸
-3. 基于真实输入尺寸分配 `FrameCopyPool`、`StreamFramePool` 和 RGB buffer。
-4. 起 `streamThread`，专门消费 RTSP 推流队列。
-5. 起 `sourceThread`，统一把相机帧或解码帧做双路 fan-out：
-   - 一路 `copyFrameToAiPool()` 送到 `rknnPool`
-   - 一路 `copyFrameToStreamPool()` 送到 `streamThread`
-6. 主循环 `aiPool.get()` 取回 AI 结果，把 NV12/YUYV 帧转成 RGB，渲染框图，必要时发布 detection MQTT。
-7. 组装 `VisionSnapshot`，调用 `updateVisionState(snapshot)`。
-8. 退出时 join `sourceThread` / `streamThread`，并关闭 `V4L2Capture` 或 `MppDecoder`。
-
-这段的作用是把“本地相机或本地视频文件 -> 统一产帧 -> AI/RTSP 双路 fan-out -> 推理快照回传”串成一个闭环。
-
-依赖：
-- `frame_pools.h`
-- `mpp_decoder.h`
-- `mpp_encoder_rtsp.h`
-- `preprocess.h`
-- `rkYolov5s.hpp`
-- `v4l2_capture.h`
-- `rga.h`
-
-输入：
-- 摄像头设备，例如 `/dev/video9`
-- 可读的本地视频文件，例如板侧 MP4
-- 模型文件，例如 `model/yolov5s_relu-640-640-rk3568.rknn`
-
-输出：
-- 带框图像
-- 检测列表
-- FPS
-- 摄像头/模型状态
-- RTSP 推流状态
-- 错误文本
-
-去向：
-- `DashboardBackend::updateVisionState()`
-- `DashboardBackend::addLog()`
-
-为什么这样设计：
-- 模型加载、相机打开、视频文件打开、推流失败都被降级成状态快照，而不是让线程崩掉。
-- 相机帧和 MP4 解码帧共用同一条本地 runtime，只在输入获取阶段分叉，不再维护“假的默认路径”。
-- 页面只需要知道当前能不能看、看到了什么、报了什么错。
-
-### 7.2.1 `VisionRuntime` helper 链：本地模型 / 相机 / 渲染辅助函数
-
-这条链把“模型路径从哪来”“设备格式怎么兼容”“失败态怎么留住”“渲染风格怎么稳定”串起来看：
-
-```text
-localVisionRoot()
-  -> resolveModelPath()
-  -> workerLoop()
-  -> makeStatusSnapshot()
-  -> updateVisionState()
-
-sleepShort()
-  -> retry / backoff between failure states
-
-toRgaFormat()
-  -> V4L2Capture / RGA format mapping
-
-colorForLabel()
-  -> renderAnnotatedFrame()
-```
-
-| 函数 | 作用 | 依赖 | 输入 | 输出 | 去向 | 为什么这样设计 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `makeStatusSnapshot()` | 把错误消息、`cameraOnline`、`modelLoaded` 封成统一快照 | `VisionSnapshot` | 状态文本 + 两个布尔值 | 可直接写回 backend 的快照 | `updateVisionState()` / `setVisionOffline()` | 失败态也要走同一套结构，页面才能稳定读 |
-| `sleepShort()` | 在失败路径里短暂停一下，避免空转打爆 CPU | `std::this_thread::sleep_for` | 无 | 无 | `workerLoop()` 的重试分支 | 这里要的是轻量 backoff，不是长时间阻塞 |
-| `localVisionRoot()` | 给出视觉资源根目录 | `QCoreApplication::applicationDirPath()` | 无 | 本地仓库/安装目录下的视觉根 | `resolveModelPath()` | 让模型和程序包保持同一分发边界，减少外部配置依赖 |
-| `resolveModelPath()` | 从多个候选里选出可用的本地模型 | `localVisionRoot()`、`QFileInfo` | 无 | 首个存在的 `.rknn` 路径 | `workerLoop()` | 兼容不同板型和命名方式，先找得到再说 |
-| `toRgaFormat()` | 把摄像头像素格式映射到 RGA 格式 | RGA / V4L2 常量 | capture 的 pixel format | RGA 目标格式码 | `workerLoop()` 的预处理分支 | 设备兼容问题先在格式层收口，避免推理阶段才爆 |
-| `colorForLabel()` | 为同一个标签生成稳定颜色 | `QColor`、label 字符串 | 类别名 | 画框颜色 | `renderAnnotatedFrame()` / 视觉渲染 | 同类同色，便于人眼扫图；颜色规则固定，便于复现 |
-
-`workerLoop()` 里这几类 helper 的分工是：
-
-- `localVisionRoot()` / `resolveModelPath()` 先把模型定位好。
-- `toRgaFormat()` 先把设备输入格式对齐到预处理链能接受的格式。
-- `makeStatusSnapshot()` 在模型失败、相机失败、推理失败时统一回写状态。
-- `sleepShort()` 在失败态之间留出很短的退避间隔，避免一直紧密重试。
-- `colorForLabel()` 只影响渲染风格，不影响模型结果。
-
-这样拆的原因是：
-- 模型路径和板型兼容性属于运行时入口问题，应该在真正推理前解决。
-- 失败态必须可读、可回写、可复用，不能靠 UI 自己猜。
-- 渲染颜色只是展示层风格，不该反向污染推理逻辑。
-
-### 7.3 结果回传
-
-这个链路里有两个辅助函数最关键：
-
-```cpp
-QStringList formatDetections(const detect_result_group_t &group);
-QImage renderAnnotatedFrame(const QImage &baseFrame, const detect_result_group_t &group);
-```
-
-`formatDetections()` 负责把检测框转成字符串列表。
-
-`renderAnnotatedFrame()` 负责把检测框和标签画回图像。
-
-这段的作用是把原始推理结果拆成两份：
-- 一份给列表展示
-- 一份给视频框展示
-
-你要抓住的点是：
-- `VisionRuntime` 不把裸检测结果直接甩给 UI。
-- 它自己先把结果整理成“画过框的图像 + 文本列表”，页面只负责显示。
-
-如果本地运行时没有启用，线程会直接回写一个不可用状态和 warning 日志。
-
-这不是失败路径的补丁，而是明确的编译期开关语义。
-
-### 7.4 `VisionPage`
-
-页面职责很简单：
-
-```cpp
-class VisionPage : public QWidget {
-public:
-    explicit VisionPage(DashboardBackend *backend, QWidget *parent = nullptr);
-private:
-    void setupUi();
-    void refresh();
-};
-```
-
-这段的作用是展示视觉快照，不参与推理。
-
-依赖：
-- `QLabel`
-- `QListWidget`
-- `QTimer`
-- `DashboardBackend`
-
-输入：
-- `backend_->snapshotVisionState()`
-
-输出：
-- 视频预览
-- FPS
-- 摄像头在线状态
-- 模型加载状态
-- 帧计数
-- 检测结果列表
-
-去向：
-- 用户界面
-
-为什么这样设计：
-- 视觉页面是纯消费者。
-- 它通过 33ms 定时刷新拿快照，和视觉线程解耦。
-
-`refresh()` 里有几个关键分支：
-- `statusReported == false` 时，页面显示“未接入/等待状态”
-- `snapshot.frame` 非空时，显示图像
-- `snapshot.frame` 为空时，显示错误文本或等待文本
-- `snapshot.detections` 为空时，显示“无检测目标”
-
-你要抓住的点是：
-- 页面显示的不是“推理器内部状态”，而是 `VisionSnapshot` 的最后一次回写结果。
-- `cameraOnline`、`modelLoaded`、`errorMsg` 的组合，比单一布尔值更有表达力。
-
-## 8. 日志链路：`system_log_page.*`
-
-先看定位：
-
-```cpp
-class SystemLogPage : public QWidget {
-public:
-    explicit SystemLogPage(DashboardBackend *backend, QWidget *parent = nullptr);
-private:
-    void setupUi();
-    void refresh();
-};
-```
-
-这段的作用是把 RF、视觉、MQTT 和系统状态聚到一页。
-
-依赖：
-- `DashboardBackend`
-- `QPlainTextEdit`
-- `QComboBox`
-- `QTimer`
-
-输入：
-- `snapshotSystemStats()`
-- `snapshotRF()`
-- `snapshotVisionState()`
-- `queryLogs()`
-
-输出：
-- CPU / 内存 / uptime
-- MQTT 次数和最近一条 MQTT 日志
-- RF 错误计数
-- 视觉状态和错误
-- 日志文本
-
-去向：
-- 仅 UI 展示
-
-为什么这样设计：
-- 这个页面不是“日志打印器”，而是“运行态总览页”。
-- 它把系统资源、业务错误和消息日志放在同一屏，方便对链路做排障。
-
-`refresh()` 的处理逻辑很明确：
-
-```cpp
-const QString selected = filterCombo_->currentText();
-const QString sourceFilter = (selected == QStringLiteral("全部")) ? QString() : selected;
-
-const SystemStats stats = backend_->snapshotSystemStats();
-const RFSnapshot rf = backend_->snapshotRF();
-const VisionSnapshot vision = backend_->snapshotVisionState();
-const QVector<LogEntry> logs = backend_->queryLogs(sourceFilter, 200);
-```
-
-这段的作用是把不同来源的状态统一读出来。
-
-几个关键点：
-- MQTT 计数来自 `SystemStats::mqttCount`。
-- 最近一条 MQTT 日志单独查询，避免扫描整页日志。
-- `queryLogs(sourceFilter, 200)` 取的是最近 200 条。
-- 页面再把日志倒回正序展示。
-
-你要抓住的点是：
-- `SystemLogPage` 依赖的是 `DashboardBackend` 的聚合能力，不依赖任何具体运行时对象。
-- 它不是业务处理层，而是观测层。
-
-## 9. 结论：这套 UI 的真实职责边界
-
-这套代码最重要的不是“页面有几个”，而是边界切得很清楚：
-
-- `main.cpp` 负责启动门禁。
-- `MainWindow` 负责组装和生命周期。
-- `DashboardBackend` 负责共享状态。
-- `RFGatewayClient` 负责把外部 RF 进程接进来。
-- `VisionRuntime` 负责本地摄像头 + 推理 + 回写。
-- `RFStatusPage`、`VisionPage`、`SystemLogPage` 只读快照。
-- `WaveformWidget` 只画波形。
-
-不是 X，而是 Y：
-- 不是页面自己去拉硬件，而是运行时写 backend，页面轮询 backend。
-- 不是 UI 直接操作线程内部对象，而是所有状态先变成快照。
-- 不是 RF 和视觉共享同一条处理链，而是各自生产、统一汇聚。
-
-如果你读这份代码，只记一件事，就是这条链：
-
-```text
-输入约束(main)
-  -> 运行时组装(MainWindow)
-  -> 状态中枢(DashboardBackend)
-  -> 两条生产链路(RFGatewayClient / VisionRuntime)
-  -> 三个展示页(RFStatusPage / VisionPage / SystemLogPage)
-  -> 一个纯绘图控件(WaveformWidget)
-```
-
-这就是这套 Qt / vision 仪表盘的真实运行方式。
-## 2. 关键资源生命周期
-
-先看 `QProcess`、`std::thread` 和各类 `snapshot` 的生灭关系，再看后面的页面刷新。
-
-这段的作用是把“资源什么时候生、什么时候死、什么时候失效”卡清楚。
-
-`QProcess` 这条线：
-- `RFGatewayClient::start()` 会先 `new QProcess(context_)`，再挂 `started` / `readyReadStandardOutput` / `errorOccurred` / `finished` 四个信号。
-- `stop()` 会先 `kill()`，再等 `waitForFinished(500)`，最后 `deleteLater()`。
-- 不是“页面关了进程就自动消失”，而是 `MainWindow` 析构时显式停一次，`RFGatewayClient` 自己也会在析构里再停一次。
-- 失效时机是 `gateway_ == nullptr`、`gatewayPath` 找不到，或者进程已经退出。
-
-线程这条线：
-- `VisionRuntime::start()` 先用 `running_.exchange(true)` 做幂等控制，再启动 `std::thread`。
-- `stop()` 先把 `running_` 置回 false，再 `join()`。
-- 析构函数里会再走一遍 `stop()`，所以线程生命周期和对象生命周期是绑死的。
-- 不是 Qt 信号线程，而是单独 worker thread 在跑推理。
-
-snapshot / frame 这条线：
-- `VisionSnapshot::frame` 只在一帧成功完成后才有效；`RGA` 转换失败、`RKNN` 推理失败、摄像头打开失败时，快照里要么是空图，要么是错误文本。
-- `DashboardBackend::updateVisionState()` 写进去的是“最新一次可展示状态”，旧快照会被下一次覆盖。
-- `RFSnapshot` 不是独立资源，它是 `DashboardBackend` 当前状态的拷贝；`snapshotRF()` / `snapshotVisionState()` 拿到的都是“这一刻的快照”，下一次 backend 写入后旧快照自然就过时。
-- `SystemStats` 不是每次都重算，`snapshotSystemStats()` 自带 1500ms 节流，所以页面读到的是缓存值，不是实时采样点。
-
-你要抓住的点是：
-- 不是每个对象都需要单独找“销毁点”，而是先看谁拥有它、谁负责停它。
-- 不是 snapshot 自己会失效，而是 backend 写了更新值之后，旧快照自然退场。
-- 不是所有页面刷新都会触发采集，很多时候只是把已经写好的快照再读一遍。
-
-## 3. 数据契约与更新频率
-
-先看谁写、谁读、多久刷一次，再看字段本身。
-
-这段的作用是先把数据形状和刷新节奏分开看，不要把“字段是谁写的”误读成“字段是谁展示的”。
-
-| 结构 | 字段谁写 | 谁读 | 多久刷新一次 |
-| --- | --- | --- | --- |
-| `RFEvent` | `RFGatewayClient::handleProtocolLine()` 在匹配 `type == "rf_event"` 的 JSON envelope 时一次性写入 `timestamp`、`address`、`key`、`confidence`、`source`、`frameSeq`、`decodeUs` 和真实 `pulse_us[]` | `DashboardBackend::snapshotRF()`，`RFStatusPage` 的最近解码区和历史表 | 事件驱动，每次 RF 解码命中刷新一次 |
-| `VisionSnapshot` | `VisionRuntime::workerLoop()` 在每帧后写 `frame`、`detections`、`fps`、`frameCount`、`errorMsg`，`cameraOnline`、`modelLoaded`；`DashboardBackend::updateVisionState()` 统一把 `statusReported` 置真，`setVisionOffline()` 会重置离线态 | `MainWindow::updateStatusBar()`、`VisionPage::refresh()`、`SystemLogPage::refresh()` | 帧驱动，页面侧分别按 2000ms / 33ms / 1000ms 读快照，`fps` 本身大约每秒更新一次 |
-| `SystemStats` | `DashboardBackend::snapshotSystemStats()` 读 `/proc/stat`、`/proc/meminfo` 并缓存；`addLog()` 在 `source == "MQTT"` 时顺手累计 `mqttCount` | `MainWindow::updateStatusBar()`、`SystemLogPage::refresh()` | 系统统计缓存约每 1500ms 刷新一次，`uptimeSec` 每次快照都会递增 |
-
-你要抓住的点是：
-- `statusReported` 不是“成功”，而是“视觉线程已经回写过状态”。
-- `VisionSnapshot` 的 `frame` 不是常驻资源，它只是最近一次成功推理后的快照图。
-- `SystemStats` 不是每次页面刷新都重算，它是有节流的缓存快照。
-
-## 4. 最后一眼只看代码
-
-先看三段代码块，别先看解释文字。
-
-这页只看代码块，不看解释也能把链路串起来。
-
-```cpp
-// 启动链
-int main(...) {
-    MainWindow window(options);
-    window.show();
-    return app.exec();
-}
-
-MainWindow::MainWindow(...)
-    : rfClient_(&backend_, options_, this),
-      visionRuntime_(&backend_, options_) {
-    setupUi();
-    setupRuntime();
-}
 
 void MainWindow::setupRuntime() {
+    backend_.addLog("INFO", "SYSTEM", QStringLiteral("Qt5 前端已启动"));
+    backend_.addLog(
+        "INFO",
+        "VISION",
+        QStringLiteral("板侧本地视觉链路已接入，默认使用 %1").arg(options_.visionDevice)
+    );
+
     rfClient_.start();
     visionRuntime_.start();
     updateStatusBar();
 }
 ```
 
-```cpp
-// 信号链
-RFGatewayClient -> QProcess stdout / finished / errorOccurred
-    -> DashboardBackend::updateSerialStatus()
-    -> DashboardBackend::addRFEvent()
-    -> DashboardBackend::addLog()
+这段装配代码说明 `VisionRuntime` 不是外部守护进程，也不是懒加载插件，而是 `MainWindow` 构造阶段就被实例化、在 `setupRuntime()` 里直接 `start()`。所以后面所有 `workerLoop()`、`sourceThread`、`streamThread` 都属于当前 Qt 进程内部线程，而不是另一套独立服务。
 
-VisionRuntime workerLoop()
-    -> DashboardBackend::updateVisionState()
-    -> DashboardBackend::addLog()
+## 4. 状态中心：`DashboardBackend`
+
+视觉链最终不会直接操作页面对象，而是统一回写 `DashboardBackend::updateVisionState()`。
+
+当前视觉快照结构是：
+
+| 字段 | 含义 |
+|---|---|
+| `frame` | UI 展示的 `QImage` |
+| `detections` | 已格式化好的字符串列表 |
+| `fps` | 推理 FPS |
+| `statusReported` | 是否有有效视觉状态 |
+| `modelLoaded` | 模型是否已加载 |
+| `cameraOnline` | 输入侧是否在线 |
+| `frameCount` | 主循环累计处理帧数 |
+| `errorMsg` | 当前错误文本 |
+
+页面是纯消费者：
+
+- `VisionPage` 每 33ms 拉一次 `VisionSnapshot`
+- `SystemLogPage` 每 1000ms 拉一次日志和系统状态
+- 状态栏每 2000ms 拉一次汇总
+
+所以 UI 从来不碰 `sourceThread` 或 `streamThread` 的内部对象。
+
+## 5. `VisionRuntime` 类本身很薄
+
+`qt_gui/vision/vision_runtime.h` 里的类成员很少：
+
+- `DashboardBackend *backend_`
+- `AppOptions options_`
+- `std::atomic<bool> running_`
+- `std::thread worker_`
+
+真正的复杂度全部被压进 `workerLoop()`。
+
+`start()` 和 `stop()` 的行为很简单：
+
+- `start()` 用 `running_.exchange(true)` 做幂等保护，然后起 `worker_`
+- `stop()` 把 `running_` 置 `false`，再 `join()`
+
+这意味着整条视觉链的生命周期只有一个主 worker 线程入口。
+
+## 6. `vision_runtime.cpp` 顶部常量先决定了运行时轮廓
+
+当前代码里的关键常量如下：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `kCaptureWidth` | `640` | 摄像头采集宽 |
+| `kCaptureHeight` | `480` | 摄像头采集高 |
+| `kCaptureBuffers` | `4` | V4L2 缓冲数 |
+| `kStreamWidth` | `640` | RTSP 目标宽 |
+| `kStreamHeight` | `540` | RTSP 目标高 |
+| `kAiWorkerThreads` | `1` | RKNN worker 数 |
+| `kAiQueueSize` | `4` | AI 队列长度 |
+| `kPostStreamQueueSize` | `4` | post-stream 队列长度 |
+| `kPoolPreallocCount` | `6` | 通用 frame pool 预分配数 |
+| `kPoolCachedCount` | `8` | 通用 frame pool 缓存上限 |
+| `kOverlayPoolPreallocCount` | `2` | overlay pool 预分配数 |
+| `kOverlayPoolCachedCount` | `4` | overlay pool 缓存上限 |
+| `kDefaultFpsNum` | `30` | 默认 FPS 分子 |
+| `kDefaultFpsDen` | `1` | 默认 FPS 分母 |
+| `kDefaultRtspBitrateBps` | `0` | 交给 encoder 自动估算码率 |
+| `kRtspRetryDelayMs` | `3000` | RTSP 重试等待 |
+| `kDeviceId` | `rk3568-001` | 设备 ID |
+| `kMqttHost` | `192.168.30.26` | Vision MQTT broker 主机 |
+| `kMqttPort` | `1883` | Vision MQTT broker 端口 |
+
+两条 Vision MQTT topic 也在这里写死：
+
+- `argi/device/rk3568-001/vision/detection`
+- `argi/device/rk3568-001/stream/status`
+
+## 7. `workerLoop()` 的七个阶段
+
+为了读懂 `workerLoop()`，不要从中间看，要按阶段看。
+
+### 7.1 阶段 A：解析模型和运行时选项
+
+`workerLoop()` 一开始先把几个关键变量定下来：
+
+- `modelPath = resolveModelPath()`
+- `inputPath = options_.visionDevice.trimmed()`
+- `useV4L2 = isAllowedVisionDevicePath(inputPath)`
+- `rtspEnabled = options_.visionRtspEnabled`
+- `rtspUrl = options_.visionRtspUrl.trimmed().isEmpty() ? defaultVisionRtspUrl() : options_.visionRtspUrl.trimmed()`
+
+这里有两个容易忽略的事实。
+
+第一，模型查找是多候选回退，不是单一路径：
+
+- `applicationDirPath()/model/yolov5s_relu-640-640-rk3568.rknn`
+- `applicationDirPath()/model/yolov5s-640-640.rknn`
+- `DASHBOARD_LOCAL_VISION_ROOT/model/yolov5s_relu-640-640-rk3568.rknn`
+- `DASHBOARD_LOCAL_VISION_ROOT/model/yolov5s-640-640.rknn`
+
+第二，`stream_url` 是配置值，不是在线状态本身。
+
+即使 RTSP 被禁用，或者流还没推成功，`publishDetection()` 里也会带上当前 `rtspUrl`。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()`
+作用：在进入真正采帧和推理之前，先锁定模型路径、输入源模式、RTSP 开关和 RTSP URL。
+
+```cpp
+void VisionRuntime::workerLoop() {
+    if (backend_ == nullptr) {
+        running_.store(false);
+        return;
+    }
+
+#ifdef DASHBOARD_HAVE_LOCAL_VISION_RUNTIME
+    const QString modelPath = resolveModelPath();
+    const QString inputPath = options_.visionDevice.trimmed();
+    const bool useV4L2 = isAllowedVisionDevicePath(inputPath);
+    const bool rtspEnabled = options_.visionRtspEnabled;
+    const QString rtspUrl = options_.visionRtspUrl.trimmed().isEmpty()
+        ? defaultVisionRtspUrl()
+        : options_.visionRtspUrl.trimmed();
+    VisionMqttPublisher mqtt;
+    QString terminalMessage;
+    bool modelReady = false;
+    bool inputReady = false;
+    int srcWidth = 0;
+    int srcHeight = 0;
+    int srcFormat = RK_FORMAT_YCbCr_420_SP;
+    int srcStride = 0;
+    int srcVerStride = 0;
+    int fpsNum = kDefaultFpsNum;
+    int fpsDen = kDefaultFpsDen;
 ```
 
-```cpp
-// 状态刷新链
-MainWindow     : 2000ms 读 `snapshotSystemStats()` / `snapshotRF()` / `snapshotVisionState()`
-RFStatusPage   :  500ms 读 `snapshotRF()`
-VisionPage     :   33ms 读 `snapshotVisionState()`
-SystemLogPage  : 1000ms 读 `snapshotSystemStats()` / `snapshotRF()` / `snapshotVisionState()` / `queryLogs()`
+这里最重要的不是变量名，而是顺序。`rtspEnabled` 和 `rtspUrl` 在 `workerLoop()` 一开头就固定下来，后面不再从 UI 线程回读；`VisionMqttPublisher mqtt` 也是这个作用域里的局部对象，所以整个视觉链的 MQTT 生命周期与 `workerLoop()` 完全一致。
+
+### 7.2 阶段 B：初始化 RKNN 和 Vision MQTT
+
+模型路径为空时，逻辑直接失败：
+
+- 更新 `VisionSnapshot` 错误态
+- 记 `ERROR` 日志
+- `running_ = false`
+- 立刻返回
+
+模型路径存在后才创建：
+
+```text
+rknnPool<rkYolov5s> aiPool(modelPath, 1, 4)
 ```
 
-你最后只要记住这三句：
-- `MainWindow` 负责拉起。
-- `DashboardBackend` 负责收口。
-- `Page` 只负责读快照并展示。
+`aiPool.init()` 失败同样直接终止视觉链。
+
+随后初始化本地 Vision MQTT publisher：
+
+```text
+VisionMqttPublisher mqtt;
+mqtt.open("rk3568-001-vision-runtime", "192.168.30.26", 1883)
+```
+
+注意这里的语义：
+
+- MQTT 打不开只会记 `WARN`。
+- 推理不会因为 MQTT 失败而停止。
+- 后续 publish 会自动降级成“尝试但不成功”。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()` 初始化段、`VisionMqttPublisher::open()`
+作用：完成 RKNN worker 池与 Vision MQTT publisher 的真实初始化，并把 MQTT 失败定义为“可降级”而不是“致命”。
+
+```cpp
+rknnPool<rkYolov5s> aiPool(modelPath.toStdString(), kAiWorkerThreads, kAiQueueSize);
+if (aiPool.init() != 0) {
+    terminalMessage = QStringLiteral("RKNN inference pool init failed");
+    backend_->updateVisionState(makeStatusSnapshot(terminalMessage, false, false));
+    backend_->addLog("ERROR", "VISION", terminalMessage);
+    running_.store(false);
+    return;
+}
+modelReady = true;
+
+if (!mqtt.open(kVisionMqttClientId, kMqttHost, kMqttPort)) {
+    backend_->addLog(
+        "WARN",
+        "VISION",
+        QStringLiteral("Vision MQTT broker unavailable at %1:%2; publishes will be skipped until the broker is reachable")
+            .arg(QString::fromLatin1(kMqttHost))
+            .arg(kMqttPort)
+    );
+}
+
+bool open(const char *clientId, const char *host, int port) {
+    int rc = MOSQ_ERR_SUCCESS;
+
+    close();
+    rc = mosquitto_lib_init();
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[VISION_MQTT] mosquitto_lib_init failed: %s\n", mosquitto_strerror(rc));
+        return false;
+    }
+    libInitialized_ = true;
+
+    mosq_ = mosquitto_new(clientId, true, this);
+    if (mosq_ == nullptr) {
+        fprintf(stderr, "[VISION_MQTT] mosquitto_new failed\n");
+        close();
+        return false;
+    }
+
+    mosquitto_connect_callback_set(mosq_, &VisionMqttPublisher::handleConnect);
+    mosquitto_disconnect_callback_set(mosq_, &VisionMqttPublisher::handleDisconnect);
+    mosquitto_reconnect_delay_set(mosq_, 1u, 5u, true);
+
+    rc = mosquitto_connect_async(mosq_, host, port, 30);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[VISION_MQTT] connect_async failed: %s\n", mosquitto_strerror(rc));
+        close();
+        return false;
+    }
+
+    rc = mosquitto_loop_start(mosq_);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[VISION_MQTT] loop_start failed: %s\n", mosquitto_strerror(rc));
+        close();
+        return false;
+    }
+
+    loopStarted_ = true;
+    return true;
+}
+```
+
+这一段明确区分了两类失败：`aiPool.init()` 失败会直接让视觉链退出，而 `mqtt.open()` 失败只会记 `WARN`。原因也很清楚，RKNN 是主功能依赖，MQTT 是对外输出依赖。当前设计优先保证本地推理与 UI 存活，再接受“发布端暂时不可用”的降级。
+
+### 7.3 阶段 C：打开输入
+
+#### 摄像头支路
+
+当 `useV4L2 == true` 时：
+
+1. 构造 `V4L2Capture capture(inputPath, 640, 480, 4)`
+2. `capture.open()`
+3. `capture.startStream()`
+4. 取回 `width / height / pixelFormat / fps`
+5. 用 `toRgaFormat()` 映射到 RGA 格式
+
+如果像素格式不是当前支持集合，直接终止：
+
+- `V4L2_PIX_FMT_YUYV`
+- `V4L2_PIX_FMT_NV12`
+- `V4L2_PIX_FMT_BGR24`
+
+#### 本地视频文件支路
+
+当输入不是 `/dev/video*` 时：
+
+1. `describeVisionInputError()` 先检查是否存在、可读、普通文件
+2. `MppDecoder decoder.open(path)`
+3. 先读第一帧，拿到 `srcWidth / srcHeight`
+4. 固定整条后续链路的几何尺寸
+
+这里有一个关键设计：
+
+- 文件输入的第一帧决定了整条链路的尺寸。
+- 后续如果解码出不同尺寸，代码会直接报错停机。
+
+原因很直接：
+
+- `aiFramePool`
+- `rgbBuffer`
+- `postStreamBufferPool`
+- `MppRtspEncoder`
+
+这些对象都是按固定几何尺寸初始化的，运行中变分辨率会引发不一致。
+
+### 7.4 阶段 D：分配 buffer 和队列
+
+输入可用后，代码统一算出几类 buffer 大小：
+
+- `aiFrameBytes`
+- `streamFrameBytes`
+- `streamOverlayBytes`
+- `rgbBufferBytes`
+
+然后建立三个池和一个队列：
+
+- `FrameCopyPool aiFramePool`
+- `FrameCopyPool postStreamBufferPool`
+- `FrameCopyPool postStreamOverlayPool`
+- `PostStreamFramePool postStreamFramePool`
+
+职责分别是：
+
+| 对象 | 用途 |
+|---|---|
+| `aiFramePool` | sourceThread 往 aiPool 送帧前的稳定持有缓冲 |
+| `postStreamBufferPool` | annotated NV12 输出缓冲 |
+| `postStreamOverlayPool` | 叠框时的 BGRA 工作面 |
+| `postStreamFramePool` | 交给 RTSP 线程消费的帧队列 |
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()`
+作用：按输入几何和固定 RTSP 输出几何预分配 AI、RTSP、UI 三条子链真正要共享的缓冲资源。
+
+```cpp
+const int streamWidth = kStreamWidth;
+const int streamHeight = kStreamHeight;
+const int streamStride = alignUp(streamWidth, 16);
+const size_t streamFrameBytes = computeNv12Bytes(streamStride, streamHeight);
+const size_t streamOverlayBytes = computeBgraBytes(streamWidth, streamHeight);
+const size_t rgbBufferBytes = computeRgbBytes(srcWidth, srcHeight);
+if (aiFrameBytes == 0U || streamWidth <= 0 || streamHeight <= 0 || streamStride <= 0 ||
+    streamFrameBytes == 0U || streamOverlayBytes == 0U || rgbBufferBytes == 0U ||
+    rgbBufferBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    terminalMessage = QStringLiteral("Unsupported vision frame geometry %1x%2").arg(srcWidth).arg(srcHeight);
+    backend_->updateVisionState(makeStatusSnapshot(terminalMessage, false, modelReady));
+    backend_->addLog("ERROR", "VISION", terminalMessage);
+    running_.store(false);
+    return;
+}
+FrameCopyPool aiFramePool(aiFrameBytes, kPoolPreallocCount, kPoolCachedCount);
+FrameCopyPool postStreamBufferPool(streamFrameBytes, kPoolPreallocCount, kPoolCachedCount);
+FrameCopyPool postStreamOverlayPool(streamOverlayBytes, kOverlayPoolPreallocCount, kOverlayPoolCachedCount);
+PostStreamFramePool postStreamFramePool(kPostStreamQueueSize);
+QVector<unsigned char> rgbBuffer(static_cast<int>(rgbBufferBytes));
+std::atomic<uint64_t> frameIdGenerator{1U};
+bool postStreamBranchActive = rtspEnabled;
+```
+
+这段初始化把三条用途不同的内存路线拆开了：`aiFramePool` 只服务 RKNN 输入，`postStreamBufferPool` 和 `postStreamOverlayPool` 只服务 RTSP annotated frame 生成，`rgbBuffer` 只服务 UI 展示。也正因为这些对象在这里按固定几何初始化，后面一旦输入分辨率变化，代码就必须停机而不是“边跑边自适应”。
+
+### 7.5 阶段 E：启动 `streamThread`
+
+只有 `rtspEnabled == true` 时才起 `streamThread`。
+
+这个线程内部维护：
+
+- `MppRtspEncoder encoder`
+- `encoderOpen`
+- `streamWasOnline`
+- `nextRetryAt`
+
+它的控制流是：
+
+1. `waitAndPop()` 等一帧 `PostStreamFrame`
+2. 如果 encoder 没开，且还没到重试时间，就丢掉当前帧
+3. 到了重试时间，尝试 `encoder.open(rtspUrl, ...)`
+4. 成功后发 `stream/status online`
+5. 每帧 `encodeAndPush(frame)`
+6. 失败则发 `offline/push_failed`，关闭 encoder，等待下次重试
+7. 线程退出时，如果曾经在线过，再发一次 `offline/stopped`
+
+这里要特别注意三种 `reason`：
+
+- `open_failed`
+- `push_failed`
+- `stopped`
+
+另外还有两种状态是在其它位置发的：
+
+- `disabled`
+- `post_stream_failed`
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()` 里的 `streamThread` lambda
+作用：以单独线程消费 `PostStreamFramePool`，串起 `MppRtspEncoder`、重试节流和 `stream/status` MQTT 发布。
+
+```cpp
+if (rtspEnabled) {
+    streamThread = std::thread([&]() {
+        MppRtspEncoder encoder;
+        bool encoderOpen = false;
+        bool streamWasOnline = false;
+        auto nextRetryAt = std::chrono::steady_clock::time_point::min();
+
+        while (true) {
+            PostStreamFrame frame;
+            if (!postStreamFramePool.waitAndPop(&frame)) {
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (!encoderOpen) {
+                if (now < nextRetryAt) {
+                    release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                    continue;
+                }
+
+                if (encoder.open(
+                        rtspUrl.toUtf8().constData(),
+                        frame.width,
+                        frame.height,
+                        frame.stride,
+                        frame.height,
+                        fpsNum,
+                        fpsDen,
+                        kDefaultRtspBitrateBps) != 0) {
+                    backend_->addLog("WARN", "VISION", QStringLiteral("RTSP encoder open failed; stream branch will retry"));
+                    publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("open_failed"));
+                    nextRetryAt = now + std::chrono::milliseconds(kRtspRetryDelayMs);
+                    release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                    continue;
+                }
+
+                encoderOpen = true;
+                streamWasOnline = true;
+                backend_->addLog("INFO", "VISION", QStringLiteral("RTSP push online: %1").arg(rtspUrl));
+                publishStreamStatus(backend_, &mqtt, QStringLiteral("online"), rtspUrl);
+            }
+
+            if (encoder.encodeAndPush(frame) != 0) {
+                backend_->addLog("WARN", "VISION", QStringLiteral("RTSP push failed; stream branch will retry"));
+                publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("push_failed"));
+                encoder.close();
+                encoderOpen = false;
+                nextRetryAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRtspRetryDelayMs);
+                release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                continue;
+            }
+
+            release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+        }
+
+        if (encoderOpen || streamWasOnline) {
+            publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("stopped"));
+        }
+        encoder.close();
+    });
+} else {
+    backend_->addLog("INFO", "VISION", QStringLiteral("RTSP push disabled by option"));
+    publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("disabled"));
+}
+```
+
+这段代码是 RTSP 开关真正落地的位置。`main()` 只是把 `visionRtspEnabled` 放进 `AppOptions`，真正决定“起不起推流线程”的是这里的 `if (rtspEnabled)`。而 `else` 分支也没有沉默跳过，而是明确记日志并发一条 `offline/disabled` 的 retained MQTT 状态。
+
+### 7.6 阶段 F：启动 `sourceThread`
+
+`sourceThread` 是输入侧唯一生产者。
+
+它循环干的事情只有五步：
+
+1. 拿到一帧源数据
+2. 生成 `captureTsUs`
+3. 生成自增 `frameId`
+4. 调 `copyFrameToAiPool()`
+5. 如果是摄像头帧，再把原始 V4L2 buffer queue 回去
+
+`copyFrameToAiPool()` 的含义要写清楚：
+
+- 它不是零拷贝。
+- 它一定会把源帧拷进 `aiFramePool` 里拿到的独立 buffer。
+- 然后把该 buffer 的释放契约连同 `frameId`、时间戳一起交给 `aiPool.put()`。
+
+返回值也要写清：
+
+- `0`：成功进入 AI 池
+- `1`：池忙或非致命拒绝，本帧可视为被跳过
+- `< 0`：致命错误
+
+当前 `sourceThread` 只把 `< 0` 看成 fatal。
+
+这意味着在压力下允许跳帧，但不因为暂时拥塞直接打死整条链路。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()` 里的 `sourceThread` lambda
+作用：作为唯一上游生产者抓取 V4L2 或解码帧，生成 `frameId` / `captureTsUs`，并把独立拥有的 buffer 交给 RKNN 池。
+
+```cpp
+std::thread sourceThread([&]() {
+    bool usePrefetchedDecodedFrame = prefetchedDecodedFrame;
+
+    while (running_.load()) {
+        const void *srcData = nullptr;
+        size_t srcSize = 0U;
+        int currentWidth = srcWidth;
+        int currentHeight = srcHeight;
+        int currentFormat = srcFormat;
+        int currentStride = srcStride;
+        int currentVerStride = srcVerStride;
+        long long captureTsUs = nowWallTimeUs();
+        V4L2Frame v4l2Frame;
+        QString fatalCopyError;
+
+        if (useV4L2) {
+            if (capture.dequeueFrame(&v4l2Frame) != 0) {
+                sourceError = QStringLiteral("Camera frame capture failed");
+                backend_->addLog("ERROR", "VISION", sourceError);
+                running_.store(false);
+                break;
+            }
+            srcData = v4l2Frame.data;
+            srcSize = static_cast<size_t>(v4l2Frame.size);
+            if (v4l2Frame.capture_ts_us > 0) {
+                captureTsUs = v4l2Frame.capture_ts_us;
+            }
+        } else {
+            if (usePrefetchedDecodedFrame) {
+                srcData = decodedFrameData;
+                srcSize = decodedFrameSize;
+                usePrefetchedDecodedFrame = false;
+            } else {
+                unsigned char *decodedFrame = nullptr;
+                if (decoder.readFrame(&decodedFrame, &currentWidth, &currentHeight) != 0) {
+                    break;
+                }
+                srcData = decodedFrame;
+            }
+            currentFormat = RK_FORMAT_YCbCr_420_SP;
+            currentStride = currentWidth;
+            currentVerStride = currentHeight;
+        }
+
+        const uint64_t frameId = frameIdGenerator.fetch_add(1U, std::memory_order_relaxed);
+        const int aiCopyRc = copyFrameToAiPool(
+            srcData,
+            srcSize,
+            currentWidth,
+            currentHeight,
+            currentFormat,
+            frameId,
+            captureTsUs,
+            &aiPool,
+            &aiFramePool
+        );
+        if (aiCopyRc < 0) {
+            fatalCopyError = QStringLiteral("AI frame fan-out failed for %1x%2 input")
+                                 .arg(currentWidth)
+                                 .arg(currentHeight);
+        }
+
+        if (useV4L2 && capture.queueFrame(v4l2Frame) != 0) {
+            sourceError = QStringLiteral("Camera frame queue failed");
+            backend_->addLog("ERROR", "VISION", sourceError);
+            running_.store(false);
+            break;
+        }
+        if (!fatalCopyError.isEmpty()) {
+            sourceError = fatalCopyError;
+            backend_->addLog("ERROR", "VISION", sourceError);
+            running_.store(false);
+            break;
+        }
+    }
+
+    aiPool.notifyGetters();
+});
+```
+
+这段代码把 `sourceThread` 的边界画得很死：它只负责拿帧、标时间、入池、回队，不负责 UI、MQTT、RTSP。还有一个容易漏写的细节是 `frameIdGenerator.fetch_add()` 发生在这里，所以后面 detection 消息、RTSP 帧和日志里的 `frame_id` 都是由生产者线程统一分配的。
+
+### 7.7 阶段 G：主线程消费 `aiPool.get()`
+
+`workerLoop()` 自己作为单消费者，不断 `aiPool.get()`：
+
+1. 拿到 `detect_result_group_t`
+2. 拿到原始帧指针与释放函数
+3. 构建 `VisionSnapshot`
+4. 可选生成 RTSP annotated frame
+5. 把源帧转成 RGB 供 UI 展示
+6. 有检测目标时发 Vision detection MQTT
+7. `backend_->updateVisionState(snapshot)`
+
+这是整条链最关键的扇出点。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`VisionRuntime::workerLoop()` 主循环
+作用：从 `aiPool.get()` 取回推理结果后，同时向 RTSP 支路、UI 快照和 Vision MQTT 三个出口扇出。
+
+```cpp
+while (running_.load()) {
+    detect_result_group_t detGroup;
+    float scaleW = 0.0f;
+    float scaleH = 0.0f;
+    unsigned char *frameData = nullptr;
+    int frameWidth = 0;
+    int frameHeight = 0;
+    int frameFormat = 0;
+    uint64_t frameId = 0U;
+    long long captureTsUs = 0LL;
+    void (*releaseFn)(unsigned char *, void *) = nullptr;
+    void *releaseCtx = nullptr;
+    VisionSnapshot snapshot;
+
+    memset(&detGroup, 0, sizeof(detGroup));
+    if (aiPool.get(
+            detGroup,
+            scaleW,
+            scaleH,
+            &frameData,
+            &frameWidth,
+            &frameHeight,
+            &frameFormat,
+            &frameId,
+            &captureTsUs,
+            &releaseFn,
+            &releaseCtx) != 0) {
+        break;
+    }
+
+    snapshot.cameraOnline = inputReady;
+    snapshot.modelLoaded = modelReady;
+    snapshot.statusReported = true;
+    snapshot.frameCount = ++frameCount;
+
+    if (frameData == nullptr) {
+        snapshot.errorMsg = QStringLiteral("AI pool returned an empty frame payload");
+    } else {
+        if (postStreamBranchActive) {
+            const int postStreamRc = copyPostInferFrameToPostStreamPool(
+                detGroup,
+                frameData,
+                frameWidth,
+                frameHeight,
+                frameFormat,
+                frameId,
+                captureTsUs > 0 ? captureTsUs : nowWallTimeUs(),
+                streamWidth,
+                streamHeight,
+                streamStride,
+                &postStreamBufferPool,
+                &postStreamOverlayPool,
+                &postStreamFramePool
+            );
+            if (postStreamRc < 0) {
+                postStreamBranchActive = false;
+                backend_->addLog(
+                    "WARN",
+                    "VISION",
+                    QStringLiteral("RTSP post-stream frame build failed; disabling RTSP branch while keeping inference and display active")
+                );
+                publishStreamStatus(
+                    backend_,
+                    &mqtt,
+                    QStringLiteral("offline"),
+                    rtspUrl,
+                    QStringLiteral("post_stream_failed")
+                );
+                postStreamFramePool.stop();
+            }
+        }
+
+        if (rga_resize_convert_vaddr(
+                       frameData,
+                       frameWidth,
+                       frameHeight,
+                       frameFormat,
+                       rgbBuffer.data(),
+                       frameWidth,
+                       frameHeight,
+                       RK_FORMAT_RGB_888) == 0) {
+            QImage rgbImage(
+                rgbBuffer.constData(),
+                frameWidth,
+                frameHeight,
+                frameWidth * 3,
+                QImage::Format_RGB888
+            );
+            snapshot.detections = formatDetections(detGroup);
+            snapshot.frame = renderAnnotatedFrame(rgbImage, detGroup);
+            if (detGroup.count > 0) {
+                publishDetection(backend_, &mqtt, rtspUrl, frameId, captureTsUs, detGroup);
+            }
+        }
+    }
+
+    if (frameData != nullptr) {
+        release_frame_buffer(frameData, releaseFn, releaseCtx);
+    }
+
+    snapshot.fps = fps;
+    backend_->updateVisionState(snapshot);
+}
+```
+
+这个主循环是真正的“推理后扇出点”。一帧数据从 `aiPool.get()` 回来之后，会先尝试生成 RTSP annotated frame，再转 RGB 供 UI，最后在 `detGroup.count > 0` 时发布 detection MQTT。也正因为三个出口都挂在这里，所以 `release_frame_buffer(frameData, releaseFn, releaseCtx)` 必须放在扇出完成之后。
+
+## 8. 为什么 UI 画框和 RTSP 画框不是一回事
+
+当前代码有两种“画框”行为，但目标不同。
+
+### 8.1 UI 画框
+
+路径是：
+
+1. `rga_resize_convert_vaddr(..., RK_FORMAT_RGB_888)`
+2. 构造 `QImage rgbImage`
+3. `renderAnnotatedFrame(rgbImage, detGroup)`
+
+最终产物是给 `VisionSnapshot.frame` 用的 `QImage`。
+
+### 8.2 RTSP 画框
+
+路径是：
+
+1. `copyPostInferFrameToPostStreamPool()`
+2. `rga_resize_convert_vaddr(..., RK_FORMAT_BGRA_8888)`
+3. 在 BGRA overlay 面上 `paintDetections()`
+4. `rga_resize_to_nv12_vaddr(...)`
+5. 生成 `PostStreamFrame`
+
+最终产物不是 `QImage`，而是可供 MPP 编码的 NV12。
+
+所以不要把 UI 画框函数和 RTSP 输出混为一个概念。
+
+## 9. `copyPostInferFrameToPostStreamPool()` 是 RTSP 支路的关键枢纽
+
+这个函数做了四件事：
+
+1. 从 `postStreamBufferPool` 申请 NV12 输出缓冲。
+2. 从 `postStreamOverlayPool` 申请 BGRA overlay 工作缓冲。
+3. 把源帧缩放/转换到 BGRA。
+4. 在 BGRA 上画框，再转回 NV12，塞进 `postStreamFramePool`。
+
+如果你问“为什么不直接在原始帧上画”，答案是当前代码的约束不是只考虑绘制本身，而是同时考虑：
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`copyPostInferFrameToPostStreamPool()`
+作用：把 `aiPool.get()` 取回的原始推理帧，构造成 RTSP 分支真正消费的 annotated NV12。
+
+```cpp
+streamBuffer = postStreamBufferPool->acquire();
+if (streamBuffer == nullptr) {
+    return 1;
+}
+
+overlayBuffer = postStreamOverlayPool->acquire();
+if (overlayBuffer == nullptr) {
+    release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+    return 1;
+}
+
+if (rga_resize_convert_vaddr(
+        const_cast<void *>(srcData),
+        width,
+        height,
+        srcFormat,
+        overlayBuffer,
+        streamWidth,
+        streamHeight,
+        RK_FORMAT_BGRA_8888) != 0) {
+    release_frame_buffer(overlayBuffer, release_pooled_buffer, postStreamOverlayPool);
+    release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+    return -1;
+}
+
+QImage overlayFrame(
+    overlayBuffer,
+    streamWidth,
+    streamHeight,
+    streamWidth * 4,
+    QImage::Format_ARGB32
+);
+QPainter overlayPainter(&overlayFrame);
+paintDetections(&overlayPainter, group, width, height, streamWidth, streamHeight);
+
+if (rga_resize_to_nv12_vaddr(
+        overlayBuffer,
+        streamWidth,
+        streamHeight,
+        streamWidth,
+        streamHeight,
+        RK_FORMAT_BGRA_8888,
+        streamBuffer,
+        streamWidth,
+        streamHeight,
+        streamStride,
+        streamHeight) != 0) {
+    release_frame_buffer(overlayBuffer, release_pooled_buffer, postStreamOverlayPool);
+    release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+    return -1;
+}
+
+PostStreamFrame frame;
+frame.data = streamBuffer;
+frame.size = streamBytes;
+frame.width = streamWidth;
+frame.height = streamHeight;
+frame.stride = streamStride;
+frame.format = RK_FORMAT_YCbCr_420_SP;
+frame.frame_id = frameId;
+frame.timestamp_us = captureTsUs;
+frame.release_fn = release_pooled_buffer;
+frame.release_ctx = postStreamBufferPool;
+postStreamFramePool->enqueue(std::move(frame));
+return 0;
+```
+
+这段构建逻辑说明 RTSP 分支拿到的从来不是 UI 截图，也不是 `QImage` 本身，而是重新编码前最后一版 NV12。`paintDetections()` 画上去的框和标签会被实际烧进后续推流画面，而 `frame.release_fn` / `release_ctx` 则保证 `streamThread` 在编码后能把这块 NV12 缓冲正确归还给池。
+
+- 输入帧格式可能不同
+- RTSP 输出要求 NV12
+- Qt 叠框最方便的是 BGRA/ARGB 可见平面
+- 需要把推理主链和推流支路的帧生命周期隔离开
+
+它的错误语义也要写清：
+
+- 返回 `1`：通常表示池忙，当前帧可能被跳过
+- 返回 `< 0`：致命错误，主循环会停掉 RTSP 支路
+
+停支路的动作是：
+
+- `postStreamBranchActive = false`
+- 记 `WARN`
+- 发布 `stream/status offline, reason=post_stream_failed`
+- `postStreamFramePool.stop()`
+
+但注意：
+
+- 推理主链不因此退出
+- UI 显示不因此退出
+
+## 10. `MppRtspEncoder` 负责的不是“拉流”，而是“编码后推流”
+
+这个类在 vendor 目录里：
+
+- `include/mpp_encoder_rtsp.h`
+- `src/mpp_encoder_rtsp.cc`
+
+它做的事可以分成五步。
+
+### 10.1 `open()`
+
+记录：
+
+- `rtsp_url`
+- `width/height`
+- `hor_stride/ver_stride`
+- `fps`
+- `bitrate`
+
+其中码率 `0` 不表示零码率，而是交给 `clamp_bitrate()` 自动估算：
+
+- 估算公式近似是 `width * height * fps`
+- 最小 1 Mbps
+- 最大 8 Mbps
+
+### 10.2 `initMpp()`
+
+初始化 Rockchip MPP 编码器：
+
+- `MPP_CTX_ENC`
+- `MPP_VIDEO_CodingAVC`
+- `MPP_ENC_RC_MODE_CBR`
+- `prep:format = MPP_FMT_YUV420SP`
+
+这里已经把输入格式钉死成 NV12。
+
+### 10.3 `initRtspOutput()`
+
+初始化 FFmpeg RTSP 输出：
+
+- `avformat_alloc_output_context2(..., "rtsp", url)`
+- 新建 `video_stream_`
+- `codec_id = AV_CODEC_ID_H264`
+- `format = AV_PIX_FMT_NV12`
+- `time_base = 1/90000`
+- `rtsp_transport = tcp`
+- `muxdelay = 0`
+- `pkt_size = 1200`
+
+这说明它不是本地起一个 RTSP server，而是作为 RTSP client 往目标地址写。
+
+### 10.4 `encodeAndPush()`
+
+这是最核心的帧级逻辑：
+
+1. 检查 `PostStreamFrame` 必须是 NV12。
+2. 如分辨率不匹配，调用 `reopenForFrame()` 重开 encoder。
+3. 把源 `PostStreamFrame` 逐行拷贝进 MPP 输入缓冲，处理 stride。
+4. `mpp_frame_set_pts(frame.timestamp_us)`
+5. `encode_put_frame()`
+6. 循环 `encode_get_packet()`
+7. 每个 packet 调 `writeMppPacket()`
+
+这里有两个关键事实。
+
+第一，`encodeAndPush()` 仍然会把外部 NV12 拷贝进自己的 MPP input buffer，所以它不是严格零拷贝。
+
+第二，时间戳来自 `PostStreamFrame.timestamp_us`，而这个时间戳又来自采集或解码侧的 `captureTsUs`，不是 FFmpeg 自己瞎生。
+
+### 10.5 `writeMppPacket()`
+
+这个函数把 MPP 输出 packet 转成 FFmpeg `AVPacket` 并写出。
+
+时间处理规则是：
+
+- 第一帧的 `capture_ts_us` 作为基准点
+- 后续 `pts/dts` 用“相对第一帧的微秒偏移”换算到 `1/90000`
+- `duration` 默认按 FPS 推导
+- 如果相邻两帧捕获时间差更合理，就用真实时间差
+
+这让 RTSP 时间轴更接近真实采集时间。
+
+## 11. Vision MQTT publish 是怎样接进来的
+
+视觉侧 MQTT wrapper 也在 `vision_runtime.cpp` 内部定义，而不是复用 `linux_app/mqtt_publisher.c`。
+
+它当前只支持：
+
+- `open()`
+- `close()`
+- `isConnected()`
+- `publish()`
+
+它当前不支持：
+
+- `subscribe()`
+- message callback 处理 command
+- 任意 topic router
+
+这就决定了 Vision 侧当前只有“往外发”，没有“从 broker 收命令”。
+
+### 11.1 `publishStreamStatus()`
+
+流状态 payload 固定字段是：
+
+| 字段 | 含义 |
+|---|---|
+| `device_id` | `rk3568-001` |
+| `type` | 固定为 `stream_status` |
+| `state` | `online` 或 `offline` |
+| `protocol` | 固定为 `rtsp` |
+| `codec` | 固定为 `h264` |
+| `url` | 当前 RTSP 目标地址 |
+| `reason` | 可选，描述离线原因 |
+
+它使用 `retain = true`。
+
+这很合理，因为订阅端更关心“最近一次流状态”。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`publishStreamStatus()`
+作用：把 RTSP 在线状态打成 retained MQTT 消息，供外部订阅端查询最近一次状态。
+
+```cpp
+void publishStreamStatus(
+    DashboardBackend *backend,
+    VisionMqttPublisher *mqtt,
+    const QString &state,
+    const QString &streamUrl,
+    const QString &reason = QString()
+) {
+    QJsonObject payload{
+        {QStringLiteral("device_id"), QString::fromLatin1(kDeviceId)},
+        {QStringLiteral("type"), QStringLiteral("stream_status")},
+        {QStringLiteral("state"), state},
+        {QStringLiteral("protocol"), QStringLiteral("rtsp")},
+        {QStringLiteral("codec"), QStringLiteral("h264")},
+        {QStringLiteral("url"), streamUrl}
+    };
+
+    if (!reason.isEmpty()) {
+        payload.insert(QStringLiteral("reason"), reason);
+    }
+    logPublishedMessage(backend, mqtt, QString::fromLatin1(kTopicStreamStatus), payload, true);
+}
+```
+
+这里的 `retain = true` 不是文档推断，而是实码行为。也就是说，新订阅者即使错过了上线瞬间，仍然能从 broker 拿到最近一条 `stream/status`，这和 detection 事件流的语义明显不同。
+
+### 11.2 `publishDetection()`
+
+检测消息字段是：
+
+| 字段 | 含义 |
+|---|---|
+| `device_id` | `rk3568-001` |
+| `type` | `vision_detection` |
+| `frame_id` | sourceThread 生成的帧号 |
+| `ts_us` | 捕获时间戳 |
+| `objects[]` | 每个目标的 `class/conf/box` |
+| `stream_url` | 当前 RTSP 配置地址 |
+
+发布条件只有一个：
+
+- `detGroup.count > 0`
+
+也就是说，空帧不发 detection。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`publishDetection()`
+作用：把当前帧检测结果编码成 `vision_detection` JSON，并带上 `frame_id`、`ts_us`、`stream_url` 这些跨链路关联字段。
+
+```cpp
+void publishDetection(
+    DashboardBackend *backend,
+    VisionMqttPublisher *mqtt,
+    const QString &streamUrl,
+    uint64_t frameId,
+    long long captureTsUs,
+    const detect_result_group_t &group
+) {
+    QJsonArray objects;
+    for (int i = 0; i < group.count; ++i) {
+        const detect_result_t &det = group.results[i];
+        QJsonArray box;
+        box.append(det.box.left);
+        box.append(det.box.top);
+        box.append(det.box.right);
+        box.append(det.box.bottom);
+
+        QJsonObject object{
+            {QStringLiteral("class"), QString::fromLocal8Bit(det.name)},
+            {QStringLiteral("conf"), det.prop},
+            {QStringLiteral("box"), box}
+        };
+        objects.append(object);
+    }
+
+    QJsonObject payload{
+        {QStringLiteral("device_id"), QString::fromLatin1(kDeviceId)},
+        {QStringLiteral("type"), QStringLiteral("vision_detection")},
+        {QStringLiteral("frame_id"), static_cast<qint64>(frameId)},
+        {QStringLiteral("ts_us"), static_cast<qint64>(captureTsUs)},
+        {QStringLiteral("objects"), objects},
+        {QStringLiteral("stream_url"), streamUrl}
+    };
+
+    logPublishedMessage(backend, mqtt, QString::fromLatin1(kTopicVisionDetection), payload, false);
+}
+```
+
+这里能看出 detection 消息不是“简单扔个类别名”，而是把框坐标、置信度、帧号、时间戳和 RTSP URL 都一起发了出去。这样外部系统既能把事件和视频流关联，也能用 `frame_id` 对齐本地日志和 UI 侧观测。
+
+### 11.3 发布成功与日志计数
+
+`logPublishedMessage()` 的语义很重要：
+
+- 先把 payload 压成 compact JSON
+- 调 `mqtt.publish(...)`
+- 只有成功时才 `backend->addMqttPublishLog(...)`
+
+所以 `SystemLogPage` 里显示的 MQTT 次数并不是“尝试次数”，而是“成功写入 broker 的次数”。
+
+代码来源：`project2_master/qt_gui/vision/vision_runtime.cpp`
+函数：`logPublishedMessage()`
+作用：把“尝试发布”和“成功记日志”拆开，确保 Dashboard 上的 MQTT 计数只统计真正写进 broker 的消息。
+
+```cpp
+void logPublishedMessage(DashboardBackend *backend, VisionMqttPublisher *mqtt, const QString &topic, const QJsonObject &payload, bool retain = false) {
+    const QByteArray encoded = compactJson(payload);
+    const bool published = mqtt != nullptr && mqtt->publish(topic.toUtf8().constData(), encoded, retain);
+
+    if (backend != nullptr && published) {
+        backend->addMqttPublishLog(topic, QString::fromUtf8(encoded));
+    }
+}
+```
+
+这一层包装很关键，因为它决定了 UI 上看到的 MQTT 次数是“成功次数”而不是“调用次数”。如果 broker 断线，`publishDetection()` / `publishStreamStatus()` 仍然可以被调用，但没有成功写入时，`DashboardBackend` 不会被记一条伪成功日志。
+
+## 12. 错误路径与降级策略
+
+为了排故，最好按“是否停机”来记。
+
+### 12.1 会直接导致视觉链退出
+
+- 模型文件找不到
+- `aiPool.init()` 失败
+- 摄像头打开失败
+- 摄像头起流失败
+- 摄像头像素格式不支持
+- 文件输入不存在或不可读
+- `decoder.open()` 失败
+- 首帧解码失败
+- 解码后尺寸非法
+- `sourceThread` 采集失败
+- `sourceThread` queue 回摄像头帧失败
+- RGB buffer 尺寸溢出
+
+### 12.2 会停掉 RTSP 支路，但保留推理和 UI
+
+- `copyPostInferFrameToPostStreamPool()` 返回致命错误
+- `MppRtspEncoder::open()` 失败
+- `MppRtspEncoder::encodeAndPush()` 失败
+- 启动时明确 `--disable-vision-rtsp`
+
+### 12.3 不会停机，但 MQTT 不可用
+
+- `VisionMqttPublisher::open()` 失败
+- broker 运行中断开
+- publish 调用失败
+
+这时表现是：
+
+- 视觉检测仍然继续
+- UI 仍然刷新
+- RTSP 仍可继续，前提是它自己的依赖正常
+- 只有 MQTT 日志和计数不会增长
+
+## 13. 依赖边界和构建边界
+
+这部分很适合拿去写部署说明。
+
+### 13.1 Qt 目标直接编进了哪些 vendor 源文件
+
+`qt_gui/CMakeLists.txt` 直接把这些 `.cc` 编进 `rf_dashboard_qt5`：
+
+- `rkYolov5s.cc`
+- `preprocess.cc`
+- `postprocess.cc`
+- `v4l2_capture.cc`
+- `mpp_decoder.cc`
+- `mpp_encoder_rtsp.cc`
+
+说明这不是运行时“外挂一个独立视觉服务”，而是链接进同一 Qt 可执行文件。
+
+### 13.2 强制依赖
+
+- `librknnrt.so`
+- `librga.so`
+- `librockchip_mpp.so`
+- `libavformat`
+- `libavcodec`
+- `libavutil`
+- `libmosquitto`
+
+少任何一类，当前配置都会构建失败，而不是偷偷降级。
+
+### 13.3 不再接受 fake-success runtime
+
+当前 `CMakeLists.txt` 和 `workerLoop()` 都明确表达了一个边界：
+
+- 没有 `DASHBOARD_HAVE_LOCAL_VISION_RUNTIME` 时不再假装本地视觉可用。
+- 这是“显式失败”，不是“静默禁用”。
+
+## 14. 当前没有实现什么
+
+这一节必须写得非常保守。
+
+当前没有实现：
+
+- MQTT subscribe
+- MQTT command handler
+- `gateway/{gateway_id}/cmd`
+- recorder
+- 事件触发录像
+- `record_done`
+- 录像完成回执元数据
+
+所以文档不应该出现这些说法：
+
+- “VisionRuntime 会订阅 MQTT 命令”
+- “收到命令后会启动录像”
+- “录像完成会发 `record_done`”
+
+这些都不是当前代码事实。
+
+## 15. 如果你要改代码，先从哪几处下手
+
+### 改输入源相关
+
+先读：
+
+- `qt_gui/core/app_options.h`
+- `qt_gui/app/main.cpp`
+- `qt_gui/vision/vision_runtime.cpp` 里输入初始化与 `sourceThread`
+
+### 改 MQTT publish 相关
+
+先读：
+
+- `VisionMqttPublisher`
+- `logPublishedMessage()`
+- `publishStreamStatus()`
+- `publishDetection()`
+- [mqtt_publish_tutorial_zh.md](mqtt_publish_tutorial_zh.md)
+
+### 改 RTSP push 相关
+
+先读：
+
+- `copyPostInferFrameToPostStreamPool()`
+- `PostStreamFramePool`
+- `MppRtspEncoder`
+- [rtsp_push_tutorial_zh.md](rtsp_push_tutorial_zh.md)
+
+## 16. 一段最实用的心智模型
+
+把当前 VisionRuntime 想成三层就不容易迷路：
+
+第一层，输入层。
+
+- `sourceThread`
+- `V4L2Capture` / `MppDecoder`
+- `aiFramePool`
+
+第二层，推理与扇出层。
+
+- `aiPool`
+- `aiPool.get()`
+- `VisionSnapshot`
+- `publishDetection()`
+- `copyPostInferFrameToPostStreamPool()`
+
+第三层，输出层。
+
+- Qt 页面消费 `VisionSnapshot`
+- MQTT broker 消费 Vision publish
+- RTSP 服务器消费 H.264 over RTSP
+
+当前代码已经把这三层分得很清楚；真正没做完的不是这三层内部，而是“更上层的命令输入和录像闭环”。

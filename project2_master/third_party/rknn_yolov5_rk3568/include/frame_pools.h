@@ -114,31 +114,33 @@ static inline void release_pooled_buffer(unsigned char* data, void* ctx) {
     pool->release(data);
 }
 
-struct StreamFrame {
-    unsigned char* data{nullptr};
-    size_t data_size{0};
-    uint64_t frame_id{0};
-    long long capture_ts_us{0};
+// Post-inference frame handed off after ai_pool.get().
+// The payload is expected to already contain any stream-side annotation/overlay.
+struct PostStreamFrame {
+    unsigned char* data{nullptr};        // CPU-visible payload owned by release_fn/release_ctx.
+    size_t size{0};                      // Valid byte count in data, including any stride padding.
     int width{0};
     int height{0};
-    int stride{0};
-    int format{0};
-    FrameReleaseFn release_fn{nullptr};
-    void* release_ctx{nullptr};
+    int stride{0};                       // Consumer row stride; for NV12 this is bytes per Y/UV row.
+    int format{0};                       // Current stream path uses RK_FORMAT_YCbCr_420_SP.
+    uint64_t frame_id{0};
+    long long timestamp_us{0};           // Source/capture timestamp propagated to encoder PTS.
+    FrameReleaseFn release_fn{nullptr};  // Must release data back to the originating owner/pool.
+    void* release_ctx{nullptr};          // Paired context for release_fn; round-trip unchanged.
 };
 
-class StreamFramePool {
+class PostStreamFramePool {
 public:
-    explicit StreamFramePool(size_t max_queue_size)
+    explicit PostStreamFramePool(size_t max_queue_size)
         : max_queue_size_(max_queue_size == 0 ? 1 : max_queue_size) {}
 
-    ~StreamFramePool() {
+    ~PostStreamFramePool() {
         stop();
         clear();
     }
 
-    void enqueue(StreamFrame&& frame) {
-        StreamFrame dropped;
+    void enqueue(PostStreamFrame&& frame) {
+        PostStreamFrame dropped;
         bool has_dropped = false;
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -162,7 +164,7 @@ public:
         cv_.notify_one();
     }
 
-    bool waitAndPop(StreamFrame* out_frame) {
+    bool waitAndPop(PostStreamFrame* out_frame) {
         if (!out_frame) {
             return false;
         }
@@ -187,15 +189,15 @@ public:
     }
 
     void clear() {
-        std::deque<StreamFrame> pending;
+        std::deque<PostStreamFrame> pending;
         {
             std::lock_guard<std::mutex> lock(mtx_);
             pending.swap(queue_);
         }
 
-        for (StreamFrame& frame : pending) {
+        for (PostStreamFrame& frame : pending) {
             release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
-            frame = StreamFrame{};
+            frame = PostStreamFrame{};
         }
     }
 
@@ -207,9 +209,12 @@ private:
     size_t max_queue_size_;
     mutable std::mutex mtx_;
     std::condition_variable cv_;
-    std::deque<StreamFrame> queue_;
+    std::deque<PostStreamFrame> queue_;
     bool stop_{false};
     std::atomic<uint64_t> dropped_count_{0};
 };
+
+using StreamFrame = PostStreamFrame;
+using StreamFramePool = PostStreamFramePool;
 
 #endif

@@ -34,8 +34,22 @@ int main(int argc, char *argv[]) {
         QStringLiteral("input"),
         defaultVisionDevice
     );
+    const QString defaultVisionRtspUrl = dashboard::defaultVisionRtspUrl();
+    QCommandLineOption visionRtspUrlOption(
+        QStringLiteral("vision-rtsp-url"),
+        QStringLiteral("RTSP push URL used by the local vision runtime when enabled (default: %1).")
+            .arg(defaultVisionRtspUrl),
+        QStringLiteral("url"),
+        defaultVisionRtspUrl
+    );
+    QCommandLineOption disableVisionRtspOption(
+        QStringLiteral("disable-vision-rtsp"),
+        QStringLiteral("Disable the RTSP push side-branch while keeping local vision inference and display active.")
+    );
     parser.addOption(rfInputOption);
     parser.addOption(visionDeviceOption);
+    parser.addOption(visionRtspUrlOption);
+    parser.addOption(disableVisionRtspOption);
 
     parser.process(app);
 
@@ -47,6 +61,11 @@ int main(int argc, char *argv[]) {
     options.visionDevice = parser.value(visionDeviceOption).trimmed();
     if (options.visionDevice.isEmpty()) {
         options.visionDevice = defaultVisionDevice;
+    }
+    options.visionRtspEnabled = !parser.isSet(disableVisionRtspOption);
+    options.visionRtspUrl = parser.value(visionRtspUrlOption).trimmed();
+    if (options.visionRtspEnabled && options.visionRtspUrl.isEmpty()) {
+        options.visionRtspUrl = defaultVisionRtspUrl;
     }
     if (options.rfInput != defaultRfInput) {
         QTextStream(stderr)

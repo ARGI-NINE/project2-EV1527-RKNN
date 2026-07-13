@@ -8,6 +8,8 @@ namespace dashboard {
 struct AppOptions {
     QString rfInput;
     QString visionDevice;
+    bool visionRtspEnabled = true;
+    QString visionRtspUrl;
 };
 
 inline QString defaultRFInputPath() {
@@ -16,6 +18,10 @@ inline QString defaultRFInputPath() {
 
 inline QString defaultVisionDevicePath() {
     return QStringLiteral("/dev/video9");
+}
+
+inline QString defaultVisionRtspUrl() {
+    return QStringLiteral("rtsp://192.168.30.26:8554/rk3568-001/cam0");
 }
 
 inline bool isAllowedVisionDevicePath(const QString &path) {

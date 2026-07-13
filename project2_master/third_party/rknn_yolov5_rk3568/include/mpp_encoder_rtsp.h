@@ -2,6 +2,7 @@
 #define MPP_ENCODER_RTSP_H
 
 #include <cstdint>
+#include <string>
 
 #include "frame_pools.h"
 #include "rockchip/rk_mpi.h"
@@ -26,16 +27,18 @@ public:
              int fps_num,
              int fps_den,
              int bitrate_bps);
-    int encodeAndPush(const StreamFrame& frame);
+    // Consumes a post-inference annotated PostStreamFrame and forwards it to MPP/RTSP.
+    int encodeAndPush(const PostStreamFrame& frame);
     void close();
 
 private:
     int initMpp();
     int initRtspOutput();
     int loadHeadersIntoStream();
+    int reopenForFrame(const PostStreamFrame& frame);
     int writeMppPacket(MppPacket packet, bool mark_keyframe);
 
-    const char* rtsp_url_{nullptr};
+    std::string rtsp_url_;
     int width_{0};
     int height_{0};
     int hor_stride_{0};

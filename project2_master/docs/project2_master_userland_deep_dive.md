@@ -1,421 +1,241 @@
 # project2_master 用户态深读
 
-本文只讲 `project2_master/linux_app` 这条真实 master 用户态链路：
-`main.c`、`rf_source.c/h`、`rf_epoll.c/h`、`rf_decode.c/h`、`rf_decode_c.c/h`。
-不展开 `pc sim`、vendor、生成文件。
+这份文档只读 `project2_master/linux_app` 下的 RF 用户态链路：
 
-先抓住一句话：
+- `main.c`
+- `rf_source.c/h`
+- `rf_epoll.c/h`
+- `rf_decode.c/h`
+- `rf_decode_c.c/h`
+- `mqtt_publisher.c/h`
 
-```text
-main()
-  -> 打开 rf_source
-  -> 配置 rf_epoll
-  -> epoll_wait 事件泵
-      -> read 驱动帧
-      -> 搬运成 rf_frame_t
-      -> on_rf_frame()
-          -> rf_decode_frame()
-              -> rf_decode_ev1527_c_with_stats()
-                  -> build_runs_from_frame()
-                  -> decode_best_from_runs()
-          -> 低置信度过滤
-          -> 稳定分组 / 近邻合并
-          -> 重复抑制
-          -> build_rf_event_payload()
-          -> emit_protocol_message("rf_event", ...)
-      -> on_drv_stats()
-          -> refresh_driver_state()
-          -> emit_device_status()
-          -> emit_rf_stats()
-  -> emit_rf_stats("shutdown")
-  -> emit_device_status("shutdown")
-  -> rf_source_close()
-```
+它对应的可执行文件是 `rf_gateway`。
 
-你要抓住的点是：`rf_source` 只负责“怎么打开设备”，`rf_epoll` 只负责“怎么持续收帧”，`rf_decode` 只负责“把一帧变成可发布 packet 并记统计”，`rf_decode_c` 才是 EV1527 识别算法本体。`main.c` 不做底层读写，它是策略层、状态中心和 JSON envelope 发布器。
+兼容说明：以下先补回 `HEAD` 版章节骨架，便于沿用旧目录、旧引用和旧阅读顺序；后文现有正文、源码摘录和细讲全部保留。
 
 ## 0. 阅读路线图
 
-这段先给你一个固定的读法：不要从细节函数一路乱跳，而是按 `main -> source -> epoll -> decode -> publish` 的顺序往下压。
-
-- 先读 `main.c`
-  - 目标不是背参数，而是先把“策略层 + 状态中心”记住。
-  - 你要抓住的点是：哪些状态留在 `main.c`，哪些只是下发给下层。
-- 再读 `rf_source.c/h`
-  - 目标是确认输入口怎么收紧，`fd` 怎么打开、怎么关。
-  - 你要抓住的点是：它不是业务层，只是设备入口壳。
-- 再读 `rf_epoll.c/h`
-  - 目标是看事件泵怎么持续喂帧，哪里会阻塞，哪里会退出。
-  - 你要抓住的点是：`read -> consume -> callback` 不是一步到位，而是一段可回压的节奏。
-- 再读 `rf_decode.c/h`
-  - 目标是确认“单帧结果怎么标准化”，以及统计怎么分层记账。
-  - 你要抓住的点是：它是适配层，不是算法本体。
-- 最后读 `rf_decode_c.c/h`
-  - 目标是看 EV1527 识别本体怎么做结构筛选、时序打分和候选选择。
-  - 你要抓住的点是：这里才是“像不像这一码”的核心判断。
-
-不是先钻 `build_runs_from_frame()`，而是先知道一帧是怎么从 `main.c` 被一路推到 `publish` 的。这样你后面再回来看细节，就知道每一层是在“收口”还是在“放行”。
+兼容旧版目录：下文现有正文继续覆盖 `main -> rf_source -> rf_epoll -> rf_decode -> rf_decode_c -> JSON/MQTT/Qt` 主链，本轮新增代码块与细讲保持不删。
 
 ## 1. `main.c`：主循环不是循环本身，而是整条状态链
 
+兼容旧版目录：对应下文现有 `## 1. 先记住这层的定位`、`## 2. 程序入口：main()`、`## 6. 事件策略层`、`## 7. stdout JSON envelope`、`## 8. 三种 payload 的职责`。
+
 ### 1.0 文件职责与函数索引
 
-这段先把文件职责排一下，避免你在细节里把层次看反。
-
-- `main.c`
-  - 负责参数解析、策略阈值、状态保存、发布、汇总打印、退出清理。
-  - 先读的函数：`main()`、`on_rf_frame()`、`on_drv_stats()`
-  - 不是底层读写，而是策略层和状态中心。
-- `rf_source.c/h`
-  - 负责设备白名单、字符设备校验、`fd` 打开和关闭。
-  - 先读的函数：`rf_source_is_supported_path()`、`rf_source_open()`、`rf_source_close()`
-  - 只是薄封装，不做业务决策。
-- `rf_epoll.c/h`
-  - 负责事件泵、`epoll_wait()`、驱动帧搬运、定时统计回调。
-  - 先读的函数：`consume_frames()`、`rf_epoll_run()`
-  - 只是薄封装，不决定业务是否继续。
-- `rf_decode.c/h`
-  - 负责把算法结果标准化成统一 packet，并顺手记调用统计。
-  - 先读的函数：`rf_decode_frame()`、`rf_decode_get_runtime_stats()`、`rf_decode_get_last_call_stats()`
-  - 只是包装层，不是解码本体。
-- `rf_decode_c.c/h`
-  - 负责 EV1527 识别算法本体，做 run 构造、结构筛选、时序评分、候选选择。
-  - 先读的函数：`rf_decode_ev1527_c_with_stats()`、`build_runs_from_frame()`、`decode_best_from_runs()`
-  - 这里才是核心逻辑，不是薄封装。
+兼容旧版目录：对应当前正文里 `main.c`、`rf_source`、`rf_epoll`、`rf_decode`、`rf_decode_c`、`mqtt_publisher` 的分工说明。
 
 ### 1.1 运行时上下文
 
-```c
-typedef struct {
-    uint32_t frame_seq;
-    uint32_t last_publish_seq;
-    unsigned last_code;
-    uint16_t publish_gap;
-    uint16_t stable_repeat;
-    uint16_t stable_window;
-    uint8_t stable_near_bits;
-    float min_publish_confidence;
-    int has_last_code;
-    rf_stable_group_t stable_groups[RF_STABLE_GROUP_MAX];
-    uint32_t frames_total;
-    uint32_t decode_ok;
-    uint32_t decode_no_frame;
-    uint32_t decode_err;
-    uint32_t low_conf_drop;
-    uint32_t stable_drop;
-    uint32_t dup_drop;
-    uint32_t published;
-    uint32_t drv_seq_prev;
-    uint32_t drv_drop;
-    int has_drv_seq;
-    const char *rf_input;
-    mqtt_publisher_t mqtt;
-    struct rf433_stats drv_stats;
-    struct rf433_status drv_status;
-    int has_drv_stats;
-    rf_epoll_stats_t *epoll_stats;
-} app_ctx_t;
-```
-
-这段的作用是把 master 用户态的全部“状态变化”集中在一个上下文里。
-
-- 依赖：`rf_decode` 的输出、驱动序号、稳定分组、重复发布阈值。
-- 输入：每次 `on_rf_frame()` 的单帧解码结果和驱动序号。
-- 输出：新的分类结果、JSON 发布行为、统计计数、下一帧决策依据。
-- 去向：后续每一帧都会继续读取这些状态，决定要不要发布、怎么发布、发布哪个码。
-- 为什么这样设计：不是把每一帧当成独立事件处理，而是把“短时间内是否稳定”“同码是否重复”“驱动有没有丢帧”都做成可累积状态。这样主循环才能做策略，而不是只做一次性解码。
-
-`rf_stable_group_t` 也不是解码器的一部分，而是 `main.c` 的后置稳定化缓存：
-
-- `anchor_code` 是分组锚点
-- `best_code` 是组内当前最强候选
-- `best_conf` 是组内最高置信度
-- `hits` 是命中计数
-- `last_seq` 用来做窗口淘汰
-
-你要抓住的点是：这层分组不是“识别码”，而是“把已经识别出来的码再做一次去抖和合并”。
-这段还要顺手抓住资源所有权的线：`ctx`、`epoll_stats`、最终打印的统计对象都由 `main.c` 持有，下面几层只是借用或者写入。
-- `rf_fd` 由 `main.c` 打开并持有，进入 `rf_epoll_config_t` 时只是把句柄传下去。
-- `rf_epoll_config_t` 本身是栈上的配置对象，事件泵只读它，不接管它。
-- `rf_frame_t` 不是长期对象，它通常是 `rf_epoll` 在 `consume_frames()` 里拼出来，再作为回调参数临时交给 `on_rf_frame()`。
-- `rf_decoded_packet_t` 是 `on_rf_frame()` 的局部结果，生命周期只覆盖这次回调，打印和分组都在同一段里完成。
-- 统计对象分两类：`epoll_stats`、`decode_stats` 这类是 `main.c` 持有的结果容器；`rf_decode` 内部的全局缓存只是供读取，不是所有权转移。
+兼容旧版目录：对应当前正文里稳定分组、驱动序号、统计字段、MQTT 发布状态等运行时状态说明。
 
 ### 1.2 `main()` 的入口顺序
 
-```c
-setvbuf(stdout, NULL, _IONBF, 0);
-setvbuf(stderr, NULL, _IONBF, 0);
-
-memset(&ctx, 0, sizeof(ctx));
-memset(&epoll_stats, 0, sizeof(epoll_stats));
-for (i = 1; i < argc; ++i) {
-    ...
-}
-
-if (!rf_source_is_supported_path(rf_input)) {
-    fprintf(stderr, "Unsupported --rf-input: %s (allowed: %s)\n", rf_input, RF_SOURCE_PATH);
-    return 1;
-}
-
-rf_fd = rf_source_open(rf_input);
-if (rf_fd < 0) {
-    fprintf(stderr, "Open RF input failed: %s\n", rf_input);
-    return 2;
-}
-```
-
-这段的作用是把“程序启动”收束成三步：参数解析、路径校验、设备打开。
-
-- 依赖：`rf_source_is_supported_path()`、`rf_source_open()`。
-- 输入：命令行参数和默认 `RF_SOURCE_PATH`。
-- 输出：一个合法的 `rf_fd`，或者直接退出。
-- 去向：`rf_fd` 进入 `rf_epoll_config_t`，成为后续事件泵的核心输入。
-- 为什么这样设计：用户态 master 不是开放式文件读取器，而是只接受固定设备入口。先拦掉非法路径，再打开字符设备，可以避免后面的 epoll 和 decode 在错误输入上空转。
-
-这里的参数是策略开关，不是协议参数：
-
-- `--stable-repeat`：同一组至少要命中几次才发布
-- `--stable-window`：分组存活窗口
-- `--stable-near-bits`：24 位码的汉明近邻阈值
-- `--min-publish-confidence`：最低可发布置信度
-- `--publish-gap`：同码最小重发间隔
-
-你要抓住的点是：这些参数全都发生在 `main.c`，说明“发布策略”在用户态而不是解码器内部。
+兼容旧版目录：对应下文现有 `## 2. 程序入口：main()`。
 
 ### 1.3 事件泵配置
 
-```c
-cfg.rf_fd = rf_fd;
-cfg.on_frame = on_rf_frame;
-cfg.on_stats = on_drv_stats;
-cfg.stats_interval_s = 5;
-cfg.stats = &epoll_stats;
-cfg.user = &ctx;
-
-refresh_driver_state(&ctx, rf_fd);
-emit_device_status(&ctx, "startup");
-epoll_rc = rf_epoll_run(&cfg);
-```
-
-这段的作用是把主程序的职责一次性拆成两个回调：一个处理帧，一个处理周期统计，并在进入事件泵前先发一条启动期 `device_status`。
-你要抓住的点是：`main.c` 不是在这里“开始读帧”，而是在这里把所有权和控制权交给事件泵。`cfg.stats = &epoll_stats` 这类赋值也不是转交所有权，只是让下层回调时能写回同一份状态。
-
-- 依赖：`rf_epoll_config_t`、`on_rf_frame()`、`on_drv_stats()`。
-- 输入：`rf_fd`、统计间隔、策略参数、上下文指针。
-- 输出：交给 `rf_epoll_run()` 的持续事件循环。
-- 去向：`rf_epoll` 内部调用 `epoll_wait()`，再回调到 `main.c`。
-- 为什么这样设计：不是 `main()` 自己 while-read，而是把“事件泵”单独抽出来。这样读帧逻辑、统计逻辑和策略逻辑就分层了，后续更容易替换输入源或者加定时统计。
+兼容旧版目录：对应当前正文里 `rf_epoll` 回调配置、启动期状态刷新与 `device_status` 首发逻辑。
 
 ### 1.4 `on_rf_frame()`：真正的业务核心
 
-```c
-static int on_rf_frame(const rf_frame_t *frame, uint64_t timestamp_ns, uint32_t drv_seq, void *user) {
-    ...
-    rc = rf_decode_frame(frame, &pkt);
-    memset(&call_stats, 0, sizeof(call_stats));
-    rf_decode_get_last_call_stats(&call_stats);
-    ...
-    if (pkt.confidence < ctx->min_publish_confidence) {
-        ctx->low_conf_drop++;
-        return 0;
-    }
-    ...
-    if (build_rf_event_payload(payload, sizeof(payload), ctx, frame, &pkt, &call_stats, timestamp_ns, drv_seq) != 0) {
-        fprintf(stderr, "[RF_JSON] failed to assemble rf event payload\n");
-        return 0;
-    }
-    (void)emit_protocol_message(ctx, "rf_event", MQTT_TOPIC_RF_EVENT, payload, 0);
-    ...
-}
-```
-
-这段的作用是把“原始帧”变成“可发布事件”，并在中间插入所有用户态策略。
+兼容旧版目录：对应当前正文里解码、过滤、稳定化、去重、封装和发布主流程。
 
 #### 1.4.1 先记驱动丢帧
 
-```c
-if (ctx->has_drv_seq && drv_seq > ctx->drv_seq_prev) {
-    const uint32_t gap = drv_seq - ctx->drv_seq_prev - 1u;
-    if (gap > 0u) {
-        ctx->drv_drop += gap;
-    }
-}
-ctx->drv_seq_prev = drv_seq;
-ctx->has_drv_seq = 1;
-```
-
-- 作用：从驱动序号看出中间是否漏帧。
-- 依赖：`drv_seq`、`ctx->drv_seq_prev`。
-- 输入：本帧驱动序号。
-- 输出：`ctx->drv_drop` 累加。
-- 去向：最后的 `rf_stats.payload` 汇总。
-- 为什么这样设计：这不是协议层丢包，而是驱动 FIFO 或读路径上的缺口统计。它不影响解码，但影响你判断整条链路是否稳定。
+兼容旧版目录：对应当前正文里 `drv_seq` 缺口统计和 `drv_drop` 语义。
 
 #### 1.4.2 再解码
 
-```c
-rc = rf_decode_frame(frame, &pkt);
-rf_decode_get_last_call_stats(&call_stats);
-```
-
-- 作用：把 `rf_frame_t` 转成 `rf_decoded_packet_t`，并取回本次调用耗时。
-- 依赖：`rf_decode.c` 的包装层。
-- 输入：一帧脉冲数组。
-- 输出：`pkt.addr`、`pkt.key`、`pkt.raw_code`、`pkt.confidence`、`pkt.source`。
-- 去向：后续过滤、分组、打印。
-- 为什么这样设计：解码结果和解码性能被拆成两条线记录。结果用于业务，耗时用于观测。
-
-这里要特别抓住一点：`main.c` 看到的不是原始算法细节，而是一个已经标准化的 packet。
+兼容旧版目录：对应当前正文里 `rf_decode_frame()` 和最近一次调用统计。
 
 #### 1.4.3 低置信度先丢
 
-```c
-if (pkt.confidence < ctx->min_publish_confidence) {
-    ctx->low_conf_drop++;
-    return 0;
-}
-```
-
-- 作用：先挡掉“能解出来，但不够稳”的结果。
-- 依赖：`min_publish_confidence`。
-- 输入：解码器给出的 `confidence`。
-- 输出：要么放行，要么计入 `low_conf_drop`。
-- 去向：只有通过这层的结果才会进入稳定分组。
-- 为什么这样设计：不是让解码器去做策略判断，而是把“算法评分”和“业务可发布阈值”分开。这样阈值能在用户态单独调。
+兼容旧版目录：对应当前正文里 `min_publish_confidence` 过滤。
 
 #### 1.4.4 稳定分组不是解码，而是后处理
 
-```c
-if (ctx->stable_repeat > 1u) {
-    stable_groups_decay(ctx);
-    idx = stable_group_find(ctx, pkt.raw_code);
-    if (idx < 0) {
-        idx = stable_group_alloc(ctx);
-        if (idx >= 0) {
-            stable_group_seed(...);
-        }
-        ctx->stable_drop++;
-        return 0;
-    }
-    g = &ctx->stable_groups[idx];
-    stable_group_update(g, pkt.raw_code, pkt.confidence, ctx->frame_seq);
-    if (g->hits < ctx->stable_repeat) {
-        ctx->stable_drop++;
-        return 0;
-    }
-    pkt.raw_code = g->best_code & 0xFFFFFFu;
-    snprintf(pkt.addr, sizeof(pkt.addr), "0x%06X", pkt.raw_code & 0xFFFFFFu);
-    snprintf(pkt.key, sizeof(pkt.key), "%u", (unsigned)(pkt.raw_code & 0x0Fu));
-    if (g->best_conf > pkt.confidence) {
-        pkt.confidence = g->best_conf;
-    }
-}
-```
-
-这段的作用是把单帧识别结果再压成“稳定事件”。
-
-- 依赖：`stable_window`、`stable_near_bits`、`stable_repeat`。
-- 输入：`pkt.raw_code`、`pkt.confidence`、当前 `frame_seq`。
-- 输出：可能被重写后的 `pkt.raw_code`、`pkt.addr`、`pkt.key`、`pkt.confidence`。
-- 去向：后面的重复抑制和打印。
-- 为什么这样设计：不是一次识别就立刻上报，而是先把短时抖动和相近码漂移都消化掉，再把组内最佳候选抬出来。`stable_groups` 是用户态的“事件平滑器”。
-
-你要抓住的点是：
-
-- `stable_group_find()` 用汉明距离找近邻组
-- `stable_group_seed()` 新建组
-- `stable_group_update()` 续命和刷新最佳候选
-- `stable_groups_decay()` 清掉过期组
-
-这说明稳定化依赖的是“连续帧状态”，不是单帧结果。
+兼容旧版目录：对应下文现有 `## 6. 事件策略层：稳定分组、近邻合并、重复抑制`。
 
 #### 1.4.5 重复发布抑制
 
-```c
-if (
-    ctx->has_last_code &&
-    pkt.raw_code == ctx->last_code &&
-    (ctx->frame_seq - ctx->last_publish_seq) < (uint32_t)ctx->publish_gap
-) {
-    ctx->dup_drop++;
-    return 0;
-}
-```
-
-- 作用：防止同一个码在很短时间里连续刷屏。
-- 依赖：`last_code`、`last_publish_seq`、`publish_gap`。
-- 输入：当前稳定后的 `raw_code`。
-- 输出：`dup_drop` 或放行。
-- 去向：真正进入 `emit_protocol_message(..., "rf_event", ...)` 的只剩非重复结果。
-- 为什么这样设计：不是让上游一直发，而是把“可见事件频率”控制在用户态。这对串口/终端打印和上层消费都更稳。
+兼容旧版目录：对应当前正文里 `publish_gap`、`last_code`、`last_publish_seq` 的抑制规则。
 
 #### 1.4.6 事件发布不是最后一步，发布后还要更新状态
 
-```c
-if (build_rf_event_payload(payload, sizeof(payload), ctx, frame, &pkt, &call_stats, timestamp_ns, drv_seq) != 0) {
-    fprintf(stderr, "[RF_JSON] failed to assemble rf event payload\n");
-    return 0;
-}
-(void)emit_protocol_message(ctx, "rf_event", MQTT_TOPIC_RF_EVENT, payload, 0);
-ctx->last_code = pkt.raw_code;
-ctx->has_last_code = 1;
-ctx->last_publish_seq = ctx->frame_seq;
-ctx->published++;
-```
-
-- 作用：把最终结果输出成 `rf_event` 单行 JSON envelope，并同步更新“最近发布了什么”。
-- 依赖：`pkt`、`call_stats`、`frame->pulse[]`、`build_rf_event_payload()`、`emit_protocol_message()`。
-- 输入：稳定化后的 packet。
-- 输出：stdout JSON envelope 和新的发布状态。
-- 去向：JSON envelope 给 Qt / MQTT 消费，状态给后续帧做去重。
-- 为什么这样设计：不是“发完就结束”，而是“发布本身也是状态转移的一部分”。`last_code` 和 `last_publish_seq` 就是后续抑制重复的依据。
-
-这里还要再看一眼发布时序：JSON envelope 发出和状态更新是一体的，不是“先打一行再说”。`ctx->last_code`、`ctx->has_last_code`、`ctx->last_publish_seq`、`ctx->published` 都是在这一步后写回的，这样后面的 `dup_drop` 才有判断基线。
+兼容旧版目录：对应当前正文里 `rf_event` 发布与 `ctx` 状态回写。
 
 ### 1.5 周期/退出汇总：单行 JSON envelope，而不是旧文本 stdout
 
-```c
-refresh_driver_state(&ctx, rf_fd);
-emit_rf_stats(&ctx, "shutdown");
-ctx.drv_status.online = 0u;
-ctx.has_drv_stats = 1;
-emit_device_status(&ctx, "shutdown");
-```
-
-这段的作用是把业务统计、IO 统计和驱动状态折叠进两类 JSON payload：
-
-- `rf_stats`：业务层统计、事件泵/读取层统计、解码层统计，说明帧最终怎么被筛掉或发布
-- `device_status`：驱动在线位、驱动队列水位、当前发布策略和 MQTT 连接状态
-
-你要抓住的点是：stdout ABI 现在不是旧的多套文本标签，而是统一的单行 JSON envelope：顶层固定为 `type/topic/mqtt_published/payload`，具体语义下沉到 `rf_event`、`rf_stats`、`device_status` 的 payload。
-
-统计不是附属打印，而是这份文档里最能看出层次分工的地方。`drv_drop` 不是 `read_error`，`low_conf_drop` 不是 `decode_no_frame`，`decode_c_accepts` 也不是 `published_events`。
+兼容旧版目录：对应下文现有 `## 7. stdout JSON envelope 是这层最重要的输出契约`、`## 8. 三种 payload 的职责`、`## 9. MQTT publish 是旁路，不是主线`。
 
 ### 1.6 退出清理顺序
 
-```c
-epoll_rc = rf_epoll_run(&cfg);
-if (epoll_rc != 0) {
-    fprintf(stderr, "[RF_IO] rf_epoll_run exited with rc=%d\n", epoll_rc);
-}
-...
-rf_source_close(rf_fd);
-return 0;
-```
-
-这段的作用是把“退出”也写成一条明确链路。
-你要抓住的点是：先让事件泵自己退干净，再在 `main.c` 里统一打印汇总，最后才关 `rf_fd`。不是每一层都各自静默退出，而是先保住统计状态，再收口资源。
-
-- 依赖：`rf_epoll_run()` 的返回值、`rf_source_close()`。
-- 输入：事件泵结束原因和最终统计状态。
-- 输出：`epoll_run` 内部关闭 `timerfd` / `epfd`，`main` 最后关闭 `rf_fd`。
-- 去向：程序返回给 shell。
-- 为什么这样设计：不是在每一层都各自静默退出，而是让事件泵先收尾，再由主程序统一打印汇总，最后再关闭输入源。这样能保证统计先落盘、fd 后释放，排查问题时不会丢链路尾巴。
+兼容旧版目录：对应当前正文里 shutdown 阶段的 `rf_stats` / `device_status` 输出与 `rf_source_close()`。
 
 ## 2. `rf_source.c/h`：只做设备白名单和 fd 生命周期
 
+兼容旧版目录：对应下文现有 `## 3. rf_source：只允许 /dev/rf433`。
+
 ### 2.1 代码
+
+兼容旧版目录：对应当前正文里路径白名单、字符设备校验、打开和关闭逻辑。
+
+## 3. `rf_epoll.c/h`：事件泵只负责“持续喂帧”
+
+兼容旧版目录：对应下文现有 `## 4. rf_epoll：把定长驱动帧接成事件循环`。
+
+### 3.1 配置结构
+
+兼容旧版目录：对应当前正文里 `rf_epoll_config_t` 的 fd、回调、统计与用户指针。
+
+### 3.2 `consume_frames()`：把驱动帧搬成用户帧
+
+兼容旧版目录：对应当前正文里从 `struct rf433_frame` 到 `rf_frame_t` 的搬运逻辑。
+
+### 3.3 `rf_epoll_run()`：一个 epoll 同时管理数据和统计
+
+兼容旧版目录：对应当前正文里 `epoll_wait()`、`timerfd`、帧流与统计流的调度关系。
+
+### 3.4 事件泵与回压时序
+
+兼容旧版目录：对应当前正文里 `read -> consume -> decode -> publish -> wait` 的节奏说明。
+
+## 4. `rf_decode.c/h`：适配层，不是算法层
+
+兼容旧版目录：对应下文现有 `## 5. 解码层：rf_decode 与 rf_decode_c`。
+
+### 4.1 代码
+
+兼容旧版目录：对应当前正文里 `rf_decode_frame()`、标准化 packet 和运行统计说明。
+
+### 4.2 统计联动
+
+兼容旧版目录：对应当前正文里 runtime 统计、last-call 统计和上层读取方式。
+
+### 4.3 异常路径与退出顺序
+
+兼容旧版目录：对应当前正文里 `EINTR`、`EAGAIN`、`EOF`、真错误与统一收口顺序说明。
+
+## 5. `rf_decode_c.c/h`：EV1527 识别本体
+
+兼容旧版目录：对应下文现有 `### 5.2 rf_decode_c 的角色` 以及当前正文里算法主链补充。
+
+### 5.1 先看数据流
+
+兼容旧版目录：对应当前正文里两种起始极性、候选窗口和最佳结果选择总览。
+
+### 5.2 `build_runs_from_frame()`：先把脉冲变成 run
+
+兼容旧版目录：对应当前正文里脉宽转 run 序列的阶段说明。
+
+### 5.3 `decode_best_from_runs()`：先结构，再时序，再评分
+
+兼容旧版目录：对应当前正文里结构筛选、时钟估计、位级判定和置信度打分。
+
+#### 5.3.1 先找合法窗口
+
+兼容旧版目录：对应当前正文里同步头与候选起点选择。
+
+#### 5.3.2 再检查位级结构
+
+兼容旧版目录：对应当前正文里高低交替结构校验。
+
+#### 5.3.3 再估计时钟
+
+兼容旧版目录：对应当前正文里 `clk` 融合估计。
+
+#### 5.3.4 再按位计算双假设误差
+
+兼容旧版目录：对应当前正文里 bit `0/1` 双假设比较。
+
+#### 5.3.5 最后不是“能解就行”，而是“分数够不够高”
+
+兼容旧版目录：对应当前正文里综合置信度构造与门槛说明。
+
+#### 5.3.6 选择最佳候选
+
+兼容旧版目录：对应当前正文里 `raw_code/address20/button4/confidence` 等最终结果封装。
+
+### 5.4 `rf_decode_stage_stats_t` 是两级门控的可观测点
+
+兼容旧版目录：对应当前正文里结构门和时序门统计含义。
+
+## 6. 这三层统计怎么联动
+
+兼容旧版目录：对应下文现有 `## 8. 三种 payload 的职责`、`## 9. MQTT publish 是旁路，不是主线`、`## 10. Qt 是怎样接上这条链的` 里的观测面说明。
+
+### 6.1 驱动统计
+
+兼容旧版目录：对应当前正文里 `GET_STATS` / `GET_STATUS`、`device_status` 与 `rf_stats` 的驱动字段。
+
+### 6.2 用户态业务统计
+
+兼容旧版目录：对应当前正文里 `frames_total/decode_ok/low_conf_drop/stable_drop/dup_drop/published_events` 的分层语义。
+
+### 6.3 IO / 解码统计也折叠在 `rf_stats.payload`
+
+兼容旧版目录：对应当前正文里 `read_eintr/read_eagain/read_error/decode_c_*` 等字段说明。
+
+## 7. 最后再把关系说死
+
+兼容旧版目录：对应当前正文里 `rf_source`、`rf_epoll`、`rf_decode`、`rf_decode_c`、`main.c` 和 Qt/MQTT 的职责边界总结。
+
+## 1. 先记住这层的定位
+
+`rf_gateway` 不是驱动，也不是 Qt 页面。它是两者之间的策略层和协议转换层。
+
+更具体地说，它做四件事：
+
+1. 作为 `/dev/rf433` 的用户态消费者
+2. 把 pulse frame 解码成 EV1527 语义结果
+3. 生成统一的 `stdout JSON envelope`
+4. 在 MQTT 已连接时并行发布同一份 payload
+
+如果用一句更工程化的话概括：
+
+`rf_gateway = /dev/rf433 reader + EV1527 decoder + JSON envelope publisher + optional MQTT publisher`
+
+## 2. 程序入口：`main()`
+
+主函数大致按下面顺序工作：
+
+```text
+parse args
+  -> validate rf_input
+  -> open /dev/rf433
+  -> init MQTT publisher
+  -> query driver state
+  -> emit startup device_status
+  -> run rf_epoll loop
+  -> emit shutdown rf_stats/device_status
+```
+
+读 `main()` 时，你会发现它刻意没有碰串口细节。它关心的是策略参数：
+
+- `stable_repeat`
+- `stable_window`
+- `stable_near_bits`
+- `min_publish_confidence`
+- `publish_gap`
+
+这些都属于“上层如何决定要不要把一帧当成有效业务事件发出去”的策略，而不是底层采集逻辑。
+
+## 3. `rf_source`：只允许 `/dev/rf433`
+
+### 3.1 路径白名单
+
+`rf_source.h` 把默认路径固定成：
+
+```c
+#define RF_SOURCE_PATH "/dev/rf433"
+```
+
+`rf_source_is_supported_path()` 和 `main()` 都要求 RF 输入路径必须是这个值。
+
+所以当前 master 用户态并不是“可注入任意 RF 数据源”的通用程序，而是一个明确绑定 `/dev/rf433` 的板侧网关。
+
+来源：`project2_master/linux_app/rf_source.c`，函数：`rf_source_is_supported_path()` / `rf_source_open()`，作用：把 RF 输入路径锁死在 `/dev/rf433`，并且要求它真的是字符设备。
 
 ```c
 int rf_source_is_supported_path(const char *path) {
@@ -425,168 +245,281 @@ int rf_source_is_supported_path(const char *path) {
     return (strcmp(path, RF_SOURCE_PATH) == 0) ? 1 : 0;
 }
 
+static int rf_source_is_char_device(const char *path) {
+    struct stat st;
+
+    if (path == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+    return S_ISCHR(st.st_mode) ? 1 : 0;
+}
+
 int rf_source_open(const char *path) {
     const char *resolved = (path == NULL || path[0] == '\0') ? RF_SOURCE_PATH : path;
+
     if (!rf_source_is_supported_path(resolved)) {
         errno = EINVAL;
         return -1;
     }
-    if (rf_source_is_char_device(resolved) == 0) {
-        errno = ENOTTY;
-        return -1;
+
+    {
+        const int is_chr = rf_source_is_char_device(resolved);
+        if (is_chr < 0) {
+            return -1;
+        }
+        if (is_chr == 0) {
+            errno = ENOTTY;
+            return -1;
+        }
     }
+
     return open(resolved, O_RDONLY | O_NONBLOCK);
 }
 ```
 
-这段的作用是把 master 的输入入口锁死在一个已知字符设备上。
+这段实现把“白名单”写得非常硬：
 
-- 依赖：`RF_SOURCE_PATH`、`stat()`、`S_ISCHR()`、`open()`。
-- 输入：路径参数。
-- 输出：合法 fd 或失败。
-- 去向：`main.c` 把这个 fd 交给 `rf_epoll`。
-- 为什么这样设计：不是让上层随便传文件名，而是先把“输入源”定义成字符设备。这样 `read()`、`epoll`、`ioctl` 才有语义一致性。
+- 空路径允许，是因为它会回落到默认的 `RF_SOURCE_PATH`。
+- 非 `/dev/rf433` 直接 `EINVAL`，不是 warn 后继续。
+- 即使路径字符串对了，也必须通过 `stat()` 证明它是字符设备，普通文件同样会被拒绝。
 
-你要抓住的点是：
+### 3.2 打开时还要确认字符设备
 
-- `rf_source_is_supported_path()` 不是做安全模型，它只是做路径收口
-- `rf_source_is_char_device()` 不是为了好看，而是为了在打开前就排除普通文件
-- `rf_source_close()` 只负责 `close(fd)`，不做额外语义
+`rf_source_open()` 不只是 `open()`，还会先用 `stat()` 检查目标是不是字符设备。通过后才以 `O_RDONLY | O_NONBLOCK` 打开。
 
-这说明 `rf_source` 不是抽象层，而是极薄的一层设备适配壳。
+这一步非常重要，因为它明确说明当前程序预期面对的是“驱动导出的设备节点”，不是普通文件、不是串口日志文件，也不是 PC 仿真输入。
 
-## 3. `rf_epoll.c/h`：事件泵只负责“持续喂帧”
+## 4. `rf_epoll`：把定长驱动帧接成事件循环
 
-### 3.1 配置结构
+`rf_epoll_run()` 的工作可以拆成两部分：
 
-```c
-typedef struct {
-    int rf_fd;
-    rf_epoll_on_frame_fn on_frame;
-    rf_epoll_on_stats_fn on_stats;
-    int stats_interval_s;
-    rf_epoll_stats_t *stats;
-    void *user;
-} rf_epoll_config_t;
-```
+### 4.1 监听 `/dev/rf433`
 
-这段的作用是把事件泵做成“通用调度器”，而不是绑定具体业务。
+当 `epoll` 报告 `rf_fd` 可读时，`consume_frames()` 会循环 `read()`：
 
-- 依赖：`rf_frame_t`、回调函数类型、统计结构体。
-- 输入：fd、回调、统计间隔、用户指针。
-- 输出：回调驱动的事件流。
-- 去向：`main.c` 的 `on_rf_frame()` 和 `on_drv_stats()`。
-- 为什么这样设计：不是把业务逻辑写进 epoll 循环里，而是用回调把数据面和观测面拆开。
+- 每次读一个完整 `struct rf433_frame`
+- 取出其中的 `pulse_count`
+- 把 `pulse[]` 搬进 `rf_frame_t`
+- 再把 `timestamp_ns` 和 `seq` 作为独立参数传给回调
 
-### 3.2 `consume_frames()`：把驱动帧搬成用户帧
+注意这个转换很有层次感：
+
+- `rf_frame_t` 只保留共享脉冲帧语义
+- 驱动补充的 `timestamp_ns` / `seq` 作为附加元数据单独向上传递
+
+来源：`project2_master/linux_app/rf_epoll.c`，函数：`consume_frames()`，作用：把驱动导出的 `struct rf433_frame` 搬成共享层 `rf_frame_t`，再把 `timestamp_ns/seq` 单独上推给回调。
 
 ```c
-while (1) {
-    n = read(cfg->rf_fd, &drv_frame, sizeof(drv_frame));
-    if (n < 0) {
-        if (errno == EINTR) { ... continue; }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { ... return 0; }
-        ... return -1;
-    }
-    if (n == 0) { ... return -2; }
-    if ((size_t)n < sizeof(drv_frame)) { ... continue; }
+static int consume_frames(const rf_epoll_config_t *cfg) {
+    struct rf433_frame drv_frame;
+    rf_frame_t frame;
+    ssize_t n;
 
-    memset(&frame, 0, sizeof(frame));
-    frame.len = drv_frame.pulse_count;
-    if (frame.len > RF_BUFFER_SIZE) {
-        frame.len = (uint16_t)RF_BUFFER_SIZE;
-    }
-    memcpy(frame.pulse, drv_frame.pulse, frame.len * sizeof(uint16_t));
+    while (1) {
+        n = read(cfg->rf_fd, &drv_frame, sizeof(drv_frame));
+        if (n < 0) {
+            if (errno == EINTR) {
+                if (cfg->stats != NULL) {
+                    cfg->stats->read_eintr++;
+                }
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (cfg->stats != NULL) {
+                    cfg->stats->read_eagain++;
+                }
+                return 0;
+            }
+            if (cfg->stats != NULL) {
+                cfg->stats->read_error++;
+            }
+            fprintf(stderr, "[RF_IO] read failed: errno=%d (%s)\n", errno, strerror(errno));
+            return -1;
+        }
+        if (n == 0) {
+            if (cfg->stats != NULL) {
+                cfg->stats->read_eof++;
+            }
+            fprintf(stderr, "[RF_IO] read returned EOF on rf_fd=%d\n", cfg->rf_fd);
+            return -2;
+        }
+        if ((size_t)n < sizeof(drv_frame)) {
+            if (cfg->stats != NULL) {
+                cfg->stats->short_read++;
+            }
+            fprintf(stderr, "[RF_IO] short read from driver: %zd/%zu\n", n, sizeof(drv_frame));
+            continue;
+        }
 
-    if (cfg->on_frame != NULL) {
-        if (cfg->on_frame(&frame, drv_frame.timestamp_ns, drv_frame.seq, cfg->user) != 0) {
-            return 1;
+        memset(&frame, 0, sizeof(frame));
+        frame.len = drv_frame.pulse_count;
+        if (frame.len > RF_BUFFER_SIZE) {
+            frame.len = (uint16_t)RF_BUFFER_SIZE;
+        }
+        memcpy(frame.pulse, drv_frame.pulse, frame.len * sizeof(uint16_t));
+
+        if (cfg->on_frame != NULL) {
+            if (cfg->on_frame(&frame, drv_frame.timestamp_ns, drv_frame.seq, cfg->user) != 0) {
+                return 1;
+            }
         }
     }
 }
 ```
 
-这段的作用是把驱动层 `struct rf433_frame` 搬运成用户态 `rf_frame_t`，然后交给上层处理。
+这段代码很值得对着 driver ABI 一起看：
 
-- 依赖：驱动 `read()` 结果、`RF_BUFFER_SIZE`、`on_frame` 回调。
-- 输入：驱动帧、时间戳、序号。
-- 输出：用户帧和回调结果。
-- 去向：`main.c` 的 `on_rf_frame()`。
-- 为什么这样设计：不是让上层直接碰驱动结构，而是先把数据复制成通用的用户态协议帧。这样上层只认 `rf_frame_t`，不关心驱动私有布局。
+- `read()` 返回的是 `struct rf433_frame`，但用户态业务链立刻把它降成共享层 `rf_frame_t`。
+- `timestamp_ns` 和 `seq` 没有被塞进 `rf_frame_t`，而是作为并列参数传给 `on_frame` 回调。
+- `short_read` 被显式当成异常路径处理，说明这条链假设 driver ABI 必须是一帧一个完整 struct。
 
-这里要抓住三种读路径：
+### 4.2 定时拉取驱动统计
 
-- `EINTR`：继续读
-- `EAGAIN/EWOULDBLOCK`：当前没数据，退出本轮消费
-- `short read` / `EOF` / 其他错误：计入统计并返回失败
+`rf_epoll_run()` 还会创建 `timerfd`。当前 `main.c` 把统计间隔设为 5 秒，所以每 5 秒会调用一次 `on_drv_stats()`：
 
-这说明 `rf_epoll` 不是“读一次就完”，而是“把设备内可读的数据一次性清空”。
+1. 通过 ioctl 刷新驱动统计和状态
+2. 发出一条 `device_status`
+3. 再发出一条 `rf_stats`
 
-### 3.3 `rf_epoll_run()`：一个 epoll 同时管理数据和统计
+这就是为什么即使一段时间没有新的解码事件，Qt 和日志仍然能看到状态更新。
+
+来源：`project2_master/linux_app/rf_epoll.c`，函数：`rf_epoll_run()`，作用：把 `/dev/rf433` 和 `timerfd` 编织进同一个 epoll 循环。
 
 ```c
-epfd = epoll_create1(0);
-epoll_ctl(epfd, EPOLL_CTL_ADD, cfg->rf_fd, &ev);
-...
-if (cfg->on_stats != NULL && cfg->stats_interval_s > 0) {
-    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    ...
-    epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev);
-}
+int rf_epoll_run(const rf_epoll_config_t *cfg) {
+    int epfd = -1;
+    int timer_fd = -1;
+    struct epoll_event ev;
+    struct epoll_event events[8];
+    int nfds = 0;
+    int i = 0;
+    int rc = 0;
 
-while (1) {
-    nfds = epoll_wait(epfd, events, ..., -1);
-    ...
-    if (events[i].data.fd == cfg->rf_fd) {
-        rc = consume_frames(cfg);
-        if (rc != 0) {
+    if (cfg == NULL || cfg->rf_fd < 0 || cfg->on_frame == NULL) {
+        return -1;
+    }
+
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        return -2;
+    }
+
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.fd = cfg->rf_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfg->rf_fd, &ev) != 0) {
+        close(epfd);
+        return -3;
+    }
+
+    if (cfg->on_stats != NULL && cfg->stats_interval_s > 0) {
+        struct itimerspec its;
+        timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (timer_fd >= 0) {
+            memset(&its, 0, sizeof(its));
+            its.it_value.tv_sec = cfg->stats_interval_s;
+            its.it_interval.tv_sec = cfg->stats_interval_s;
+            timerfd_settime(timer_fd, 0, &its, NULL);
+            memset(&ev, 0, sizeof(ev));
+            ev.events = EPOLLIN;
+            ev.data.fd = timer_fd;
+            epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev);
+        }
+    }
+
+    while (1) {
+        nfds = epoll_wait(epfd, events, (int)(sizeof(events) / sizeof(events[0])), -1);
+        if (nfds < 0) {
+            if (errno == EINTR) {
+                if (cfg->stats != NULL) {
+                    cfg->stats->epoll_eintr++;
+                }
+                continue;
+            }
+            if (cfg->stats != NULL) {
+                cfg->stats->epoll_error++;
+            }
+            fprintf(stderr, "[RF_IO] epoll_wait failed: errno=%d (%s)\n", errno, strerror(errno));
+            rc = -4;
             goto out;
         }
-    } else if (timer_fd >= 0 && events[i].data.fd == timer_fd) {
-        (void)read(timer_fd, &expirations, sizeof(expirations));
-        if (cfg->on_stats != NULL) {
-            cfg->on_stats(cfg->rf_fd, cfg->user);
+        for (i = 0; i < nfds; ++i) {
+            if (events[i].data.fd == cfg->rf_fd) {
+                if ((events[i].events & (EPOLLERR | EPOLLHUP)) != 0u) {
+                    fprintf(
+                        stderr,
+                        "[RF_IO] epoll event=0x%X on rf_fd=%d (ERR/HUP)\n",
+                        (unsigned)events[i].events,
+                        cfg->rf_fd
+                    );
+                }
+                if ((events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)) == 0u) {
+                    continue;
+                }
+                rc = consume_frames(cfg);
+                if (rc != 0) {
+                    goto out;
+                }
+            } else if (timer_fd >= 0 && events[i].data.fd == timer_fd) {
+                uint64_t expirations;
+                (void)read(timer_fd, &expirations, sizeof(expirations));
+                if (cfg->on_stats != NULL) {
+                    cfg->on_stats(cfg->rf_fd, cfg->user);
+                }
+            }
         }
     }
+
+out:
+    if (timer_fd >= 0) {
+        close(timer_fd);
+    }
+    close(epfd);
+    return rc;
 }
 ```
 
-这段的作用是把数据泵和观测泵放在同一个事件循环里。
-你要抓住的点是：这里的“回压”是自然形成的，不是显式队列控制。`consume_frames()` 一直读到 `EAGAIN` 才停，说明内核里可读的数据已经清空；如果 `on_frame()` 返回非 0，事件泵就把退出信号往上抛，不再继续喂后面的帧；如果设备读到 EOF 或真错误，`rf_epoll_run()` 也会收掉整个循环。
+`rf_epoll_run()` 不是只盯 `rf_fd` 的简单双循环，它把“业务帧输入”和“统计心跳”放到了同一个调度点上，所以 `device_status/rf_stats/rf_event` 三种消息天然来自同一条主链。
 
-- 依赖：`epoll`、`timerfd`、`consume_frames()`。
-- 输入：`rf_fd` 以及 `stats_interval_s`。
-- 输出：连续的帧处理回调和周期统计回调。
-- 去向：帧流进 `on_rf_frame()`，统计流进 `on_drv_stats()`。
-- 为什么这样设计：不是单开线程去拉统计，也不是在主循环里睡眠轮询，而是让 `epoll` 同时管两类 fd。这样结构简单、时序稳定、没有额外线程同步成本。
+## 5. 解码层：`rf_decode` 与 `rf_decode_c`
 
-你要抓住的点是：
+### 5.1 `rf_decode_frame()`
 
-- `EPOLLIN` 触发时才去 `read()`，避免忙等
-- `timerfd` 触发时才去查统计，避免频繁 `ioctl`
-- `cfg->on_frame()` 返回非 0 时，整个事件泵退出
+这一层是业务解码入口。当前实现只调了一个算法分支：
 
-这说明 `rf_epoll` 只负责“把该喂的东西按事件喂出去”，并不决定业务是否继续。
-### 3.4 事件泵与回压时序
+- `rf_decode_ev1527_c_with_stats()`
 
-这段再把时序说死一点：不是“有事件就打印”，而是“有事件就尽量消化，再决定发不发，发完再回到等待”。
+成功时，它会把结果转成：
 
-- `epoll_wait()` 唤醒后，先看 `rf_fd` 可不可读。
-- 如果可读，就进 `consume_frames()`，把一批驱动帧搬成一批 `rf_frame_t`。
-- 每一帧回到 `main.c` 后，先 `decode`，再做低置信度过滤、稳定分组、重复抑制，最后才 `publish`。
-- 只要 `read()` 还在继续返回数据，本轮就继续消化；一旦触到 `EAGAIN/EWOULDBLOCK`，说明本轮收干净了，回去等下一次唤醒。
-- 如果 `on_frame()` 在某个业务阈值上返回非 0，说明不是“读不动了”，而是“策略上要停了”，这时事件泵直接退出。
-- `timerfd` 触发的是统计回调，不参与帧数据通路，所以它不会改变 `publish` 的节奏，只负责把后台状态暴露出来。
+- `addr`
+- `key`
+- `raw_code`
+- `confidence`
+- `source = "c"`
 
-不是 `read -> print -> read`，而是 `read -> consume -> decode -> publish -> wait`。这个顺序一旦看清楚，你就能把“堵塞”“丢帧”“唤醒”“退出”四件事连起来看。
+因此 `addr/key/conf` 的来源非常明确：它们是用户态 EV1527 解码结果，不是共享协议字段，更不是驱动字段。
 
-## 4. `rf_decode.c/h`：适配层，不是算法层
-
-### 4.1 代码
+来源：`project2_master/linux_app/rf_decode.c`，函数：`rf_decode_frame()`，作用：调用 C 版 EV1527 解码器，填充统一的用户态结果结构，并记录耗时统计。
 
 ```c
-int rf_decode_frame(const rf_frame_t *frame, rf_decoded_packet_t *out) {
-    ...
+int rf_decode_frame(
+    const rf_frame_t *frame,
+    rf_decoded_packet_t *out
+) {
+    unsigned long long t0, t1;
+    rf_decode_result_c_t c_result;
+    int c_rc;
+
+    if (frame == NULL || out == NULL) {
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    memset(&g_rf_last_call_stats, 0, sizeof(g_rf_last_call_stats));
     g_rf_last_call_stats.frame_len = frame->len;
 
     t0 = rf_now_us();
@@ -605,6 +538,7 @@ int rf_decode_frame(const rf_frame_t *frame, rf_decoded_packet_t *out) {
         snprintf(out->source, sizeof(out->source), "c");
         out->raw_code = c_result.raw_code;
         out->confidence = c_result.confidence;
+        g_rf_last_call_stats.rc = 0;
         g_rf_last_call_stats.c_ok = 1;
         g_rf_decode_stats.c_accepts++;
         g_rf_decode_stats.c_accept_total_us += g_rf_last_call_stats.c_total_us;
@@ -616,345 +550,650 @@ int rf_decode_frame(const rf_frame_t *frame, rf_decoded_packet_t *out) {
 }
 ```
 
-这段的作用是把算法结果包装成统一输出，并记录本次调用的性能统计。
+这里可以直接看出 `rf_gateway` 里的高层字段从哪里长出来：
 
-- 依赖：`rf_decode_ev1527_c_with_stats()`、`clock_gettime()`、全局统计缓存。
-- 输入：一帧 `rf_frame_t`。
-- 输出：标准化 packet 和调用统计。
-- 去向：`main.c` 的 `on_rf_frame()`。
-- 为什么这样设计：不是让业务层直接接触 EV1527 算法结构，而是让它只看到统一 packet。这样未来如果换 decode 算法，`main.c` 的业务逻辑不用改。
+- `addr` 是 `raw_code` 的十六进制格式化结果。
+- `key` 来自 `button4`，不是驱动里已有字段。
+- `source` 被显式写成 `"c"`，说明当前 decode 路由没有多后端协商，只有 C 实现这一条。
 
-你要抓住的点是：
+### 5.2 `rf_decode_c` 的角色
 
-- `rf_decode` 不是“第二套算法”，而是“结果适配器 + 统计器”
-- 当前实现把成功结果标成 `source="c"`
-- 当前实现把算法失败统一折叠成 `RF_DECODE_RC_NO_FRAME`
+`rf_decode_c.c` 是真正的 EV1527 波形识别算法所在位置。就当前代码事实看：
 
-这说明 `main.c` 里看到的 `decode_no_frame`，在当前实现下基本对应“这帧没有被 EV1527 C 解码器接受”，而不是驱动读失败。
+- 它根据脉冲宽度推导时钟
+- 识别同步区和数据区
+- 评分并选出最佳候选
+- 最终产出 `raw_code`、按钮位、置信度等结果
 
-### 4.2 统计联动
+文档在这里不展开算法细节，只保留一个关键事实：
 
-```c
-void rf_decode_get_runtime_stats(rf_decode_runtime_stats_t *out) {
-    if (out == NULL) {
-        return;
-    }
-    *out = g_rf_decode_stats;
-}
+解码发生在用户态，而且只在 `rf_gateway` 里发生。
 
-void rf_decode_get_last_call_stats(rf_decode_last_call_stats_t *out) {
-    if (out == NULL) {
-        return;
-    }
-    *out = g_rf_last_call_stats;
-}
-```
+## 6. 事件策略层：稳定分组、近邻合并、重复抑制
 
-这段的作用是把“累计统计”和“最近一次调用统计”分开。
-这也对应着所有权边界：`rf_decode` 内部拿着自己的静态统计缓存，但它不接管上层 packet，也不接管上层输入帧。`main.c` 只是在读这些观测值，不是在和 `rf_decode` 共享可变所有权。
+`main.c` 在解码成功后不会立刻发布事件，而是继续做三层过滤。
 
-### 4.3 异常路径与退出顺序
-
-这段要单独抓住，因为它决定了统计是不是会丢尾巴。
-
-- `EINTR`
-  - 语义是被信号打断，不是读错。
-  - 处理方式是继续读或继续等，不要把它当成退出条件。
-- `EAGAIN` / `EWOULDBLOCK`
-  - 语义是本轮已经把可读数据消化完了。
-  - 处理方式是回到 `epoll_wait()`，让下一次事件唤醒再继续。
-- `EOF` / `read() == 0`
-  - 语义是输入口真的收尾了，事件泵要退出。
-  - 处理方式是向上返回，让 `main.c` 进入统一收口。
-- 其他真错误
-  - 语义是设备通路异常，不能再假装继续。
-  - 处理方式是计入错误并退出当前循环。
-
-你要抓住的点是：退出顺序不是“谁先碰到就谁先打印”，而是“先让事件泵停下来，保住 `ctx` 和统计对象，再由 `main.c` 发出 `rf_stats` / `device_status` 收口消息，最后关闭 `rf_fd`”。这样 JSON envelope 带出来的仍是同一份完整状态，不会因为提前 close 或提前清零把尾巴抹掉。
-
-- 依赖：全局统计对象。
-- 输入：无。
-- 输出：runtime 级统计或 last-call 级统计。
-- 去向：`main.c` 在打印和分析时使用。
-- 为什么这样设计：不是把所有统计都塞成一个大表，而是把持续趋势和单次观测拆开。前者看长期，后者看当前帧。
-
-## 5. `rf_decode_c.c/h`：EV1527 识别本体
-
-### 5.1 先看数据流
+来源：`project2_master/linux_app/main.c`，函数：`on_rf_frame()`，作用：接住一帧共享 pulse frame，完成掉帧统计、解码、低置信度过滤、稳定分组、重复抑制和最终发布。
 
 ```c
-int rf_decode_ev1527_c_with_stats(const rf_frame_t *frame, rf_decode_result_c_t *out, rf_decode_stage_stats_t *stats) {
-    rf_run_t runs[RF_BUFFER_SIZE];
-    uint16_t run_count = 0u;
-    rf_decode_result_c_t best;
-    int found = 0;
-    int phase = 0;
+static int on_rf_frame(const rf_frame_t *frame, uint64_t timestamp_ns, uint32_t drv_seq, void *user) {
+    app_ctx_t *ctx = (app_ctx_t *)user;
+    rf_decoded_packet_t pkt;
+    rf_decode_last_call_stats_t call_stats;
+    char payload[JSON_PAYLOAD_CAPACITY];
+    int rc = 0;
 
-    for (phase = 1; phase >= 0; --phase) {
-        rf_decode_result_c_t phase_best;
-        build_runs_from_frame(frame, phase, runs, &run_count);
-        if (decode_best_from_runs(runs, run_count, &phase_best, stats) != 0) {
-            continue;
+    if (ctx == NULL || frame == NULL) {
+        return -1;
+    }
+
+    if (ctx->has_drv_seq && drv_seq > ctx->drv_seq_prev) {
+        const uint32_t gap = drv_seq - ctx->drv_seq_prev - 1u;
+        if (gap > 0u) {
+            if (ctx->drv_drop > (0xFFFFFFFFu - gap)) {
+                ctx->drv_drop = 0xFFFFFFFFu;
+            } else {
+                ctx->drv_drop += gap;
+            }
         }
-        ...
     }
-}
-```
+    ctx->drv_seq_prev = drv_seq;
+    ctx->has_drv_seq = 1;
 
-这段的作用是把一帧脉冲做成可搜索的 run 序列，然后在两种起始极性上都试一遍。
-
-- 依赖：`rf_frame_t`、`rf_run_t`、统计结构体。
-- 输入：脉冲宽度数组。
-- 输出：最佳候选 `rf_decode_result_c_t`。
-- 去向：`rf_decode.c` 的包装层。
-- 为什么这样设计：不是假设帧一定从固定高低电平开始，而是两种相位都试。这样更抗输入边界的不确定性。
-
-你要抓住的点是：`rf_decode_c` 是“算法本体”，它不负责打印、不负责发布、不负责重复抑制，它只负责“这一帧像不像 EV1527，像的话最像哪个码”。
-
-### 5.2 `build_runs_from_frame()`：先把脉冲变成 run
-
-```c
-static void build_runs_from_frame(const rf_frame_t *frame, int start_level, rf_run_t *runs_out, uint16_t *run_count_out) {
-    ...
-    for (i = 0u; i < frame->len && i < RF_BUFFER_SIZE; ++i) {
-        const uint16_t sample_len = us_to_samples(frame->pulse[i]);
-        runs_out[i].level = level;
-        runs_out[i].start = cursor;
-        runs_out[i].length = sample_len;
-        cursor = (uint16_t)(cursor + sample_len);
-        level = level ? 0 : 1;
-        *run_count_out = (uint16_t)(*run_count_out + 1u);
+    ctx->frames_total++;
+    ctx->frame_seq++;
+    rc = rf_decode_frame(frame, &pkt);
+    memset(&call_stats, 0, sizeof(call_stats));
+    rf_decode_get_last_call_stats(&call_stats);
+    if (rc != 0) {
+        if (rc == RF_DECODE_RC_NO_FRAME) {
+            ctx->decode_no_frame++;
+        } else {
+            ctx->decode_err++;
+        }
+        return 0;
     }
-}
-```
+    ctx->decode_ok++;
 
-这段的作用是把微秒脉宽转成固定采样率下的 run 序列。
-
-- 依赖：`EV1527_SAMPLE_RATE`、`us_to_samples()`。
-- 输入：原始脉宽数组和起始电平。
-- 输出：run 数组和 run 数量。
-- 去向：后面的结构检查和打分。
-- 为什么这样设计：不是直接拿脉宽硬怼协议公式，而是先统一成“高/低 run 的时长序列”。这样后面的窗口搜索、周期估计和误差评分都更顺。
-
-### 5.3 `decode_best_from_runs()`：先结构，再时序，再评分
-
-这部分是核心，逻辑顺序非常重要。
-
-#### 5.3.1 先找合法窗口
-
-```c
-for (i = 1u; i < (uint16_t)(run_count - (uint16_t)(2u * EV1527_BITS)); ++i) {
-    if (runs[i - 1u].level != 1 || runs[i].level != 0) {
-        continue;
+    if (pkt.confidence < ctx->min_publish_confidence) {
+        ctx->low_conf_drop++;
+        return 0;
     }
-    sync_high = (float)runs[i - 1u].length;
-    sync_low = (float)runs[i].length;
-    ...
-}
-```
 
-这段的作用是先锁定“看起来像同步头”的位置。
-
-- 依赖：run 序列、`EV1527_BITS`。
-- 输入：run 数组和运行长度。
-- 输出：一个候选起点。
-- 去向：后续比特检查和置信度计算。
-- 为什么这样设计：不是一上来就算每一位，而是先把明显不对的窗口全部排除。这样计算量更低，误判更少。
-
-#### 5.3.2 再检查位级结构
-
-```c
-for (b = 0u; b < (uint16_t)(2u * EV1527_BITS); ++b) {
-    const int expected_level = ((b & 1u) == 0u) ? 1 : 0;
-    if (runs[bit_start + b].level != expected_level) {
-        break;
+    if (ctx->stable_repeat > 1u) {
+        int idx = -1;
+        rf_stable_group_t *g = NULL;
+        stable_groups_decay(ctx);
+        idx = stable_group_find(ctx, pkt.raw_code);
+        if (idx < 0) {
+            idx = stable_group_alloc(ctx);
+            if (idx >= 0) {
+                stable_group_seed(
+                    &ctx->stable_groups[idx],
+                    pkt.raw_code,
+                    pkt.confidence,
+                    ctx->frame_seq
+                );
+            }
+            ctx->stable_drop++;
+            return 0;
+        }
+        g = &ctx->stable_groups[idx];
+        stable_group_update(g, pkt.raw_code, pkt.confidence, ctx->frame_seq);
+        if (g->hits < ctx->stable_repeat) {
+            ctx->stable_drop++;
+            return 0;
+        }
+        pkt.raw_code = g->best_code & 0xFFFFFFu;
+        snprintf(pkt.addr, sizeof(pkt.addr), "0x%06X", pkt.raw_code & 0xFFFFFFu);
+        snprintf(pkt.key, sizeof(pkt.key), "%u", (unsigned)(pkt.raw_code & 0x0Fu));
+        if (g->best_conf > pkt.confidence) {
+            pkt.confidence = g->best_conf;
+        }
     }
+
+    if (
+        ctx->has_last_code &&
+        pkt.raw_code == ctx->last_code &&
+        (ctx->frame_seq - ctx->last_publish_seq) < (uint32_t)ctx->publish_gap
+    ) {
+        ctx->dup_drop++;
+        return 0;
+    }
+
+    if (build_rf_event_payload(payload, sizeof(payload), ctx, frame, &pkt, &call_stats, timestamp_ns, drv_seq) != 0) {
+        fprintf(stderr, "[RF_JSON] failed to assemble rf event payload\n");
+        return 0;
+    }
+
+    (void)emit_protocol_message(ctx, "rf_event", MQTT_TOPIC_RF_EVENT, payload, 0);
+    ctx->last_code = pkt.raw_code;
+    ctx->has_last_code = 1;
+    ctx->last_publish_seq = ctx->frame_seq;
+    ctx->published++;
+    return 0;
 }
 ```
 
-这段的作用是确认数据段高低交替结构没乱。
+三层策略其实就直接写在这个函数里：
 
-- 依赖：协议位序和 run 极性。
-- 输入：候选起点后的连续 run。
-- 输出：通过或拒绝该候选。
-- 去向：只有通过结构检查才进入时序评分。
-- 为什么这样设计：不是只看时间长短，而是把“结构正确性”先作为门槛。EV1527 的核心不是任意脉宽，而是固定的高低组合模式。
+- `drv_seq` 差值先换算成 `drv_drop`，说明用户态还能反推 driver 队列是否跳号。
+- `min_publish_confidence`、`stable_repeat`、`publish_gap` 不是抽象设计，而是这里真实执行的三道门。
+- 真正对外发布前，代码先调用 `build_rf_event_payload()`，再走 `emit_protocol_message()`，所以 JSON 契约和 MQTT 旁路都是这一层生成的。
 
-#### 5.3.3 再估计时钟
+### 6.1 低置信度过滤
 
-```c
-totals[b] = runs[bit_start + 2u * b].length + runs[bit_start + 2u * b + 1u].length;
-clk_from_totals = (float)upper_median_u16(totals, EV1527_BITS) / pair_t;
-clk_from_sync = sync_low / EV1527_PROFILE_SYNC_LOW_T;
-clk = 0.80f * clk_from_totals + 0.20f * clk_from_sync;
-```
+如果 `pkt.confidence < min_publish_confidence`，当前帧直接丢弃，记入 `low_conf_drop`。
 
-这段的作用是从数据位和同步头两边共同估计基础时钟。
+### 6.2 稳定分组
 
-- 依赖：`upper_median_u16()`、同步头长度、每位总时长。
-- 输入：当前候选窗口的 run 长度。
-- 输出：`clk`。
-- 去向：后面每个 bit 的误差评价。
-- 为什么这样设计：不是完全相信同步头，也不是完全相信数据位，而是做加权融合。这样更抗量化误差和局部抖动。
+如果 `stable_repeat > 1`，程序会把最近若干帧按 `raw_code` 做近邻分组：
 
-#### 5.3.4 再按位计算双假设误差
+- `stable_group_find()` 用 Hamming 距离匹配近邻
+- `stable_group_seed()` 建组
+- `stable_group_update()` 更新最佳码值和置信度
 
-```c
-const float err0 =
-    rel_err_quantized(hi, EV1527_PROFILE_BIT_SHORT_T * clk) +
-    rel_err_quantized(lo, EV1527_PROFILE_BIT_LONG_T * clk);
-const float err1 =
-    rel_err_quantized(hi, EV1527_PROFILE_BIT_LONG_T * clk) +
-    rel_err_quantized(lo, EV1527_PROFILE_BIT_SHORT_T * clk);
-...
-if (err1 < err0) {
-    code = (code << 1u) | 1u;
-} else {
-    code = (code << 1u);
+默认参数下，这意味着单帧解码成功并不一定立刻对外发布；需要一定重复确认后才会出事件。
+
+### 6.3 重复抑制
+
+即使稳定分组通过了，如果当前 `raw_code` 与上次已发布事件一致，且距离上次发布的帧间隔小于 `publish_gap`，也会被当成重复事件压掉。
+
+这就是为什么最终看到的 `rf_event` 数量通常会小于驱动读到的总帧数。
+
+## 7. `stdout JSON envelope` 是这层最重要的输出契约
+
+### 7.1 根对象格式
+
+`build_protocol_line()` 组装的根对象长这样：
+
+```json
+{
+  "type": "rf_event",
+  "topic": "argi/device/rk3568-001/rf/event",
+  "mqtt_published": true,
+  "payload": {"device_id":"rk3568-001","type":"rf_event"}
 }
 ```
 
-这段的作用是对每一位同时试 `0` 和 `1` 两种解释，选误差更小的一边。
+这四个根字段必须分清：
 
-- 依赖：短脉冲/长脉冲比例模板。
-- 输入：每位高低 run 长度。
-- 输出：逐位拼出的 `code` 和 bit 误差。
-- 去向：候选打分。
-- 为什么这样设计：不是假设信号一定完美符合某一边，而是让误差最小的假设胜出。这样更适合真实采样里有噪声、有量化误差的情况。
+- `type`
+  Qt 用它决定当前是哪种消息。
+- `topic`
+  当前代码里的实际 MQTT topic。
+- `mqtt_published`
+  这一次 publish 是否成功。
+- `payload`
+  真正的业务内容。
 
-#### 5.3.5 最后不是“能解就行”，而是“分数够不够高”
-
-```c
-raw_conf = 1.0f - (
-    0.41f * bit_norm +
-    0.19f * jitter_norm +
-    0.14f * spread_norm +
-    0.03f * outlier_norm +
-    0.08f * sync_error_norm +
-    0.05f * sync_ratio_penalty +
-    0.10f * low_penalty
-);
-conf = fmaxf(0.0f, raw_conf) * fminf(1.0f, low_ratio / 2.2f);
-```
-
-这段的作用是把多个质量维度压成一个 `confidence`。
-
-- 依赖：bit error、周期抖动、同步误差、低脉冲比例等指标。
-- 输入：候选窗口的整体统计。
-- 输出：候选置信度。
-- 去向：`best_out` 的最终选择。
-- 为什么这样设计：不是只看“能不能拼出 24 位”，而是看“这帧是不是整体像 EV1527”。这就是为什么上层还能再做 `min_publish_confidence`。
-
-#### 5.3.6 选择最佳候选
+来源：`project2_master/linux_app/main.c`，函数：`build_protocol_line()`，作用：把具体 payload 包上一层统一根对象，形成给 Qt 和日志消费的 `stdout JSON envelope`。
 
 ```c
-if (!found || conf > best_conf || ... ) {
-    best_conf = conf;
-    best_out->raw_code = code & 0xFFFFFFu;
-    best_out->address20 = (code >> 4u) & 0xFFFFFu;
-    best_out->button4 = (uint8_t)(code & 0x0Fu);
-    best_out->clk_us = ...
-    best_out->confidence = conf;
-    best_out->bit_error = bit_error;
-    best_out->sync_error = sync_error;
-    best_out->period_jitter = period_jitter;
-    best_out->start_index = (uint16_t)(i - 1u);
-    found = 1;
+static int build_protocol_line(
+    char *line,
+    size_t line_capacity,
+    const char *type,
+    const char *subtopic,
+    int mqtt_published,
+    const char *payload_json
+) {
+    size_t offset = 0u;
+
+    if (
+        line == NULL ||
+        type == NULL ||
+        subtopic == NULL ||
+        payload_json == NULL
+    ) {
+        return -1;
+    }
+
+    if (
+        appendf(
+            line,
+            line_capacity,
+            &offset,
+            "{\"type\":\"%s\",\"topic\":\"%s/%s\",\"mqtt_published\":%s,\"payload\":%s}",
+            type,
+            MQTT_TOPIC_ROOT,
+            subtopic,
+            json_bool(mqtt_published),
+            payload_json
+        ) != 0
+    ) {
+        return -1;
+    }
+
+    return 0;
 }
 ```
 
-这段的作用是把最佳候选的全部可观测量一次性封装出来。
+这里非常关键的一点是：根对象里的 `topic` 和 `mqtt_published` 本质上是“附加传输元信息”，真正的业务字段都还在 `payload` 里。
 
-- 依赖：候选比较规则。
-- 输入：当前候选分数和历史最佳分数。
-- 输出：`rf_decode_result_c_t`。
-- 去向：`rf_decode.c` 再包装成打印结果。
-- 为什么这样设计：不是只保留 `raw_code`，而是把为什么选中它的依据也保留下来。这样上层能做更细的策略和调试。
+### 7.2 这不是纯 MQTT 协议
 
-### 5.4 `rf_decode_stage_stats_t` 是两级门控的可观测点
+根对象存在的意义不是“给 broker 看”，而是“给本地消费者和日志看”。`rf_gateway` 会先生成这条 JSON，再决定是否旁路发 MQTT。
+
+所以：
+
+- Qt 读的是这条本地 JSON 行
+- MQTT 只是这条 payload 的额外输出
+- 即使 MQTT 没连上，Qt 仍可以继续工作
+
+## 8. 三种 payload 的职责
+
+### 8.1 `device_status`
+
+这类消息描述网关当前状态和驱动摘要，例如：
+
+- `rf_input`
+- `rf_online`
+- `mqtt_connected`
+- 驱动统计摘要
+- 稳定分组参数
+- `reason`（如 `startup`、`driver_stats`、`shutdown`）
+
+它更像“状态心跳”。
+
+### 8.2 `rf_stats`
+
+这类消息偏统计：
+
+- `frames_total`
+- `decode_ok`
+- `decode_no_frame`
+- `decode_err`
+- `low_conf_drop`
+- `stable_drop`
+- `dup_drop`
+- `drv_drop`
+- driver/io 路径统计
+
+它更像“调优和观测面”。
+
+### 8.3 `rf_event`
+
+这类消息才是 Qt RF 页面最关心的业务事件。它包含：
+
+- `addr`
+- `key`
+- `conf` / `confidence`
+- `src` / `source`
+- `seq`
+- `drv_seq`
+- `timestamp_ns`
+- `decode_us`
+- `pulse_count`
+- `pulse_us[]`
+
+其中最关键的是 `pulse_us[]`。Qt 波形预览直接用的就是这个数组，而不是 UI 侧重新推断出的假波形。
+
+来源：`project2_master/linux_app/main.c`，函数：`build_rf_event_payload()`，作用：把 decode 结果、driver 元数据和原始脉冲数组打进 `rf_event.payload`。
 
 ```c
-typedef struct {
-    uint16_t step1_structural;
-    uint16_t step2_timing;
-} rf_decode_stage_stats_t;
+static int build_rf_event_payload(
+    char *payload,
+    size_t capacity,
+    const app_ctx_t *ctx,
+    const rf_frame_t *frame,
+    const rf_decoded_packet_t *pkt,
+    const rf_decode_last_call_stats_t *call_stats,
+    uint64_t timestamp_ns,
+    uint32_t drv_seq
+) {
+    size_t offset = 0u;
+    uint16_t i = 0u;
+
+    if (
+        payload == NULL ||
+        ctx == NULL ||
+        frame == NULL ||
+        pkt == NULL ||
+        call_stats == NULL
+    ) {
+        return -1;
+    }
+    if (
+        appendf(
+            payload,
+            capacity,
+            &offset,
+            "{"
+            "\"device_id\":\"%s\","
+            "\"type\":\"rf_event\","
+            "\"rf_input\":\"%s\","
+            "\"addr\":\"%s\","
+            "\"key\":\"%s\","
+            "\"conf\":%.4f,"
+            "\"confidence\":%.4f,"
+            "\"src\":\"%s\","
+            "\"source\":\"%s\","
+            "\"seq\":%u,"
+            "\"drv_seq\":%u,"
+            "\"timestamp_ns\":%llu,"
+            "\"decode_us\":%llu,"
+            "\"mqtt_connected\":%s,"
+            "\"pulse_count\":%u,"
+            "\"pulse_us\":[",
+            MQTT_DEVICE_ID,
+            ctx->rf_input,
+            pkt->addr,
+            pkt->key,
+            pkt->confidence,
+            pkt->confidence,
+            pkt->source,
+            pkt->source,
+            (unsigned)ctx->frame_seq,
+            (unsigned)drv_seq,
+            (unsigned long long)timestamp_ns,
+            (unsigned long long)call_stats->total_us,
+            json_bool(mqtt_publisher_is_connected(&ctx->mqtt)),
+            (unsigned)frame->len
+        ) != 0
+    ) {
+        return -1;
+    }
+
+    for (i = 0u; i < frame->len; ++i) {
+        if (appendf(payload, capacity, &offset, "%s%u", (i == 0u) ? "" : ",", (unsigned)frame->pulse[i]) != 0) {
+            return -1;
+        }
+    }
+
+    if (appendf(payload, capacity, &offset, "]}") != 0) {
+        return -1;
+    }
+    return 0;
+}
 ```
 
-这段的作用是给算法内部加两个阶段计数。
+这段代码把 `rf_event` 的字段来源讲死了：
 
-- `step1_structural`：候选先通过了结构筛选
-- `step2_timing`：候选再通过了时序评分
+- `addr/key/conf/source` 来自 decode 结果 `pkt`。
+- `drv_seq/timestamp_ns` 来自 driver 帧外壳。
+- `seq/decode_us` 来自用户态自己的处理过程。
+- `pulse_us[]` 则是共享 pulse frame 原样展开后的最后一份“真值数组”。
 
-你要抓住的点是：这两个计数只说明“算法走到了哪一步”，不是业务发布成功数。
+## 9. MQTT publish 是旁路，不是主线
 
-## 6. 这三层统计怎么联动
+`emit_protocol_message()` 的顺序很值得单独拎出来：
 
-### 6.1 驱动统计
+1. 如果 MQTT 已连接，先尝试 publish payload
+2. 无论 publish 成功与否，都组装 JSON envelope
+3. 把 JSON 行写到 `stdout`
+4. 如果 publish 失败，再把错误写到 `stderr`
 
-`on_drv_stats()` 里做的是：
+这代表了当前实现的明确优先级：
+
+- 本地 `stdout` 协议是 RF 主线
+- MQTT 是可选的外发旁支
+
+而且当前代码里只有 publish，没有 subscribe，因此不能把 MQTT command 写成已实现能力。
+
+来源：`project2_master/linux_app/main.c`，函数：`emit_protocol_message()`，作用：先尝试 MQTT publish，再无条件把同一份 envelope 写到 `stdout`。
 
 ```c
-ioctl(rf_fd, RF433_IOC_GET_STATS, &drv_stats)
-ioctl(rf_fd, RF433_IOC_GET_STATUS, &drv_status)
+static int emit_protocol_message(
+    app_ctx_t *ctx,
+    const char *type,
+    const char *subtopic,
+    const char *payload_json,
+    int retain
+) {
+    char line[JSON_LINE_CAPACITY];
+    int publish_rc = MQTT_PUBLISHER_ERR_NO_CONN;
+    int mqtt_published = 0;
+
+    if (ctx == NULL || type == NULL || subtopic == NULL || payload_json == NULL) {
+        return -1;
+    }
+
+    if (mqtt_publisher_is_connected(&ctx->mqtt)) {
+        publish_rc = mqtt_publisher_publish(&ctx->mqtt, subtopic, payload_json, retain);
+        mqtt_published = (publish_rc == 0);
+    }
+
+    if (build_protocol_line(line, sizeof(line), type, subtopic, mqtt_published, payload_json) != 0) {
+        fprintf(stderr, "[RF_JSON] failed to assemble protocol line for %s\n", type);
+        return -1;
+    }
+
+    fprintf(stdout, "%s\n", line);
+
+    if (publish_rc != 0 && publish_rc != MQTT_PUBLISHER_ERR_NO_CONN) {
+        fprintf(
+            stderr,
+            "[MQTT] publish %s/%s failed: %s\n",
+            MQTT_TOPIC_ROOT,
+            subtopic,
+            mqtt_publisher_error_string(publish_rc)
+        );
+    }
+
+    return mqtt_published ? 0 : publish_rc;
+}
 ```
 
-然后组装并发出：
+这段顺序直接说明了优先级：
 
-- `device_status.payload.rf_online`
-- `device_status.payload.driver_crc_err`
-- `device_status.payload.driver_len_err`
-- `device_status.payload.driver_drop_cnt`
-- `device_status.payload.driver_seq`
-- `device_status.payload.driver_queue_depth`
-- `device_status.payload.driver_queue_capacity`
-- `rf_stats.payload.*` 里的周期汇总字段
+- `stdout` 行一定会写，只要 `build_protocol_line()` 成功。
+- MQTT 失败不会阻断 Qt 消费主链，只会额外落一条错误到 `stderr`。
+- `mqtt_published` 不是配置项，而是这一次 publish 的实际结果位。
 
-这段的作用是回答“驱动层是不是健康”。
+## 10. Qt 是怎样接上这条链的
 
-### 6.2 用户态业务统计
+虽然 Qt 源码在别的目录，这里还是要把关系讲透。
 
-`rf_stats.payload` 回答的是“用户态处理完后，最终流向哪里了”。
+`qt_gui/rf/RFGatewayClient` 会：
 
-- `frames_total`：收到了多少帧
-- `decode_ok`：成功被解码器接受的帧数
-- `decode_no_frame`：decode 认为这帧不成立
-- `decode_err`：decode 调用返回硬错误
-- `low_conf_drop`：解出来但置信度太低
-- `stable_drop`：稳定化阶段先压住了
-- `dup_drop`：重复发布被抑制
-- `published_events`：最终发出了多少条事件
-- `drv_drop`：驱动序号缺口
+1. 在应用目录找固定路径 `rf_gateway`
+2. 用 `--rf-input /dev/rf433` 拉起它
+3. 监听 `stdout`
+4. 对每一行调用 `parseProtocolEnvelope()`
+5. 按 `type` 分流：
+   - `rf_event` -> 刷新 RF 波形、最近解码和历史表
+   - `device_status` -> 刷新在线状态和部分计数
+   - `rf_stats` -> 刷新错误与掉帧统计
+6. 如果 `mqtt_published` 为真，再额外写一条 MQTT 日志
 
-你要抓住的点是：这一组统计能把一条帧从进入用户态到真正发成 `rf_event` JSON envelope，在哪一步被丢掉全部拆出来。
+这条关系必须清楚写出来：
 
-### 6.3 IO / 解码统计也折叠在 `rf_stats.payload`
+- `rf_gateway stdout` 是 Qt RF 页面输入
+- `mqtt_published` 只决定是否在日志里多记一次 MQTT 发布
+- RF 页面不是通过 MQTT 订阅刷新
 
-当前实现不再额外拆分独立的 IO/解码文本统计行。这些指标都进了 `rf_stats.payload`：
+来源：`project2_master/qt_gui/rf/rf_gateway_client.cpp`，函数：`parseProtocolEnvelope()`，作用：把 `rf_gateway` 输出的一整行 JSON 拆成 `type/topic/mqtt_published/payload` 四部分。
 
-- `read_eintr` / `read_eagain` / `read_eof` / `read_error` / `short_read` / `epoll_eintr` / `epoll_error`：事件泵和读取层健康度
-- `decode_c_attempts`：算法尝试次数
-- `decode_c_accepts`：被 EV1527 C 算法接受的次数
-- `decode_c_total_us`：算法总耗时
-- `decode_c_accept_total_us`：接受帧的耗时累计
+```cpp
+bool RFGatewayClient::parseProtocolEnvelope(
+    const QString &line,
+    QString *type,
+    QString *topic,
+    bool *mqttPublished,
+    QJsonObject *payload
+) const {
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(line.toUtf8(), &parseError);
+    const QJsonObject root = doc.object();
 
-这三层放在一起看，才能判断问题在驱动、事件泵、算法，还是用户态策略。
+    if (type == nullptr || topic == nullptr || mqttPublished == nullptr || payload == nullptr) {
+        return false;
+    }
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return false;
+    }
 
-## 7. 最后再把关系说死
+    *type = scalarJsonString(root.value(QStringLiteral("type")));
+    *topic = scalarJsonString(root.value(QStringLiteral("topic")));
+    *mqttPublished = root.value(QStringLiteral("mqtt_published")).toBool(false);
+    if (type->isEmpty() || !root.value(QStringLiteral("payload")).isObject()) {
+        return false;
+    }
 
-不是：
+    *payload = root.value(QStringLiteral("payload")).toObject();
+    return true;
+}
+```
 
-- `rf_source` 在做解码
-- `rf_epoll` 在做协议识别
-- `rf_decode` 和 `rf_decode_c` 是两套平行的业务实现
+这段代码与 `build_protocol_line()` 是一一对称的：Linux 侧怎样包，Qt 侧就怎样拆，没有中间魔法层。
 
-而是：
+来源：`project2_master/qt_gui/rf/rf_gateway_client.cpp`，函数：`parseRFEventPayload()`，作用：从 `payload` 中抽出 `addr/key/conf/src/pulse_us[]`，还原成 Qt 侧 `RFEvent` 和脉冲数组。
 
-- `rf_source` 只负责把字符设备入口收紧
-- `rf_epoll` 只负责把设备上的可读事件持续泵出来
-- `rf_decode` 只负责把算法结果标准化并记账
-- `rf_decode_c` 才是当前真正的 EV1527 识别算法
-- `main.c` 才是发布策略、稳定化、去重、打印和汇总统计的总控
+```cpp
+bool RFGatewayClient::parseRFEventPayload(const QJsonObject &payload, RFEvent *event, QVector<int> *pulses) const {
+    const QString address = scalarJsonString(payload.value(QStringLiteral("addr")));
+    const QString key = scalarJsonString(payload.value(QStringLiteral("key")));
+    const QString source = scalarJsonString(payload.value(QStringLiteral("src")));
+    const QJsonValue confValue = payload.value(QStringLiteral("conf"));
+    const QJsonValue pulseArrayValue = payload.value(QStringLiteral("pulse_us"));
+    const QJsonArray pulseArray = pulseArrayValue.toArray();
 
-你如果只记住一个结论，就记这个：
+    if (event == nullptr || pulses == nullptr) {
+        return false;
+    }
+    if (address.isEmpty() || key.isEmpty() || source.isEmpty() || !confValue.isDouble() || !pulseArrayValue.isArray()) {
+        return false;
+    }
 
-> 用户态 master 的核心，不是“读到一帧就打印”，而是“先把帧识别成候选，再把候选变成稳定事件，最后才允许发布”。
+    event->timestamp = QDateTime::currentDateTime();
+    event->address = address;
+    event->key = key;
+    event->confidence = confValue.toDouble();
+    event->source = source;
+    event->frameSeq = payload.value(QStringLiteral("seq")).isDouble()
+        ? static_cast<qint64>(payload.value(QStringLiteral("seq")).toDouble(-1.0))
+        : -1;
+    event->decodeUs = payload.value(QStringLiteral("decode_us")).isDouble()
+        ? static_cast<qint64>(payload.value(QStringLiteral("decode_us")).toDouble(-1.0))
+        : -1;
+
+    pulses->clear();
+    pulses->reserve(pulseArray.size());
+    for (const QJsonValue &value : pulseArray) {
+        const int pulseUs = value.toInt(-1);
+        if (!value.isDouble() || pulseUs <= 0) {
+            pulses->clear();
+            return false;
+        }
+        pulses->append(pulseUs);
+    }
+
+    return true;
+}
+```
+
+这就是为什么前面文档要强调 `pulse_us[]`：Qt 不是自己从 `addr/key` 反推真波形，而是直接消费 payload 里的真实脉冲数组。
+
+来源：`project2_master/qt_gui/rf/rf_gateway_client.cpp`，函数：`handleProtocolLine()`，作用：按 `type` 把 envelope 分流到 RF 事件、设备状态和统计更新。
+
+```cpp
+void RFGatewayClient::handleProtocolLine(const QString &line) {
+    QString type;
+    QString topic;
+    QJsonObject payload;
+    bool mqttPublished = false;
+
+    if (backend_ == nullptr) {
+        return;
+    }
+
+    if (!parseProtocolEnvelope(line, &type, &topic, &mqttPublished, &payload)) {
+        backend_->incrementParseError();
+        backend_->addLog("WARN", "RF", QString("Invalid rf_gateway protocol JSON: %1").arg(line));
+        return;
+    }
+
+    if (type == QStringLiteral("rf_event")) {
+        RFEvent event;
+        QVector<int> pulses;
+        if (!parseRFEventPayload(payload, &event, &pulses)) {
+            backend_->incrementParseError();
+            backend_->addLog("WARN", "RF", QString("Invalid rf_event payload: %1").arg(line));
+            return;
+        }
+
+        backend_->updateSerialStatus(true, scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
+            ? resolvedRfInputPath()
+            : scalarJsonString(payload.value(QStringLiteral("rf_input"))));
+        backend_->addRFEvent(event, pulses);
+        backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
+        return;
+    }
+
+    if (type == QStringLiteral("device_status")) {
+        const QString rfInputPath = scalarJsonString(payload.value(QStringLiteral("rf_input")));
+        const bool rfOnline = payload.value(QStringLiteral("rf_online")).toBool(false);
+        const int crcErrors = payload.value(QStringLiteral("driver_crc_err")).toInt(-1);
+        const int driverDropFrames = payload.value(QStringLiteral("app_drv_drop")).toInt(-1);
+        backend_->updateSerialStatus(rfOnline, rfInputPath.isEmpty() ? resolvedRfInputPath() : rfInputPath);
+        backend_->updateProtocolStats(crcErrors, -1, driverDropFrames);
+        backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
+        return;
+    }
+
+    if (type == QStringLiteral("rf_stats")) {
+        const int crcErrors = payload.value(QStringLiteral("driver_crc_err")).toInt(-1);
+        const int parseErrors =
+            payload.value(QStringLiteral("decode_no_frame")).toInt(0) +
+            payload.value(QStringLiteral("decode_err")).toInt(0);
+        const int driverDropFrames = payload.value(QStringLiteral("drv_drop")).toInt(-1);
+        if (payload.contains(QStringLiteral("driver_online"))) {
+            backend_->updateSerialStatus(
+                payload.value(QStringLiteral("driver_online")).toBool(false),
+                scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
+                    ? resolvedRfInputPath()
+                    : scalarJsonString(payload.value(QStringLiteral("rf_input")))
+            );
+        }
+        backend_->updateProtocolStats(crcErrors, parseErrors, driverDropFrames);
+        backend_->addLog("INFO", "RF", line);
+        if (mqttPublished && !topic.isEmpty()) {
+            backend_->addMqttPublishLog(topic, QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+        }
+        return;
+    }
+
+    backend_->incrementParseError();
+    backend_->addLog("WARN", "RF", QString("Unknown rf_gateway protocol type: %1").arg(line));
+}
+```
+
+Qt 侧真正依赖的是 `type + payload` 这组本地协议，不是 MQTT 订阅结果。`mqtt_published` 只是在本地日志上多挂一个“这次也顺手发出去了”的标记。
+
+## 11. 当前没有实现什么
+
+这一节专门防止文档越界。
+
+### 11.1 没有 MQTT command
+
+当前 `mqtt_publisher.c` 只有连接和发布，没有订阅、没有回调、没有命令执行。
+
+### 11.2 没有 GPIO 输入
+
+用户态 RF 主链只接受 `/dev/rf433`，没有 GPIO 事件源接入逻辑。
+
+### 11.3 没有事件录像闭环
+
+`rf_gateway` 当前只负责 RF 帧、解码、JSON 和 MQTT publish，看不到录像调度或 `record_done` 输出路径。
+
+## 12. 推荐的源码走读顺序
+
+1. `main.c`
+   先看整条业务策略主干。
+2. `rf_source.c`
+   看为什么输入路径被固定死在 `/dev/rf433`。
+3. `rf_epoll.c`
+   看驱动帧如何进入事件循环。
+4. `rf_decode.c`
+   看 pulse frame 如何转成统一解码结果。
+5. `rf_decode_c.c`
+   看 EV1527 算法主体。
+6. `mqtt_publisher.c`
+   最后补齐 publish 这条旁路。

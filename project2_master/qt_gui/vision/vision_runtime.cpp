@@ -63,16 +63,18 @@ void sleepShort() {
 
 constexpr int kAiWorkerThreads = 1;
 constexpr int kAiQueueSize = 4;
-constexpr int kStreamQueueSize = 4;
+constexpr int kPostStreamQueueSize = 4;
 constexpr int kPoolPreallocCount = 6;
 constexpr int kPoolCachedCount = 8;
+constexpr int kOverlayPoolPreallocCount = 2;
+constexpr int kOverlayPoolCachedCount = 4;
 constexpr int kDefaultFpsNum = 30;
 constexpr int kDefaultFpsDen = 1;
 constexpr int kDefaultRtspBitrateBps = 0;
+constexpr int kRtspRetryDelayMs = 3000;
 constexpr char kDeviceId[] = "rk3568-001";
 constexpr char kMqttHost[] = "192.168.30.26";
 constexpr int kMqttPort = 1883;
-constexpr char kRtspPushUrl[] = "rtsp://192.168.30.26:8554/rk3568-001/cam0";
 constexpr char kTopicVisionDetection[] = "argi/device/rk3568-001/vision/detection";
 constexpr char kTopicStreamStatus[] = "argi/device/rk3568-001/stream/status";
 
@@ -115,6 +117,21 @@ size_t computeRgbBytes(int width, int height) {
         return 0U;
     }
     return pixels * 3U;
+}
+
+size_t computeBgraBytes(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return 0U;
+    }
+
+    size_t pixels = 0U;
+    if (!tryMultiplySize(static_cast<size_t>(width), static_cast<size_t>(height), &pixels)) {
+        return 0U;
+    }
+    if (pixels > (std::numeric_limits<size_t>::max() / 4U)) {
+        return 0U;
+    }
+    return pixels * 4U;
 }
 
 QString localVisionRoot() {
@@ -385,6 +402,7 @@ void publishStreamStatus(
     DashboardBackend *backend,
     VisionMqttPublisher *mqtt,
     const QString &state,
+    const QString &streamUrl,
     const QString &reason = QString()
 ) {
     QJsonObject payload{
@@ -393,7 +411,7 @@ void publishStreamStatus(
         {QStringLiteral("state"), state},
         {QStringLiteral("protocol"), QStringLiteral("rtsp")},
         {QStringLiteral("codec"), QStringLiteral("h264")},
-        {QStringLiteral("url"), QString::fromLatin1(kRtspPushUrl)}
+        {QStringLiteral("url"), streamUrl}
     };
 
     if (!reason.isEmpty()) {
@@ -405,6 +423,7 @@ void publishStreamStatus(
 void publishDetection(
     DashboardBackend *backend,
     VisionMqttPublisher *mqtt,
+    const QString &streamUrl,
     uint64_t frameId,
     long long captureTsUs,
     const detect_result_group_t &group
@@ -432,7 +451,7 @@ void publishDetection(
         {QStringLiteral("frame_id"), static_cast<qint64>(frameId)},
         {QStringLiteral("ts_us"), static_cast<qint64>(captureTsUs)},
         {QStringLiteral("objects"), objects},
-        {QStringLiteral("stream_url"), QString::fromLatin1(kRtspPushUrl)}
+        {QStringLiteral("stream_url"), streamUrl}
     };
 
     logPublishedMessage(backend, mqtt, QString::fromLatin1(kTopicVisionDetection), payload, false);
@@ -487,81 +506,6 @@ int copyFrameToAiPool(
     return 0;
 }
 
-int copyFrameToStreamPool(
-    const void *srcData,
-    size_t srcSize,
-    int width,
-    int height,
-    int srcStride,
-    int srcVerStride,
-    int srcFormat,
-    uint64_t frameId,
-    long long captureTsUs,
-    int streamWidth,
-    int streamHeight,
-    int streamStride,
-    FrameCopyPool *streamBufferPool,
-    StreamFramePool *streamFramePool
-) {
-    const size_t requiredSize = computeFrameSizeBytes(width, height, srcFormat);
-    const size_t streamBytes = computeNv12Bytes(streamStride, streamHeight);
-    unsigned char *streamBuffer = nullptr;
-    StreamFrame frame;
-
-    if (
-        srcData == nullptr ||
-        streamBufferPool == nullptr ||
-        streamFramePool == nullptr ||
-        width <= 0 ||
-        height <= 0 ||
-        streamWidth <= 0 ||
-        streamHeight <= 0 ||
-        srcStride < width ||
-        srcVerStride < height ||
-        streamStride < streamWidth ||
-        requiredSize == 0U ||
-        srcSize < requiredSize ||
-        streamBytes == 0U ||
-        streamBytes > streamBufferPool->bufferSize()
-    ) {
-        return -1;
-    }
-
-    streamBuffer = streamBufferPool->acquire();
-    if (streamBuffer == nullptr) {
-        return 1;
-    }
-
-    if (rga_resize_to_nv12_vaddr(
-            const_cast<void *>(srcData),
-            width,
-            height,
-            srcStride,
-            srcVerStride,
-            srcFormat,
-            streamBuffer,
-            streamWidth,
-            streamHeight,
-            streamStride,
-            streamHeight) != 0) {
-        release_frame_buffer(streamBuffer, release_pooled_buffer, streamBufferPool);
-        return -1;
-    }
-
-    frame.data = streamBuffer;
-    frame.data_size = streamBytes;
-    frame.frame_id = frameId;
-    frame.capture_ts_us = captureTsUs;
-    frame.width = streamWidth;
-    frame.height = streamHeight;
-    frame.stride = streamStride;
-    frame.format = RK_FORMAT_YCbCr_420_SP;
-    frame.release_fn = release_pooled_buffer;
-    frame.release_ctx = streamBufferPool;
-    streamFramePool->enqueue(std::move(frame));
-    return 0;
-}
-
 QColor colorForLabel(const QString &label) {
     static const QVector<QColor> palette = {
         QColor(255, 99, 71),
@@ -595,38 +539,166 @@ QStringList formatDetections(const detect_result_group_t &group) {
     return detections;
 }
 
-QImage renderAnnotatedFrame(const QImage &baseFrame, const detect_result_group_t &group) {
-    QImage frame = baseFrame.copy();
-    QPainter painter(&frame);
-    painter.setRenderHint(QPainter::Antialiasing, true);
+void paintDetections(
+    QPainter *painter,
+    const detect_result_group_t &group,
+    int sourceWidth,
+    int sourceHeight,
+    int targetWidth,
+    int targetHeight
+) {
+    if (painter == nullptr || sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+        return;
+    }
+
+    painter->setRenderHint(QPainter::Antialiasing, true);
 
     QFont labelFont(QStringLiteral("Microsoft YaHei"), 11, QFont::Bold);
-    painter.setFont(labelFont);
+    painter->setFont(labelFont);
 
     for (int i = 0; i < group.count; ++i) {
         const detect_result_t &det = group.results[i];
         const QString name = QString::fromLocal8Bit(det.name);
         const QColor color = colorForLabel(name);
+        const int left = qBound(0, static_cast<int>(det.box.left * targetWidth / sourceWidth), qMax(0, targetWidth - 1));
+        const int top = qBound(0, static_cast<int>(det.box.top * targetHeight / sourceHeight), qMax(0, targetHeight - 1));
+        const int right = qBound(left + 1, static_cast<int>(det.box.right * targetWidth / sourceWidth), targetWidth);
+        const int bottom = qBound(top + 1, static_cast<int>(det.box.bottom * targetHeight / sourceHeight), targetHeight);
         const QRect box(
-            det.box.left,
-            det.box.top,
-            qMax(1, det.box.right - det.box.left),
-            qMax(1, det.box.bottom - det.box.top)
+            left,
+            top,
+            qMax(1, right - left),
+            qMax(1, bottom - top)
         );
 
-        painter.setPen(QPen(color, 2));
-        painter.drawRect(box);
+        painter->setPen(QPen(color, 2));
+        painter->drawRect(box);
 
         const QString label = QStringLiteral("%1 %.1f%%").arg(name).arg(det.prop * 100.0, 0, 'f', 1);
-        const QRect labelRect = painter.fontMetrics().boundingRect(label).adjusted(-6, -3, 6, 3);
+        const QRect labelRect = painter->fontMetrics().boundingRect(label).adjusted(-6, -3, 6, 3);
         QPoint origin(box.left(), qMax(labelRect.height(), box.top()));
         QRect drawRect(origin.x(), origin.y() - labelRect.height(), labelRect.width(), labelRect.height());
-        painter.fillRect(drawRect, QColor(0, 0, 0, 160));
-        painter.setPen(Qt::white);
-        painter.drawText(drawRect.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
+        drawRect = drawRect.intersected(QRect(0, 0, targetWidth, targetHeight));
+        if (!drawRect.isEmpty()) {
+            painter->fillRect(drawRect, QColor(0, 0, 0, 160));
+            painter->setPen(Qt::white);
+            painter->drawText(drawRect.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
+        }
+    }
+}
+
+QImage renderAnnotatedFrame(const QImage &baseFrame, const detect_result_group_t &group) {
+    QImage frame = baseFrame.copy();
+    QPainter painter(&frame);
+    paintDetections(&painter, group, frame.width(), frame.height(), frame.width(), frame.height());
+    return frame;
+}
+
+int copyPostInferFrameToPostStreamPool(
+    const detect_result_group_t &group,
+    const void *srcData,
+    int width,
+    int height,
+    int srcFormat,
+    uint64_t frameId,
+    long long captureTsUs,
+    int streamWidth,
+    int streamHeight,
+    int streamStride,
+    FrameCopyPool *postStreamBufferPool,
+    FrameCopyPool *postStreamOverlayPool,
+    PostStreamFramePool *postStreamFramePool
+) {
+    const size_t streamBytes = computeNv12Bytes(streamStride, streamHeight);
+    const size_t overlayBytes = computeBgraBytes(streamWidth, streamHeight);
+    unsigned char *streamBuffer = nullptr;
+    unsigned char *overlayBuffer = nullptr;
+
+    if (
+        srcData == nullptr ||
+        postStreamBufferPool == nullptr ||
+        postStreamOverlayPool == nullptr ||
+        postStreamFramePool == nullptr ||
+        width <= 0 ||
+        height <= 0 ||
+        streamWidth <= 0 ||
+        streamHeight <= 0 ||
+        streamStride < streamWidth ||
+        streamBytes == 0U ||
+        overlayBytes == 0U ||
+        streamBytes > postStreamBufferPool->bufferSize() ||
+        overlayBytes > postStreamOverlayPool->bufferSize()
+    ) {
+        return -1;
     }
 
-    return frame;
+    streamBuffer = postStreamBufferPool->acquire();
+    if (streamBuffer == nullptr) {
+        return 1;
+    }
+
+    overlayBuffer = postStreamOverlayPool->acquire();
+    if (overlayBuffer == nullptr) {
+        release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+        return 1;
+    }
+
+    if (rga_resize_convert_vaddr(
+            const_cast<void *>(srcData),
+            width,
+            height,
+            srcFormat,
+            overlayBuffer,
+            streamWidth,
+            streamHeight,
+            RK_FORMAT_BGRA_8888) != 0) {
+        release_frame_buffer(overlayBuffer, release_pooled_buffer, postStreamOverlayPool);
+        release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+        return -1;
+    }
+
+    QImage overlayFrame(
+        overlayBuffer,
+        streamWidth,
+        streamHeight,
+        streamWidth * 4,
+        QImage::Format_ARGB32
+    );
+    QPainter overlayPainter(&overlayFrame);
+    paintDetections(&overlayPainter, group, width, height, streamWidth, streamHeight);
+
+    if (rga_resize_to_nv12_vaddr(
+            overlayBuffer,
+            streamWidth,
+            streamHeight,
+            streamWidth,
+            streamHeight,
+            RK_FORMAT_BGRA_8888,
+            streamBuffer,
+            streamWidth,
+            streamHeight,
+            streamStride,
+            streamHeight) != 0) {
+        release_frame_buffer(overlayBuffer, release_pooled_buffer, postStreamOverlayPool);
+        release_frame_buffer(streamBuffer, release_pooled_buffer, postStreamBufferPool);
+        return -1;
+    }
+
+    release_frame_buffer(overlayBuffer, release_pooled_buffer, postStreamOverlayPool);
+
+    PostStreamFrame frame;
+    frame.data = streamBuffer;
+    frame.size = streamBytes;
+    frame.width = streamWidth;
+    frame.height = streamHeight;
+    frame.stride = streamStride;
+    frame.format = RK_FORMAT_YCbCr_420_SP;
+    frame.frame_id = frameId;
+    frame.timestamp_us = captureTsUs;
+    frame.release_fn = release_pooled_buffer;
+    frame.release_ctx = postStreamBufferPool;
+    postStreamFramePool->enqueue(std::move(frame));
+    return 0;
 }
 
 #endif
@@ -668,6 +740,10 @@ void VisionRuntime::workerLoop() {
     const QString modelPath = resolveModelPath();
     const QString inputPath = options_.visionDevice.trimmed();
     const bool useV4L2 = isAllowedVisionDevicePath(inputPath);
+    const bool rtspEnabled = options_.visionRtspEnabled;
+    const QString rtspUrl = options_.visionRtspUrl.trimmed().isEmpty()
+        ? defaultVisionRtspUrl()
+        : options_.visionRtspUrl.trimmed();
     VisionMqttPublisher mqtt;
     QString terminalMessage;
     bool modelReady = false;
@@ -825,9 +901,10 @@ void VisionRuntime::workerLoop() {
     const int streamHeight = kStreamHeight;
     const int streamStride = alignUp(streamWidth, 16);
     const size_t streamFrameBytes = computeNv12Bytes(streamStride, streamHeight);
+    const size_t streamOverlayBytes = computeBgraBytes(streamWidth, streamHeight);
     const size_t rgbBufferBytes = computeRgbBytes(srcWidth, srcHeight);
     if (aiFrameBytes == 0U || streamWidth <= 0 || streamHeight <= 0 || streamStride <= 0 ||
-        streamFrameBytes == 0U || rgbBufferBytes == 0U ||
+        streamFrameBytes == 0U || streamOverlayBytes == 0U || rgbBufferBytes == 0U ||
         rgbBufferBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
         terminalMessage = QStringLiteral("Unsupported vision frame geometry %1x%2").arg(srcWidth).arg(srcHeight);
         backend_->updateVisionState(makeStatusSnapshot(terminalMessage, false, modelReady));
@@ -845,68 +922,80 @@ void VisionRuntime::workerLoop() {
         return;
     }
     FrameCopyPool aiFramePool(aiFrameBytes, kPoolPreallocCount, kPoolCachedCount);
-    FrameCopyPool streamBufferPool(streamFrameBytes, kPoolPreallocCount, kPoolCachedCount);
-    StreamFramePool streamFramePool(kStreamQueueSize);
+    FrameCopyPool postStreamBufferPool(streamFrameBytes, kPoolPreallocCount, kPoolCachedCount);
+    FrameCopyPool postStreamOverlayPool(streamOverlayBytes, kOverlayPoolPreallocCount, kOverlayPoolCachedCount);
+    PostStreamFramePool postStreamFramePool(kPostStreamQueueSize);
     QVector<unsigned char> rgbBuffer(static_cast<int>(rgbBufferBytes));
     std::atomic<uint64_t> frameIdGenerator{1U};
+    bool postStreamBranchActive = rtspEnabled;
     QString sourceError;
-    QString streamError;
     QString pipelineError;
+    std::thread streamThread;
 
-    std::thread streamThread([&]() {
-        MppRtspEncoder encoder;
-        bool encoderOpen = false;
+    if (rtspEnabled) {
+        streamThread = std::thread([&]() {
+            MppRtspEncoder encoder;
+            bool encoderOpen = false;
+            bool streamWasOnline = false;
+            auto nextRetryAt = std::chrono::steady_clock::time_point::min();
 
-        while (true) {
-            StreamFrame frame;
-            if (!streamFramePool.waitAndPop(&frame)) {
-                break;
-            }
-
-            if (!encoderOpen) {
-                if (encoder.open(
-                        kRtspPushUrl,
-                        frame.width,
-                        frame.height,
-                        frame.stride,
-                        frame.height,
-                        fpsNum,
-                        fpsDen,
-                        kDefaultRtspBitrateBps) != 0) {
-                    streamError = QStringLiteral("RTSP encoder open failed");
-                    backend_->addLog("ERROR", "VISION", streamError);
-                    publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), streamError);
-                    release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
-                    running_.store(false);
-                    streamFramePool.stop();
-                    aiPool.notifyGetters();
+            while (true) {
+                PostStreamFrame frame;
+                if (!postStreamFramePool.waitAndPop(&frame)) {
                     break;
                 }
 
-                encoderOpen = true;
-                backend_->addLog("INFO", "VISION", QStringLiteral("RTSP push online: %1").arg(QString::fromLatin1(kRtspPushUrl)));
-                publishStreamStatus(backend_, &mqtt, QStringLiteral("online"));
-            }
+                const auto now = std::chrono::steady_clock::now();
+                if (!encoderOpen) {
+                    if (now < nextRetryAt) {
+                        release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                        continue;
+                    }
 
-            if (encoder.encodeAndPush(frame) != 0) {
-                streamError = QStringLiteral("RTSP push failed");
-                backend_->addLog("ERROR", "VISION", streamError);
-                publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), streamError);
+                    if (encoder.open(
+                            rtspUrl.toUtf8().constData(),
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                            frame.height,
+                            fpsNum,
+                            fpsDen,
+                            kDefaultRtspBitrateBps) != 0) {
+                        backend_->addLog("WARN", "VISION", QStringLiteral("RTSP encoder open failed; stream branch will retry"));
+                        publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("open_failed"));
+                        nextRetryAt = now + std::chrono::milliseconds(kRtspRetryDelayMs);
+                        release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                        continue;
+                    }
+
+                    encoderOpen = true;
+                    streamWasOnline = true;
+                    backend_->addLog("INFO", "VISION", QStringLiteral("RTSP push online: %1").arg(rtspUrl));
+                    publishStreamStatus(backend_, &mqtt, QStringLiteral("online"), rtspUrl);
+                }
+
+                if (encoder.encodeAndPush(frame) != 0) {
+                    backend_->addLog("WARN", "VISION", QStringLiteral("RTSP push failed; stream branch will retry"));
+                    publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("push_failed"));
+                    encoder.close();
+                    encoderOpen = false;
+                    nextRetryAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(kRtspRetryDelayMs);
+                    release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
+                    continue;
+                }
+
                 release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
-                running_.store(false);
-                streamFramePool.stop();
-                aiPool.notifyGetters();
-                break;
             }
 
-            release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
-        }
-
-        if (encoderOpen && streamError.isEmpty()) {
-            publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), QStringLiteral("stopped"));
-        }
-        encoder.close();
-    });
+            if (encoderOpen || streamWasOnline) {
+                publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("stopped"));
+            }
+            encoder.close();
+        });
+    } else {
+        backend_->addLog("INFO", "VISION", QStringLiteral("RTSP push disabled by option"));
+        publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("disabled"));
+    }
 
     std::thread sourceThread([&]() {
         bool usePrefetchedDecodedFrame = prefetchedDecodedFrame;
@@ -989,28 +1078,6 @@ void VisionRuntime::workerLoop() {
                 fatalCopyError = QStringLiteral("AI frame fan-out failed for %1x%2 input")
                                      .arg(currentWidth)
                                      .arg(currentHeight);
-            } else {
-                const int streamCopyRc = copyFrameToStreamPool(
-                    srcData,
-                    srcSize,
-                    currentWidth,
-                    currentHeight,
-                    currentStride,
-                    currentVerStride,
-                    currentFormat,
-                    frameId,
-                    captureTsUs,
-                    streamWidth,
-                    streamHeight,
-                    streamStride,
-                    &streamBufferPool,
-                    &streamFramePool
-                );
-                if (streamCopyRc < 0) {
-                    fatalCopyError = QStringLiteral("RTSP stream fan-out failed for %1x%2 input")
-                                         .arg(currentWidth)
-                                         .arg(currentHeight);
-                }
             }
 
             if (useV4L2 && capture.queueFrame(v4l2Frame) != 0) {
@@ -1028,7 +1095,6 @@ void VisionRuntime::workerLoop() {
         }
 
         aiPool.notifyGetters();
-        streamFramePool.stop();
     });
 
     int frameCount = 0;
@@ -1073,36 +1139,72 @@ void VisionRuntime::workerLoop() {
 
         if (frameData == nullptr) {
             snapshot.errorMsg = QStringLiteral("AI pool returned an empty frame payload");
-        } else if (computeRgbBytes(frameWidth, frameHeight) == 0U ||
-                   computeRgbBytes(frameWidth, frameHeight) > static_cast<size_t>(rgbBuffer.size())) {
-            snapshot.errorMsg = QStringLiteral("AI output geometry %1x%2 exceeds the configured RGB buffer")
-                                    .arg(frameWidth)
-                                    .arg(frameHeight);
-            backend_->addLog("ERROR", "VISION", snapshot.errorMsg);
-            pipelineError = snapshot.errorMsg;
-            running_.store(false);
-        } else if (rga_resize_convert_vaddr(
-                       frameData,
-                       frameWidth,
-                       frameHeight,
-                       frameFormat,
-                       rgbBuffer.data(),
-                       frameWidth,
-                       frameHeight,
-                       RK_FORMAT_RGB_888) != 0) {
-            snapshot.errorMsg = QStringLiteral("RGA color conversion failed");
         } else {
-            QImage rgbImage(
-                rgbBuffer.constData(),
-                frameWidth,
-                frameHeight,
-                frameWidth * 3,
-                QImage::Format_RGB888
-            );
-            snapshot.detections = formatDetections(detGroup);
-            snapshot.frame = renderAnnotatedFrame(rgbImage, detGroup);
-            if (detGroup.count > 0) {
-                publishDetection(backend_, &mqtt, frameId, captureTsUs, detGroup);
+            if (postStreamBranchActive) {
+                const int postStreamRc = copyPostInferFrameToPostStreamPool(
+                    detGroup,
+                    frameData,
+                    frameWidth,
+                    frameHeight,
+                    frameFormat,
+                    frameId,
+                    captureTsUs > 0 ? captureTsUs : nowWallTimeUs(),
+                    streamWidth,
+                    streamHeight,
+                    streamStride,
+                    &postStreamBufferPool,
+                    &postStreamOverlayPool,
+                    &postStreamFramePool
+                );
+                if (postStreamRc < 0) {
+                    postStreamBranchActive = false;
+                    backend_->addLog(
+                        "WARN",
+                        "VISION",
+                        QStringLiteral("RTSP post-stream frame build failed; disabling RTSP branch while keeping inference and display active")
+                    );
+                    publishStreamStatus(
+                        backend_,
+                        &mqtt,
+                        QStringLiteral("offline"),
+                        rtspUrl,
+                        QStringLiteral("post_stream_failed")
+                    );
+                    postStreamFramePool.stop();
+                }
+            }
+
+            if (computeRgbBytes(frameWidth, frameHeight) == 0U ||
+                computeRgbBytes(frameWidth, frameHeight) > static_cast<size_t>(rgbBuffer.size())) {
+                snapshot.errorMsg = QStringLiteral("AI output geometry %1x%2 exceeds the configured RGB buffer")
+                                        .arg(frameWidth)
+                                        .arg(frameHeight);
+                backend_->addLog("ERROR", "VISION", snapshot.errorMsg);
+                pipelineError = snapshot.errorMsg;
+                running_.store(false);
+            } else if (rga_resize_convert_vaddr(
+                           frameData,
+                           frameWidth,
+                           frameHeight,
+                           frameFormat,
+                           rgbBuffer.data(),
+                           frameWidth,
+                           frameHeight,
+                           RK_FORMAT_RGB_888) != 0) {
+                snapshot.errorMsg = QStringLiteral("RGA color conversion failed");
+            } else {
+                QImage rgbImage(
+                    rgbBuffer.constData(),
+                    frameWidth,
+                    frameHeight,
+                    frameWidth * 3,
+                    QImage::Format_RGB888
+                );
+                snapshot.detections = formatDetections(detGroup);
+                snapshot.frame = renderAnnotatedFrame(rgbImage, detGroup);
+                if (detGroup.count > 0) {
+                    publishDetection(backend_, &mqtt, rtspUrl, frameId, captureTsUs, detGroup);
+                }
             }
         }
 
@@ -1124,7 +1226,7 @@ void VisionRuntime::workerLoop() {
 
     running_.store(false);
     aiPool.notifyGetters();
-    streamFramePool.stop();
+    postStreamFramePool.stop();
     if (sourceThread.joinable()) {
         sourceThread.join();
     }
@@ -1144,8 +1246,6 @@ void VisionRuntime::workerLoop() {
 
     if (!sourceError.isEmpty()) {
         backend_->updateVisionState(makeStatusSnapshot(sourceError, false, modelReady));
-    } else if (!streamError.isEmpty()) {
-        backend_->updateVisionState(makeStatusSnapshot(streamError, inputReady, modelReady));
     } else if (!pipelineError.isEmpty()) {
         backend_->updateVisionState(makeStatusSnapshot(pipelineError, inputReady, modelReady));
     } else {

@@ -23,7 +23,6 @@ extern "C" {
 
 namespace {
 
-constexpr int kExpectedStreamFrameFormat = RK_FORMAT_YCbCr_420_SP;
 constexpr size_t kEncoderHeaderBufferSize = 64 * 1024;
 
 static int align_up(int value, int align) {
@@ -68,7 +67,7 @@ int MppRtspEncoder::open(const char* rtsp_url,
                          int bitrate_bps) {
     close();
 
-    rtsp_url_ = rtsp_url;
+    rtsp_url_ = rtsp_url ? rtsp_url : "";
     width_ = width;
     height_ = height;
     hor_stride_ = align_up(std::max(width, hor_stride), 16);
@@ -81,7 +80,7 @@ int MppRtspEncoder::open(const char* rtsp_url,
     io_opened_ = false;
     header_written_ = false;
 
-    if (!rtsp_url_ || width_ <= 0 || height_ <= 0) {
+    if (rtsp_url_.empty() || width_ <= 0 || height_ <= 0) {
         fprintf(stderr, "RTSP encoder: invalid open arguments\n");
         return -1;
     }
@@ -242,7 +241,7 @@ int MppRtspEncoder::loadHeadersIntoStream() {
 int MppRtspEncoder::initRtspOutput() {
     avformat_network_init();
 
-    int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "rtsp", rtsp_url_);
+    int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "rtsp", rtsp_url_.c_str());
     if (ret < 0 || !fmt_ctx_) {
         fprintf(stderr, "RTSP encoder: avformat_alloc_output_context2 failed ret=%d\n", ret);
         return -1;
@@ -273,7 +272,7 @@ int MppRtspEncoder::initRtspOutput() {
     av_dict_set(&opts, "pkt_size", "1200", 0);
 
     if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open2(&fmt_ctx_->pb, rtsp_url_, AVIO_FLAG_WRITE, nullptr, &opts);
+        ret = avio_open2(&fmt_ctx_->pb, rtsp_url_.c_str(), AVIO_FLAG_WRITE, nullptr, &opts);
         if (ret < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, errbuf, sizeof(errbuf));
@@ -360,23 +359,60 @@ int MppRtspEncoder::writeMppPacket(MppPacket packet, bool mark_keyframe) {
     return 0;
 }
 
-int MppRtspEncoder::encodeAndPush(const StreamFrame& frame) {
-    if (!frame.data || !input_buffer_ || !mpi_ || !mpp_ctx_) {
+int MppRtspEncoder::reopenForFrame(const PostStreamFrame& frame) {
+    if (rtsp_url_.empty() || frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width) {
         return -1;
     }
-    if (frame.width != width_ || frame.height != height_ || frame.format != kExpectedStreamFrameFormat) {
+
+    const std::string reopen_url = rtsp_url_;
+    const int fps_num = fps_num_;
+    const int fps_den = fps_den_;
+    const int bitrate_bps = bitrate_bps_;
+
+    close();
+    return open(
+        reopen_url.c_str(),
+        frame.width,
+        frame.height,
+        frame.stride,
+        frame.height,
+        fps_num,
+        fps_den,
+        bitrate_bps
+    );
+}
+
+int MppRtspEncoder::encodeAndPush(const PostStreamFrame& frame) {
+    // The stream path hands us post-inference NV12 frames with overlays already
+    // burned in. The caller may release the backing buffer after this returns:
+    // we copy into an internal MPP input buffer and synchronously drain packets.
+    if (!frame.data || frame.format != RK_FORMAT_YCbCr_420_SP ||
+        frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width) {
+        return -1;
+    }
+    if (!input_buffer_ || !mpi_ || !mpp_ctx_ ||
+        frame.width != width_ || frame.height != height_) {
+        if (reopenForFrame(frame) != 0) {
+            fprintf(stderr,
+                    "RTSP encoder: failed to reopen for frame w=%d h=%d stride=%d\n",
+                    frame.width, frame.height, frame.stride);
+            return -1;
+        }
+    }
+
+    if (frame.width != width_ || frame.height != height_ || frame.format != RK_FORMAT_YCbCr_420_SP) {
         fprintf(stderr,
                 "RTSP encoder: unexpected frame shape w=%d h=%d fmt=%d expected=%dx%d fmt=%d\n",
-                frame.width, frame.height, frame.format, width_, height_, kExpectedStreamFrameFormat);
+                frame.width, frame.height, frame.format, width_, height_, RK_FORMAT_YCbCr_420_SP);
         return -1;
     }
 
     const int src_stride = frame.stride > 0 ? frame.stride : frame.width;
     const size_t min_bytes = static_cast<size_t>(src_stride) * static_cast<size_t>(frame.height) * 3U / 2U;
-    if (frame.data_size < min_bytes) {
+    if (frame.size < min_bytes) {
         fprintf(stderr,
                 "RTSP encoder: short frame payload size=%zu required=%zu\n",
-                frame.data_size, min_bytes);
+                frame.size, min_bytes);
         return -1;
     }
 
@@ -414,7 +450,7 @@ int MppRtspEncoder::encodeAndPush(const StreamFrame& frame) {
     mpp_frame_set_ver_stride(mpp_frame, ver_stride_);
     mpp_frame_set_fmt(mpp_frame, MPP_FMT_YUV420SP);
     mpp_frame_set_buffer(mpp_frame, input_buffer_);
-    mpp_frame_set_pts(mpp_frame, frame.capture_ts_us);
+    mpp_frame_set_pts(mpp_frame, frame.timestamp_us);
 
     ret = mpi_->encode_put_frame(mpp_ctx_, mpp_frame);
     mpp_frame_deinit(&mpp_frame);
@@ -494,7 +530,7 @@ void MppRtspEncoder::close() {
 
     avformat_network_deinit();
 
-    rtsp_url_ = nullptr;
+    rtsp_url_.clear();
     width_ = 0;
     height_ = 0;
     hor_stride_ = 0;
