@@ -3,6 +3,7 @@
 #include "app_options.h"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 namespace dashboard {
@@ -23,6 +24,7 @@ private:
     DashboardBackend *backend_ = nullptr;
     AppOptions options_;
     std::atomic<bool> running_{false};
+    std::mutex lifecycleMutex_;
     std::thread worker_;
 };
 

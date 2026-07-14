@@ -150,10 +150,7 @@ class Run:
 @dataclass
 class PreprocessConfig:
     name: str
-    use_abs: bool
     smooth_window: int
-    low_factor: float
-    high_factor: float
     min_run: int
 
 
@@ -376,12 +373,17 @@ def _iter_wav_chunks(raw: bytes) -> Iterable[Tuple[bytes, bytes]]:
 
 
 def _decode_ima_adpcm_mono(data: bytes, block_align: int) -> List[int]:
+    if block_align < 4:
+        raise ValueError("Invalid IMA ADPCM block alignment.")
+
     out: List[int] = []
     i = 0
     while i + block_align <= len(data):
         block = data[i : i + block_align]
         pred = struct.unpack("<h", block[0:2])[0]
         step_index = block[2]
+        if step_index > 88:
+            raise ValueError("Invalid IMA ADPCM step index.")
         out.append(pred)
         for byte in block[4:]:
             # WAV IMA ADPCM uses low nibble first.
@@ -464,31 +466,6 @@ def moving_average(values: Sequence[float], window: int) -> List[float]:
         if i >= window:
             acc -= float(values[i - window])
         out[i] = acc / float(min(i + 1, window))
-    return out
-
-
-def percentile(values: Sequence[float], p: float) -> float:
-    if not values:
-        return 0.0
-    sorted_vals = sorted(values)
-    k = (len(sorted_vals) - 1) * p
-    i = int(k)
-    j = min(i + 1, len(sorted_vals) - 1)
-    f = k - i
-    return sorted_vals[i] * (1.0 - f) + sorted_vals[j] * f
-
-
-def schmitt_binarize(values: Sequence[float], low_th: float, high_th: float) -> List[int]:
-    if not values:
-        return []
-    state = 1 if values[0] >= high_th else 0
-    out: List[int] = []
-    for v in values:
-        if state == 0 and v >= high_th:
-            state = 1
-        elif state == 1 and v <= low_th:
-            state = 0
-        out.append(state)
     return out
 
 
@@ -1258,10 +1235,7 @@ def build_preprocess_configs() -> List[PreprocessConfig]:
             configs.append(
                 PreprocessConfig(
                     name=name,
-                    use_abs=False,
                     smooth_window=window,
-                    low_factor=0.0,
-                    high_factor=0.0,
                     min_run=min_run,
                 )
             )
@@ -1412,15 +1386,22 @@ def serialize_clusters(
     min_burst_occurrences: int,
     include_all: bool,
 ) -> List[dict]:
-    # Fullscan output is always post-sanity-filtered:
-    # quality -> repeat-family aggregation -> no-overlap -> interleave checks.
-    rows, _, _ = select_cluster_rows(
-        all_frames=all_frames,
-        clusters=clusters,
-        sample_rate=sample_rate,
-        min_occurrences=max(1, min_occurrences),
-        min_burst_occurrences=max(MIN_EFFECTIVE_BURST_REPEAT, min_burst_occurrences),
-    )
+    if include_all:
+        rows = []
+        for cluster in clusters:
+            unique_occ = count_unique_occurrences(cluster.frames, sample_rate)
+            burst_occ = estimate_burst_occurrences(cluster.frames, sample_rate, cluster.mean_clk_us)
+            rows.append((cluster, unique_occ, burst_occ, cluster_quality_score(cluster, unique_occ, burst_occ)))
+        rows.sort(key=lambda row: (row[2], row[1], row[3]), reverse=True)
+    else:
+        # Default JSON follows the same repeat-aware sanity filters as the text report.
+        rows, _, _ = select_cluster_rows(
+            all_frames=all_frames,
+            clusters=clusters,
+            sample_rate=sample_rate,
+            min_occurrences=max(1, min_occurrences),
+            min_burst_occurrences=max(MIN_EFFECTIVE_BURST_REPEAT, min_burst_occurrences),
+        )
 
     data: List[dict] = []
     for cl, unique_occ, burst_occ, score in rows:

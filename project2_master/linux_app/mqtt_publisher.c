@@ -11,7 +11,7 @@ static void on_connect(struct mosquitto *mosq, void *userdata, int rc) {
     if (publisher == NULL) {
         return;
     }
-    publisher->connected = (rc == 0);
+    atomic_store_explicit(&publisher->connected, rc == 0, memory_order_relaxed);
     if (rc != 0) {
         fprintf(stderr, "[MQTT] connect failed: %s\n", mosquitto_connack_string(rc));
     }
@@ -23,7 +23,7 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc) {
     if (publisher == NULL) {
         return;
     }
-    publisher->connected = 0;
+    atomic_store_explicit(&publisher->connected, 0, memory_order_relaxed);
     if (rc != 0) {
         fprintf(stderr, "[MQTT] disconnected unexpectedly: %s\n", mosquitto_strerror(rc));
     }
@@ -43,6 +43,7 @@ int mqtt_publisher_init(
     }
 
     memset(publisher, 0, sizeof(*publisher));
+    atomic_init(&publisher->connected, 0);
     publisher->port = port;
     snprintf(publisher->client_id, sizeof(publisher->client_id), "%s", client_id);
     snprintf(publisher->host, sizeof(publisher->host), "%s", host);
@@ -102,7 +103,7 @@ void mqtt_publisher_cleanup(mqtt_publisher_t *publisher) {
         publisher->lib_initialized = 0;
     }
 
-    publisher->connected = 0;
+    atomic_store_explicit(&publisher->connected, 0, memory_order_relaxed);
     publisher->loop_started = 0;
 }
 
@@ -118,7 +119,7 @@ int mqtt_publisher_publish(
     if (publisher == NULL || publisher->mosq == NULL || subtopic == NULL || payload == NULL) {
         return MQTT_PUBLISHER_ERR_INVALID;
     }
-    if (!publisher->connected) {
+    if (!atomic_load_explicit(&publisher->connected, memory_order_relaxed)) {
         return MQTT_PUBLISHER_ERR_NO_CONN;
     }
 
@@ -142,7 +143,7 @@ int mqtt_publisher_is_connected(const mqtt_publisher_t *publisher) {
     if (publisher == NULL) {
         return 0;
     }
-    return publisher->connected;
+    return atomic_load_explicit(&publisher->connected, memory_order_relaxed);
 }
 
 const char *mqtt_publisher_error_string(int rc) {

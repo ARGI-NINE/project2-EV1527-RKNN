@@ -1,6 +1,8 @@
 #ifndef MQTT_PUBLISHER_H
 #define MQTT_PUBLISHER_H
 
+#include <stdatomic.h>
+
 struct mosquitto;
 
 #define MQTT_PUBLISHER_ERR_INVALID (-1)
@@ -9,7 +11,7 @@ struct mosquitto;
 
 typedef struct {
     struct mosquitto *mosq;
-    int connected;
+    atomic_int connected;
     int loop_started;
     int lib_initialized;
     char client_id[64];

@@ -21,7 +21,6 @@ public:
 
 private:
     QString resolveGatewayPath() const;
-    QString resolvedRfInputPath() const;
     QStringList buildGatewayArgs() const;
 
     void startGateway();

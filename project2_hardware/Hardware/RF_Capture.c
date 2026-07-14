@@ -34,7 +34,6 @@ typedef struct {
     uint16_t IdleFlushMs;
     volatile uint8_t ReadyHead;
     volatile uint8_t ReadyTail;
-    volatile uint32_t DroppedFrames;
     volatile uint32_t MsTick;
     volatile uint32_t LastEdgeMs;
     volatile uint16_t LastIntervalUs;
@@ -69,10 +68,6 @@ static uint8_t RF_Capture_FirstLowLongestForPhase(const rf_frame_t *Frame, uint1
     uint16_t first_low = 0u;
     uint16_t i = 0u;
 
-    if (Frame == NULL || LowStartIndex >= Frame->len) {
-        return 0u;
-    }
-
     first_low = Frame->pulse[LowStartIndex];
     if (first_low == 0u) {
         return 0u;
@@ -87,7 +82,7 @@ static uint8_t RF_Capture_FirstLowLongestForPhase(const rf_frame_t *Frame, uint1
 }
 
 static uint8_t RF_Capture_FrameFirstLowIsLongest(const rf_frame_t *Frame) {
-    if (Frame == NULL || Frame->len < 4u) {
+    if (Frame->len < 4u) {
         return 0u;
     }
 
@@ -104,10 +99,7 @@ static void RF_Capture_EnqueueFrame(const rf_frame_t *Frame) {
     uint8_t next = 0u;
     rf_frame_t *dst = NULL;
 
-    if (Frame == NULL) {
-        return;
-    }
-    if (Frame->len < g_rf_capture.MinFramePulses || Frame->len > RF_BUFFER_SIZE) {
+    if (Frame->len < g_rf_capture.MinFramePulses) {
         return;
     }
     if (RF_Capture_FrameFirstLowIsLongest(Frame) == 0u) {
@@ -116,7 +108,6 @@ static void RF_Capture_EnqueueFrame(const rf_frame_t *Frame) {
 
     next = (uint8_t)((g_rf_capture.ReadyHead + 1u) % RF_CAPTURE_READY_QUEUE_SIZE);
     if (next == g_rf_capture.ReadyTail) {
-        g_rf_capture.DroppedFrames++;
         return;
     }
 
@@ -134,9 +125,6 @@ static uint8_t RF_Capture_DequeueFrame(rf_frame_t *OutFrame) {
      * Producer publishes a slot only after payload copy + head advance,
      * so consumer can copy tail slot without long global IRQ masking.
      */
-    if (OutFrame == NULL) {
-        return 0u;
-    }
     if (g_rf_capture.ReadyTail == g_rf_capture.ReadyHead) {
         return 0u;
     }
@@ -174,7 +162,7 @@ static void RF_Capture_DetectPulse(uint16_t PulseUs) {
             }
         }
         RF_Capture_FlushCurrentFrame();
-        if (has_carry != 0u && g_rf_capture.CurrentFrame.len < RF_BUFFER_SIZE) {
+        if (has_carry != 0u) {
             g_rf_capture.CurrentFrame.pulse[g_rf_capture.CurrentFrame.len++] = carry_pulse;
         }
     }

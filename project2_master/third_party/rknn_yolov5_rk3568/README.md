@@ -1,202 +1,55 @@
-# Vendored RK3568 Vision Runtime for `project2_master`
+# RKNN YOLOv5 RK3568 项目适配
 
-这个目录不是上游完整工程文档，也不是一个独立维护的通用 SDK 包。
+## 定位与来源边界
 
-它在本仓库里的唯一目的，是给 `project2_master/qt_gui` 提供本地板端视觉运行时所需的最小可用依赖集合，让 `VisionRuntime` 可以在同一个 Qt 可执行文件里完成：
+本子树源自 RKNN YOLOv5 demo，并已为 Project2 的 V4L2/文件输入、RGA、模型池、帧池、MPP 解码/编码和 RTSP 输出做项目维护适配。`src/postprocess.cc` 也明确标为 adapted，而不是“官方 demo 未修改副本”。
 
-- 摄像头采集
-- 本地视频文件解码
-- RKNN 推理
-- 推理后 annotated frame 的 RTSP 编码与推流
+当前仓库没有在本子树提供一份完整的上游版本号、commit 与许可证清单。因此不能从本 README 推断所有 SDK header、预编译库、model 或上游源码都采用同一许可证；再分发/升级前必须核对对应 Rockchip SDK/demo 与模型的原始许可，并补齐 provenance 记录。
 
-## 1. 本仓库怎样使用这个目录
+## 项目维护与原始依赖
 
-`project2_master/qt_gui/CMakeLists.txt` 会直接把这里的源码和库编进 `rf_dashboard_qt5`：
-
-- `src/rkYolov5s.cc`
-- `src/preprocess.cc`
-- `src/postprocess.cc`
-- `src/v4l2_capture.cc`
-- `src/mpp_decoder.cc`
-- `src/mpp_encoder_rtsp.cc`
-
-同时会把这些头文件目录和预编译库目录加入构建：
-
-- `include/`
-- `3rdparty/rknn/include`
-- `3rdparty/rga/include`
-- `3rdparty/mpp/include`
-- `3rdparty/rknn/lib/librknnrt.so`
-- `3rdparty/rga/lib/librga.so`
-- `3rdparty/mpp/lib/librockchip_mpp.so`
-
-这意味着当前设计不是“运行时再启动一个外部视觉服务”，而是：
-
-- Qt 目标直接链接这个 vendored runtime
-- `VisionRuntime` 在 Qt 进程内直接调用这些实现
-
-这个“直接编进 Qt 目标”的说法可以被 `project2_master/qt_gui/CMakeLists.txt` 原样托底：
-
-```cmake
-target_sources(
-  rf_dashboard_qt5
-  PRIVATE
-    ${PROJECT2_MASTER_VISION_ROOT}/src/rkYolov5s.cc
-    ${PROJECT2_MASTER_VISION_ROOT}/src/preprocess.cc
-    ${PROJECT2_MASTER_VISION_ROOT}/src/postprocess.cc
-    ${PROJECT2_MASTER_VISION_ROOT}/src/v4l2_capture.cc
-    ${PROJECT2_MASTER_VISION_ROOT}/src/mpp_decoder.cc
-    ${PROJECT2_MASTER_VISION_ROOT}/src/mpp_encoder_rtsp.cc
-)
-
-target_include_directories(
-  rf_dashboard_qt5
-  PRIVATE
-    ${PROJECT2_MASTER_VISION_ROOT}/include
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/mpp/include
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/rknn/include
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/rga/include
-)
-
-target_link_libraries(
-  rf_dashboard_qt5
-  PRIVATE
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/rknn/lib/librknnrt.so
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/rga/lib/librga.so
-    ${PROJECT2_MASTER_VISION_ROOT}/3rdparty/mpp/lib/librockchip_mpp.so
-)
-```
-
-这里没有“启动外部服务”的步骤，只有 `target_sources(...)`、`target_include_directories(...)` 和 `target_link_libraries(...)`。所以本 README 只把它当作 `rf_dashboard_qt5` 的 vendored runtime 资产，而不是单独部署的服务程序。
-
-## 2. 当前真正被 `VisionRuntime` 用到的内容
-
-### 2.1 头文件
-
-- `include/rkYolov5s.hpp`
-- `include/rknnPool.hpp`
-- `include/preprocess.h`
-- `include/postprocess.h`
-- `include/v4l2_capture.h`
-- `include/mpp_decoder.h`
-- `include/mpp_encoder_rtsp.h`
-- `include/frame_pools.h`
-
-### 2.2 源文件
-
-- `src/rkYolov5s.cc`
-- `src/preprocess.cc`
-- `src/postprocess.cc`
-- `src/v4l2_capture.cc`
-- `src/mpp_decoder.cc`
-- `src/mpp_encoder_rtsp.cc`
-
-### 2.3 模型和标签
-
-- `model/yolov5s_relu-640-640-rk3568.rknn`
-- `model/yolov5s-640-640.rknn`
-- `model/coco_80_labels_list.txt`
-
-`VisionRuntime::resolveModelPath()` 会优先从可执行文件旁边的 `model/` 查找，找不到再回到这个 vendor 根下的 `model/`。
-
-本仓库对这份 runtime 的真实调用点在 `project2_master/qt_gui/vision/vision_runtime.cpp`。摘录如下：
-
-```cpp
-const QString modelPath = resolveModelPath();
-const QString inputPath = options_.visionDevice.trimmed();
-const bool useV4L2 = isAllowedVisionDevicePath(inputPath);
-
-if (modelPath.isEmpty()) {
-    backend_->addLog(
-        "ERROR",
-        "VISION",
-        QStringLiteral("VisionRuntime could not find a usable RKNN model inside project2_master assets")
-    );
-    running_.store(false);
-    return;
-}
-
-rknnPool<rkYolov5s> aiPool(modelPath.toStdString(), kAiWorkerThreads, kAiQueueSize);
-if (aiPool.init() != 0) {
-    backend_->addLog("ERROR", "VISION", QStringLiteral("VisionRuntime model init failed: %1").arg(modelPath));
-    running_.store(false);
-    return;
-}
-```
-
-这段代码说明本仓库真正依赖的是 `resolveModelPath()` 的模型查找规则，以及 `rknnPool<rkYolov5s>` 这套 C++ 调用面。README 因此只讨论“Qt 如何吃这份 runtime”，不把注意力转到上游工程的其它工具链。
-
-RTSP 支线也是通过同一个 Qt 进程直接调用 vendored encoder，而不是另起独立推流服务：
-
-```cpp
-if (encoder.open(
-        rtspUrl.toUtf8().constData(),
-        frame.width,
-        frame.height,
-        frame.stride,
-        frame.height,
-        fpsNum,
-        fpsDen,
-        kDefaultRtspBitrateBps) != 0) {
-    backend_->addLog("WARN", "VISION", QStringLiteral("RTSP encoder open failed; stream branch will retry"));
-    publishStreamStatus(backend_, &mqtt, QStringLiteral("offline"), rtspUrl, QStringLiteral("open_failed"));
-    nextRetryAt = now + std::chrono::milliseconds(kRtspRetryDelayMs);
-    release_frame_buffer(frame.data, frame.release_fn, frame.release_ctx);
-    continue;
-}
-```
-
-所以对当前仓库来说，`mpp_encoder_rtsp.*` 的意义不是“提供一个外置 RTSP daemon”，而是“作为 `VisionRuntime` 的一个进程内后处理分支被调用”。
-
-## 3. 当前代码里各文件的角色
-
-| 文件 | 在本仓库中的作用 |
+| 范围 | 分类 |
 |---|---|
-| `v4l2_capture.*` | `/dev/video*` 摄像头采集 |
-| `mpp_decoder.*` | 本地视频文件解码，供 `--vision-device <file>` 支路使用 |
-| `rkYolov5s.*` + `rknnPool.hpp` | RKNN 模型实例和 worker 池 |
-| `frame_pools.h` | AI 输入池、RTSP annotated frame 队列和释放契约 |
-| `mpp_encoder_rtsp.*` | 把 post-infer annotated NV12 frame 编成 H.264 并推到 RTSP URL |
+| `include/*.h`、`src/*.cc` | Project2 构建和维护的适配源码；修改需跑相应 host/board test |
+| `model/coco_80_labels_list.txt` | 运行资产和 lifecycle CTest 输入 |
+| `model/*.rknn` | 预编译目标模型，不能通过源码审阅验证其生成来源/精度 |
+| `3rdparty/` | 原始 SDK headers/prebuilt libraries，视为外部依赖，不在本文声称项目维护实现 |
 
-## 4. 这个 vendor 目录不表达什么
+不要在升级时把 `3rdparty/` 的二进制变化与项目源码适配混成一个无来源更新。
 
-它不表达：
+## 模块
 
-- 上游项目全部功能都被保留
-- 这里的 README 可以代替上游说明
-- 所有示例、脚本、工具都在本仓库使用
+- `v4l2_capture.*`：camera buffer/format/stream 生命周期。
+- `mpp_decoder.*`：文件 demux 与 MPP H.264/H.265/VP9 decode。
+- `preprocess.*`：RGA resize/format conversion 与 NV12 生成。
+- `rkYolov5s.*`、`rknnPool.hpp`：模型加载、context/worker 和 inference。
+- `postprocess.*`：YOLO decode/NMS/label。
+- `frame_pools.h`：跨线程 frame ownership、release callback 和 stop/wakeup。
+- `mpp_encoder_rtsp.*`：MPP H.264 与 FFmpeg libavformat RTSP output。
 
-也不要把这里当成“完整上游镜像”。对当前仓库来说，它只是 `project2_master` 的一组内聚运行时资产。
+## 模型与 label
 
-## 5. 依赖边界
+VisionRuntime 优先查可执行文件旁 `model/`，再查项目 third_party assets。`rkYolov5s` 由 model 路径推导同目录 `coco_80_labels_list.txt`。
 
-除了这个目录自身提供的头文件、源码、预编译库和模型，`qt_gui` 还依赖外部系统库：
+label 存储是 mutex 保护的进程级状态：首次加载失败可重试；成功后不可变并保留到进程结束；兼容 `deinitPostProcess` 不释放字符串；另一个实例若提供冲突 label 路径会初始化失败。这样避免 detection result 引用已释放或被替换的 `c_str()`。
 
-- Qt5 Core/Gui/Widgets
-- `libavformat`
-- `libavcodec`
-- `libavutil`
-- `libmosquitto`
-- `Threads`
+## 可移植测试
 
-因此，“把这个目录拷过去”本身不等于可运行，外部系统依赖仍然要满足。
+```bash
+cmake -S project2_master -B build/vendor-test \
+  -DBUILD_LINUX_APP=OFF -DBUILD_QT5_GUI=OFF -DBUILD_TESTING=ON
+cmake --build build/vendor-test
+ctest --test-dir build/vendor-test -R postprocess_labels_lifetime --output-on-failure
+```
 
-## 6. 更新这个 vendor 目录时要同步检查什么
+该测试不需要 RKNN runtime，覆盖 label load、空 postprocess、兼容 deinit、二次使用与冲突路径。没有覆盖并发首次初始化、failed-load retry、真实模型输出和 target NPU。
 
-如果你更新了这里的内容，至少同步检查：
+## 板端验收
 
-1. `project2_master/qt_gui/CMakeLists.txt` 里的源码清单、include 路径和链接库。
-2. `project2_master/qt_gui/vision/vision_runtime.cpp` 里使用的接口是否仍兼容。
-3. `mpp_encoder_rtsp.*` 与 `frame_pools.h` 的 `PostStreamFrame` 契约是否仍一致。
-4. `model/` 下模型文件名是否仍匹配 `resolveModelPath()` 的查找规则。
+1. 核对 RKNN/RGA/MPP/FFmpeg runtime 与预编译 headers/libs 匹配目标镜像。
+2. 核对模型面向 RK3568，labels 数量/顺序与模型一致。
+3. 运行 Qt Vision，观察 model init、camera/file decode、frame FPS 与 detection。
+4. 分别验证 RGA RGB path 与 post-stream NV12/RTSP path。
+5. 停止时确认 pool notify、thread join、buffer release 和 media close 无 hang/leak。
 
-## 7. 与文档的对应关系
-
-如果你要结合代码理解这个目录，建议按下面顺序看：
-
-1. [../../docs/rk3568_vision_dashboard.md](../../docs/rk3568_vision_dashboard.md)
-2. [../../docs/mqtt_publish_tutorial_zh.md](../../docs/mqtt_publish_tutorial_zh.md)
-3. [../../docs/rtsp_push_tutorial_zh.md](../../docs/rtsp_push_tutorial_zh.md)
-4. [../../docs/project2_master_qt_vision_deep_dive.md](../../docs/project2_master_qt_vision_deep_dive.md)
-
-这更符合本仓库“先看 Qt 如何调用 vendor，再回头看 vendor 提供了什么”的阅读方向。
+主机 lifecycle CTest 不能证明模型精度、NPU context、零拷贝或媒体运行。更新依赖时记录上游来源、版本、许可证、hash、目标镜像与回归结果。

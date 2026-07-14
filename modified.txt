@@ -1,6 +1,0 @@
-project2 主线口径（当前实现）
-
-1. 设备节点统一为 /dev/rf433。
-2. CRC 规则为 XOR(LEN + PAYLOAD)：从 LEN_LO 开始累计，包含 LEN 两字节与全部 PAYLOAD，不包含帧头 0xAA 0x55。
-3. 帧 ABI 以 rf433_frame 为准：使用 pulse_count 字段，不出现 crc_ok 字段。
-4. 队列策略与实现一致：队列满时 drop oldest（丢弃最旧帧），保留最新帧。

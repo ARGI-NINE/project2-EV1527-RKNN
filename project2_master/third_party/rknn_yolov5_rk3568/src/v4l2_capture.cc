@@ -21,8 +21,8 @@ V4L2Capture::~V4L2Capture()
 {
     if (fd_ >= 0) {
         stopStream();
-        close();
     }
+    close();
 }
 
 int V4L2Capture::open()
@@ -37,34 +37,34 @@ int V4L2Capture::open()
     struct v4l2_capability cap;
     if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) < 0) {
         perror("V4L2: QUERYCAP");
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
     if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
         fprintf(stderr, "V4L2: device does not support capture\n");
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
     if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
         fprintf(stderr, "V4L2: device does not support streaming\n");
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
     if (initFormat() != 0) {
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
     if (initStreamParams() != 0) {
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
     if (initMmap() != 0) {
-        ::close(fd_); fd_ = -1;
+        close();
         return -1;
     }
 
@@ -263,10 +263,10 @@ int V4L2Capture::stopStream()
 
 void V4L2Capture::close()
 {
-    for (int i = 0; i < bufferCount_; i++) {
-        if (buffers_[i].start && buffers_[i].start != MAP_FAILED) {
-            munmap(buffers_[i].start, buffers_[i].length);
-            buffers_[i].start = nullptr;
+    for (MmapBuffer &buffer : buffers_) {
+        if (buffer.start && buffer.start != MAP_FAILED) {
+            munmap(buffer.start, buffer.length);
+            buffer.start = nullptr;
         }
     }
     buffers_.clear();

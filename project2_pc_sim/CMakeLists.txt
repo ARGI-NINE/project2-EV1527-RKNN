@@ -5,6 +5,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+include(CTest)
+
 option(BUILD_LINUX_APP "Build Linux gateway app" ON)
 option(BUILD_QT5_GUI "Build Qt5 C++ dashboard frontend" ON)
 
@@ -14,4 +16,8 @@ endif()
 
 if(BUILD_QT5_GUI)
   add_subdirectory(qt_gui)
+endif()
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
 endif()

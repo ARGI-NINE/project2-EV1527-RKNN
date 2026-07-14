@@ -72,17 +72,9 @@ QString RFGatewayClient::resolveGatewayPath() const {
     return QString();
 }
 
-QString RFGatewayClient::resolvedRfInputPath() const {
-    const QString defaultPath = defaultRFInputPath();
-    if (options_.rfInput.isEmpty() || options_.rfInput == defaultPath) {
-        return defaultPath;
-    }
-    return defaultPath;
-}
-
 QStringList RFGatewayClient::buildGatewayArgs() const {
     QStringList args;
-    args << "--rf-input" << resolvedRfInputPath();
+    args << "--rf-input" << defaultRFInputPath();
     return args;
 }
 
@@ -92,7 +84,7 @@ void RFGatewayClient::startGateway() {
     }
 
     const QString gatewayPath = resolveGatewayPath();
-    const QString rfInputPath = resolvedRfInputPath();
+    const QString rfInputPath = defaultRFInputPath();
     if (gatewayPath.isEmpty()) {
         backend_->updateSerialStatus(false);
         backend_->addLog(
@@ -350,7 +342,7 @@ void RFGatewayClient::handleProtocolLine(const QString &line) {
         }
 
         backend_->updateSerialStatus(true, scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
-            ? resolvedRfInputPath()
+            ? defaultRFInputPath()
             : scalarJsonString(payload.value(QStringLiteral("rf_input"))));
         backend_->addRFEvent(event, pulses);
         backend_->addLog("INFO", "RF", line);
@@ -366,7 +358,7 @@ void RFGatewayClient::handleProtocolLine(const QString &line) {
         const int crcErrors = payload.value(QStringLiteral("driver_crc_err")).toInt(-1);
         const int driverDropFrames = payload.value(QStringLiteral("app_drv_drop")).toInt(-1);
 
-        backend_->updateSerialStatus(rfOnline, rfInputPath.isEmpty() ? resolvedRfInputPath() : rfInputPath);
+        backend_->updateSerialStatus(rfOnline, rfInputPath.isEmpty() ? defaultRFInputPath() : rfInputPath);
         backend_->updateProtocolStats(crcErrors, -1, driverDropFrames);
         backend_->addLog("INFO", "RF", line);
         if (mqttPublished && !topic.isEmpty()) {
@@ -386,7 +378,7 @@ void RFGatewayClient::handleProtocolLine(const QString &line) {
             backend_->updateSerialStatus(
                 payload.value(QStringLiteral("driver_online")).toBool(false),
                 scalarJsonString(payload.value(QStringLiteral("rf_input"))).isEmpty()
-                    ? resolvedRfInputPath()
+                    ? defaultRFInputPath()
                     : scalarJsonString(payload.value(QStringLiteral("rf_input")))
             );
         }

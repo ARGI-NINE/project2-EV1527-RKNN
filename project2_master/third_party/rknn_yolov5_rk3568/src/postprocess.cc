@@ -1,5 +1,5 @@
 // postprocess.cc — YOLOv5 INT8 quantized post-processing
-// Taken from official rknn_yolov5_demo with no modification.
+// Adapted from the official rknn_yolov5_demo for this project.
 // Handles 3 detection heads (stride 8/16/32), NMS, dequantization.
 
 #include "postprocess.h"
@@ -11,15 +11,19 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include <array>
+#include <fstream>
 #include <mutex>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
-#define LABEL_NALE_TXT_PATH "./model/coco_80_labels_list.txt"
+#define LABEL_NAME_TXT_PATH "./model/coco_80_labels_list.txt"
 
-static char *labels[OBJ_CLASS_NUM];
-static char label_file_path[512] = LABEL_NALE_TXT_PATH;
-static std::once_flag labels_init_once;
-static int labels_init_ret = -1;
+static std::array<std::string, OBJ_CLASS_NUM> labels;
+static std::string label_file_path = LABEL_NAME_TXT_PATH;
+static std::mutex labels_mutex;
+static bool labels_initialized = false;
 
 const int anchor0[6] = {10, 13, 16, 30, 33, 23};
 const int anchor1[6] = {30, 61, 62, 45, 59, 119};
@@ -27,67 +31,60 @@ const int anchor2[6] = {116, 90, 156, 198, 373, 326};
 
 inline static int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
 
-char *readLine(FILE *fp, char *buffer, int *len)
-{
-    int ch;
-    int i = 0;
-    size_t buff_len = 0;
-
-    buffer = (char *)malloc(buff_len + 1);
-    if (!buffer) return NULL;
-
-    while ((ch = fgetc(fp)) != '\n' && ch != EOF) {
-        buff_len++;
-        void *tmp = realloc(buffer, buff_len + 1);
-        if (tmp == NULL) { free(buffer); return NULL; }
-        buffer = (char *)tmp;
-        buffer[i] = (char)ch;
-        i++;
-    }
-    buffer[i] = '\0';
-    *len = buff_len;
-
-    if (ch == EOF && (i == 0 || ferror(fp))) { free(buffer); return NULL; }
-    return buffer;
-}
-
 int setLabelNamePath(const char *path)
 {
     if (path == nullptr || path[0] == '\0') {
         return -1;
     }
-    snprintf(label_file_path, sizeof(label_file_path), "%s", path);
+    std::lock_guard<std::mutex> lock(labels_mutex);
+    if (labels_initialized) {
+        return label_file_path == path ? 0 : -1;
+    }
+    label_file_path = path;
     return 0;
 }
 
-int readLines(const char *fileName, char *lines[], int max_line)
+static int loadLabelNames(const std::string &fileName, std::array<std::string, OBJ_CLASS_NUM> *out)
 {
-    FILE *file = fopen(fileName, "r");
-    char *s = nullptr;
-    int i = 0;
-    int n = 0;
+    std::ifstream file(fileName);
+    std::string line;
+    size_t count = 0;
 
-    if (file == NULL) { printf("Open %s fail!\n", fileName); return -1; }
-
-    while ((s = readLine(file, s, &n)) != NULL) {
-        lines[i++] = s;
-        if (i >= max_line) break;
-    }
-    fclose(file);
-    return i;
-}
-
-int loadLabelName(const char *locationFilename, char *label[])
-{
-    printf("loadLabelName %s\n", locationFilename);
-    int count = readLines(locationFilename, label, OBJ_CLASS_NUM);
-    if (count <= 0) {
+    if (!file.is_open()) {
+        printf("Open %s fail!\n", fileName.c_str());
         return -1;
     }
-    for (int i = count; i < OBJ_CLASS_NUM; i++) {
-        label[i] = nullptr;
+    while (count < out->size() && std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        (*out)[count++] = line;
+    }
+    if (count == 0) {
+        return -1;
+    }
+    while (count < out->size()) {
+        (*out)[count++].clear();
     }
     return 0;
+}
+
+static int ensureLabelsInitialized()
+{
+    std::lock_guard<std::mutex> lock(labels_mutex);
+    if (labels_initialized) {
+        return 0;
+    }
+
+    std::array<std::string, OBJ_CLASS_NUM> loaded;
+    int init_result = -1;
+    printf("loadLabelName %s\n", label_file_path.c_str());
+    init_result = loadLabelNames(label_file_path, &loaded);
+    if (init_result == 0) {
+        labels = std::move(loaded);
+        labels_initialized = true;
+    }
+    return init_result;
 }
 
 static float CalculateOverlap(float xmin0, float ymin0, float xmax0, float ymax0,
@@ -227,10 +224,7 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
                  std::vector<int32_t> &qnt_zps, std::vector<float> &qnt_scales,
                  detect_result_group_t *group)
 {
-    std::call_once(labels_init_once, [](){
-        labels_init_ret = loadLabelName(label_file_path, labels);
-    });
-    if (labels_init_ret < 0) {
+    if (ensureLabelsInitialized() < 0) {
         return -1;
     }
 
@@ -291,7 +285,10 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
         group->results[last_count].box.right  = (int)(clamp(x2, 0, model_in_w) / scale_w);
         group->results[last_count].box.bottom = (int)(clamp(y2, 0, model_in_h) / scale_h);
         group->results[last_count].prop = obj_conf;
-        const char *label = (id >= 0 && id < OBJ_CLASS_NUM && labels[id] != nullptr) ? labels[id] : "unknown";
+        const char *label =
+            (id >= 0 && id < OBJ_CLASS_NUM && !labels[(size_t)id].empty())
+                ? labels[(size_t)id].c_str()
+                : "unknown";
         strncpy(group->results[last_count].name, label, OBJ_NAME_MAX_SIZE - 1);
         group->results[last_count].name[OBJ_NAME_MAX_SIZE - 1] = '\0';
         last_count++;
@@ -302,10 +299,5 @@ int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h,
 
 void deinitPostProcess()
 {
-    for (int i = 0; i < OBJ_CLASS_NUM; i++) {
-        if (labels[i] != nullptr) {
-            free(labels[i]);
-            labels[i] = nullptr;
-        }
-    }
+    /* Labels are immutable process-lifetime data shared by all model instances. */
 }

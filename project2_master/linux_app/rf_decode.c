@@ -29,6 +29,7 @@ int rf_decode_frame(
     }
 
     memset(out, 0, sizeof(*out));
+    memset(&c_result, 0, sizeof(c_result));
     memset(&g_rf_last_call_stats, 0, sizeof(g_rf_last_call_stats));
     g_rf_last_call_stats.frame_len = frame->len;
 
@@ -39,10 +40,10 @@ int rf_decode_frame(
 
     g_rf_last_call_stats.c_total_us = t1 - t0;
     g_rf_last_call_stats.total_us = t1 - t0;
-    g_rf_last_call_stats.c_confidence = c_result.confidence;
     g_rf_decode_stats.c_total_us += g_rf_last_call_stats.c_total_us;
 
     if (c_rc == 0) {
+        g_rf_last_call_stats.c_confidence = c_result.confidence;
         snprintf(out->addr, sizeof(out->addr), "0x%06X", c_result.raw_code);
         snprintf(out->key, sizeof(out->key), "%u", (unsigned)c_result.button4);
         snprintf(out->source, sizeof(out->source), "c");

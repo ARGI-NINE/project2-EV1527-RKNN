@@ -557,8 +557,6 @@ void RFGatewayClient::onPrepFinished(int exitCode, QProcess::ExitStatus exitStat
             replayWavSecByIdx_.insert(frameIndex, wavSec);
         }
     }
-    const qint64 prepFinishedAtMs = QDateTime::currentMSecsSinceEpoch();
-    (void)prepFinishedAtMs;
     backend_->addLog(
         QStringLiteral("INFO"),
         QStringLiteral("RF"),

@@ -24,14 +24,15 @@ endif()
 target_include_directories(rf_common PUBLIC ../common)
 target_include_directories(rf_gateway_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../common)
 
-add_executable(
-  rf_gateway
-  main.c
-  $<TARGET_OBJECTS:rf_gateway_core>
-  $<TARGET_OBJECTS:rf_common>
-)
-
-if(NOT WIN32)
+if(WIN32)
+  add_executable(
+    rf_gateway
+    main.c
+    $<TARGET_OBJECTS:rf_gateway_core>
+    $<TARGET_OBJECTS:rf_common>
+  )
+else()
+  add_executable(rf_gateway main.c)
   target_link_libraries(rf_gateway PRIVATE rf_gateway_core rf_common)
 endif()
 

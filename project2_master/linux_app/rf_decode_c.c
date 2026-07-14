@@ -12,7 +12,6 @@
 #define EV1527_CLK_MIN_US 230.0f
 #define EV1527_CLK_MAX_US 4240.0f
 #define EV1527_SYNC_LOW_LONGEST_MIN_RATIO 3.0f
-#define EV1527_MIN_CONFIDENCE 0.0f
 #define EV1527_PROFILE_BIT_SHORT_T 1.0f
 #define EV1527_PROFILE_BIT_LONG_T 3.0f
 #define EV1527_PROFILE_SYNC_HIGH_T 1.0f
@@ -22,7 +21,6 @@
 
 typedef struct {
     int level;
-    uint16_t start;
     uint16_t length;
 } rf_run_t;
 
@@ -71,7 +69,6 @@ static float rel_err_quantized(float obs_len, float expected_len) {
 
 static void build_runs_from_frame(const rf_frame_t *frame, int start_level, rf_run_t *runs_out, uint16_t *run_count_out) {
     uint16_t i = 0u;
-    uint16_t cursor = 0u;
     int level = start_level ? 1 : 0;
     if (runs_out == NULL || run_count_out == NULL) {
         return;
@@ -83,9 +80,7 @@ static void build_runs_from_frame(const rf_frame_t *frame, int start_level, rf_r
     for (i = 0u; i < frame->len && i < RF_BUFFER_SIZE; ++i) {
         const uint16_t sample_len = us_to_samples(frame->pulse[i]);
         runs_out[i].level = level;
-        runs_out[i].start = cursor;
         runs_out[i].length = sample_len;
-        cursor = (uint16_t)(cursor + sample_len);
         level = level ? 0 : 1;
         *run_count_out = (uint16_t)(*run_count_out + 1u);
     }
@@ -310,10 +305,6 @@ static int decode_best_from_runs(
                 0.10f * low_penalty
             );
             conf = fmaxf(0.0f, raw_conf) * fminf(1.0f, low_ratio / 2.2f);
-        }
-
-        if (conf < EV1527_MIN_CONFIDENCE) {
-            continue;
         }
 
         if (stats != NULL) {

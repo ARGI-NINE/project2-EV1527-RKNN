@@ -15,7 +15,6 @@ static uint8_t g_uart_tx_packet[RF_UART_PACKET_MAX_LEN];
 static uint8_t g_uart_tx_fifo[RF_UART_TX_FIFO_SIZE];
 static volatile uint16_t g_uart_tx_head = 0u;
 static volatile uint16_t g_uart_tx_tail = 0u;
-static volatile uint32_t g_uart_tx_drop_frames = 0u;
 
 static uint16_t RF_Uart_TxUsed(void) {
     const uint16_t head = g_uart_tx_head;
@@ -38,11 +37,9 @@ static uint8_t RF_Uart_TxEnqueue(const uint8_t *Array, uint16_t Length) {
         return 0u;
     }
     if (Length >= RF_UART_TX_FIFO_SIZE) {
-        g_uart_tx_drop_frames++;
         return 0u;
     }
     if (RF_Uart_TxFree() < Length) {
-        g_uart_tx_drop_frames++;
         return 0u;
     }
 
@@ -62,9 +59,6 @@ static uint8_t RF_Uart_TxEnqueue(const uint8_t *Array, uint16_t Length) {
 
 static uint8_t RF_Uart_TxDequeueByte(uint8_t *Byte) {
     uint16_t tail = 0u;
-    if (Byte == NULL) {
-        return 0u;
-    }
     if (g_uart_tx_tail == g_uart_tx_head) {
         return 0u;
     }
@@ -132,7 +126,7 @@ uint8_t RF_Uart_SendFrame(const rf_frame_t *Frame) {
         return 0u;
     }
     n = rf_proto_encode(Frame, g_uart_tx_packet, sizeof(g_uart_tx_packet));
-    if (n > 0u && n <= 65535u) {
+    if (n > 0u) {
         return RF_Uart_SendArray(g_uart_tx_packet, (uint16_t)n);
     }
     return 0u;

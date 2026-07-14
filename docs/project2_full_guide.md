@@ -1,277 +1,146 @@
-# project2 总览与阅读地图
+# Project2 端到端指南
 
-## 1. 这份文档负责什么
+## 1. 读者、目标与前置条件
 
-这份文档是整个仓库的总入口，不替代各子目录的专题深读。它只做四件事：
+本文面向第一次接手工程的开发者。完成后，你应能在主机上验证协议/解码，在 PC 上回放 WAV，理解板端 RF 与视觉链路，并知道哪些结果必须在真实硬件上确认。
 
-1. 统一项目定位。
-2. 讲清楚当前代码里到底已经落了哪些主链。
-3. 明确本次完成口径只到“静态代码要求与静态代码检验”。
-4. 给出一条从顶层到专题、再到具体代码的阅读路线。
+按任务准备环境：
 
-如果你需要的是逐函数讲解，请直接跳到后面的专题文档，而不是停留在本页。
+- 主机契约：CMake 3.15+、C/C++ 编译器、CTest、Python 3；构建 Linux 网关还需 libmosquitto 开发包。
+- PC GUI：Qt 5 Widgets、CMake；WSL 视觉桥按 `project2_pc_sim` 文档准备 Python/OpenCV。
+- STM32：STM32F10x 标准外设库工程与 ARM 工具链，RF 接收模块接 PA0，USART1 PA9/PA10 与主控交叉连接且共地。
+- RK3568：匹配运行内核的源码/配置、可用 serdev UART、`/dev/video*`、板端 RKNN/RGA/MPP/FFmpeg 库；外部 MQTT/RTSP 服务需自行提供。
 
-## 2. 统一项目定位
+所有命令默认从仓库根目录执行。
 
-`project2` 当前统一定位为“基于 RK3568 的多源事件感知与视频留证网关”。
+## 2. 先理解数据契约
 
-这个定位要拆成三层来理解：
-
-- “多源事件感知”表示它不是只围绕一个 RF433 解码器组织代码，而是围绕“事件源接入”组织代码。
-- “视频留证”表示视觉链路不是装饰页面，而是项目里独立存在的一条本地运行链。
-- “网关”表示它关注的是接入、归一化、展示、发布与扩展接口，不是门禁控制器本体。
-
-从当前代码看，真正落地的事件源只有两类：
-
-- 已落地：RF433/EV1527 前端适配链。
-- 已落地：板端本地视觉检测链。
-
-另外还有两类只到规划或保留位：
-
-- 规划中：MQTT command 输入。
-- 保留位：GPIO 干接点输入。
-
-## 3. 本次完成口径
-
-这一节非常关键，后续所有文档都以这里为准。
-
-### 3.1 可以确认什么
-
-当前可以通过静态代码直接确认的内容包括：
-
-- 目录职责分工。
-- 模块之间的数据流向。
-- 驱动、用户态、Qt、本地视觉运行时的入口函数和依赖关系。
-- RF 帧协议的字节格式。
-- 当前代码里哪些功能是主链，哪些只是辅助模块或扩展位。
-
-### 3.2 不能宣称什么
-
-当前不能因为代码存在，就直接宣称下面这些事情已经完成：
-
-- STM32 采集板与 RK3568 板卡的实机接线和长期稳定联调。
-- `project2_hardware -> UART -> serdev -> /dev/rf433 -> rf_gateway -> Qt` 的整机验收。
-- 视觉检测与事件录制的整机闭环。
-- MQTT 命令下发闭环。
-- GPIO 干接点实机接入闭环。
-
-所以，这次文档的正确口径只能是：
-
-> 已完成静态代码要求与静态代码检验，不宣称实机联调完成。
-
-## 4. 三个子项目分别负责什么
-
-| 子项目 | 你可以把它理解成什么 | 当前代码里的核心职责 | 明确不该写成什么 |
-| --- | --- | --- | --- |
-| `project2_hardware` | RF 前端适配固件 | 采脉冲、分帧、编码、串口上送 | 不是门禁控制器，不是最终解码展示层 |
-| `project2_master` | RK3568 板端网关主体 | 驱动接入、用户态解析、Qt 看板、本地视觉运行时 | 不是离线仿真器 |
-| `project2_pc_sim` | PC 侧离线回放与参考环境 | WAV 回放、WSL 视觉桥接、回归参考 | 不是板端运行路径，不是验收真值源 |
-
-## 5. 当前代码里的两条主链
-
-## 5.1 RF433 事件主链
-
-这是当前仓库里最明确、也最适合从下往上追的一条链。
+STM32 把相邻边沿间隔存为 `uint16_t` 微秒。完整串口帧：
 
 ```text
-RF 前端脉冲
--> project2_hardware/Hardware/RF_Capture.c
--> project2_hardware/Hardware/RF_Protocol.c
--> project2_hardware/Hardware/RF_Uart.c
--> RK3568 串口
--> project2_master/linux_driver/rf433_drv.c
--> /dev/rf433
--> project2_master/linux_app/main.c
--> JSON envelope / MQTT
--> project2_master/qt_gui
+AA 55 | pulse_count_lo pulse_count_hi | pulse_0_lo pulse_0_hi ... | xor
 ```
 
-这条链里每一层分别做什么：
+`pulse_count` 与每个 pulse 都是 LE16。`xor` 从两个长度字节起异或到 payload 末尾。EV1527 解码器通常需要约 50 个脉宽（同步高/低加 24 bit 的高/低），因此示例不能把 8 个 pulse 当作完整可解码事件。
 
-- STM32 固件把离散的脉冲宽度整理成 `rf_frame_t`，再编码成 `AA55 + LEN + PAYLOAD + CRC`。
-- RK3568 驱动把串口字节流重新拼成帧，导出为 `/dev/rf433`。
-- `rf_gateway` 从 `/dev/rf433` 读帧、做 EV1527 解码、做稳定分组和去重、再输出 JSON。
-- Qt 侧消费这些 JSON，并把状态和波形显示出来。
+代码路径：
 
-这里要特别记住：Qt 不是 RF 数据的生产者，只是消费和展示层。
+1. `project2_hardware/Hardware/RF_Capture.c` 在 TIM2 双边沿中断中形成 pulse。
+2. `RF_Capture_ProcessLoop` 从 ready queue 取帧并调用 `RF_Uart_SendFrame`；该哨兵环有 4 个后备槽、有效容量为 3 帧，满时拒绝新到帧，不会淘汰旧帧来保证 freshness。
+3. `project2_master/linux_driver/rf433_drv.c` 验证同步、长度与 XOR，写入 16 帧 drop-oldest kfifo。
+4. `project2_master/linux_app/rf_epoll.c` 读取 `struct rf433_frame`，`rf_decode.c` 调用 EV1527 C 解码器。
+5. `main.c` 做近码合并、重复稳定与发布间隔限制，再输出 JSON；连接 broker 时同时发布 MQTT。
 
-这一节不是抽象总结，下面几段源码就是主链的真实锚点。
+## 3. 主机上验证代码
 
-摘自 `project2_hardware/Hardware/RF_Protocol.c`：
+### 3.1 master 的可移植测试
 
-```c
-bytes = (uint16_t)(frame->len * 2u);
-total = (size_t)2u + 2u + bytes + 1u;
-
-out[0] = RF_PROTO_SYNC0;
-out[1] = RF_PROTO_SYNC1;
-out[2] = (uint8_t)(frame->len & 0xFFu);
-out[3] = (uint8_t)((frame->len >> 8u) & 0xFFu);
+```bash
+cmake -S project2_master -B build/master-tests \
+  -DBUILD_LINUX_APP=OFF -DBUILD_QT5_GUI=OFF -DBUILD_TESTING=ON
+cmake --build build/master-tests
+ctest --test-dir build/master-tests --output-on-failure
 ```
 
-这段代码直接证明 hardware 上送协议的起点就是 `AA55 + LEN`，并且 `LEN` 表示 pulse 个数而不是 payload 字节数。文档里把共享 ABI 写成 `AA55/LEN/PAYLOAD/XOR`，依据就在这里。
+成功标准因平台而异：Unix 上应为 2/2，通过 `rf_decode_contract` 与 `postprocess_labels_lifetime`；Windows 上只生成可移植的 `postprocess_labels_lifetime`，应为 1/1。前者验证 AA55/LE16/XOR、50-pulse 接受、49-pulse 拒绝和失败 confidence 为确定值；后者验证标签加载后保持进程级生命周期，并拒绝随后传入的冲突路径。
 
-摘自 `project2_master/linux_driver/rf433_drv.c`：
+### 3.2 PC 协议和 Python CLI
 
-```c
-memset(&frame, 0, sizeof(frame));
-frame.timestamp_ns = ktime_get_real_ns();
-frame.pulse_count  = priv->expected_pulses;
-frame.seq          = ++priv->seq;
+```bash
+cmake -S project2_pc_sim -B build/pc-tests \
+  -DBUILD_LINUX_APP=ON -DBUILD_QT5_GUI=OFF -DBUILD_TESTING=ON
+cmake --build build/pc-tests
+ctest --test-dir build/pc-tests --output-on-failure
 
-for (i = 0; i < priv->expected_pulses; i++) {
-    u16 lo = priv->payload_buf[i * 2];
-    u16 hi = priv->payload_buf[i * 2 + 1];
-    frame.pulse[i] = lo | (hi << 8);
-}
+python -B -m unittest discover -s tests -p 'test*.py' -v
+python -B ev1527_decode.py --help
 ```
 
-这里说明 `/dev/rf433` 之前的驱动层不仅把 UART payload 重新拼回 `pulse[]`，还新增了 `timestamp_ns` 和驱动侧 `seq`。所以 `timestamp_ns` 不是 hardware wire ABI 自带字段，而是 master driver 层新增的元数据。
+PC CTest 还检查错误 XOR 后恢复、超长长度拒绝和 AA 重同步。Python 的 `--json-include-all-clusters` 只在写 JSON 时生效：默认只写 repeat-valid cluster；加该选项后保留所有 cluster，并在每项中保留 `repeat_valid` 便于分析。
 
-摘自 `project2_master/linux_app/main.c`：
+示例：
 
-```c
-"\"addr\":\"%s\","
-"\"key\":\"%s\","
-"\"conf\":%.4f,"
-"\"confidence\":%.4f,"
-"\"src\":\"%s\","
-"\"source\":\"%s\","
-"\"seq\":%u,"
-"\"drv_seq\":%u,"
-"\"timestamp_ns\":%llu,"
-"\"decode_us\":%llu,"
-"\"mqtt_connected\":%s,"
-"\"pulse_count\":%u,"
-"\"pulse_us\":[",
+```bash
+python -B ev1527_decode.py --wav capture03.wav --start-sec 0 --end-sec 10 \
+  --json-out build/default.json
+python -B ev1527_decode.py --wav capture03.wav --start-sec 0 --end-sec 10 \
+  --json-out build/all.json --json-include-all-clusters
 ```
 
-这一段则说明真正面向 Qt 和 MQTT 的业务字段是在 `rf_gateway` 用户态里组装的。也正因为如此，本总览把 `addr` / `key` / `conf` 明确归到 `project2_master/linux_app` 之后，而不反写回 hardware 文档。
+若提示 `No candidate frame found`，先确认 WAV 路径和时间段，再检查采样波形；不要先用极低 confidence 阈值掩盖输入问题。
 
-## 5.2 板端本地视觉主链
+## 4. PC 回放 RF 主链路
 
-第二条主链在 `project2_master` 内部，重点不是“网页服务”，而是本地运行时。
+```bash
+python project2_pc_sim/python/wav_to_pulses.py \
+  --wav capture03.wav --start-sec 0 --end-sec 10 \
+  --out-json project2_pc_sim/sim_data/pulse.json \
+  --out-txt project2_pc_sim/sim_data/pulse.txt
 
-```text
-/dev/video* 或本地视频文件
--> VisionRuntime
--> AI 输入池
--> RKNN 推理
--> 推理后流分支
--> VisionSnapshot
--> Qt 视觉页面
--> detection MQTT / RTSP 状态与推流支线
+python project2_pc_sim/python/replay_pulse_timeline.py \
+  --pulse-json project2_pc_sim/sim_data/pulse.json \
+  | build/pc-tests/linux_app/rf_gateway --rf-input -
 ```
 
-从代码事实看，这条链至少可以确认下面几点：
+`wav_to_pulses.py` 把音频边沿变为 pulse frame；replay 按时间线输出二进制协议；PC `rf_gateway` 只接受 stdin (`--rf-input -`) 并输出事件 JSON。Windows/生成器的可执行文件位置可能不同，以 CMake 构建输出为准。
 
-- 默认视觉输入是 `/dev/video9`。
-- `--vision-device` 也接受一个可读的本地视频文件。
-- 本地视觉运行时在 Qt 进程内，不依赖 `pc_sim`。
-- RTSP 是视觉链的输出支线之一，但本文不展开其协议细节。
+成功标准：进程无协议错误退出，并在足够重复、confidence 达阈值时输出 `rf_event`。无事件时同时检查：提取出的帧是否约 50 pulse、`--stable-repeat` 默认 2、`--min-publish-confidence` 默认 0.72、同码 `--publish-gap` 默认 6。
 
-摘自 `project2_master/qt_gui/vision/vision_runtime.cpp`：
+## 5. 部署 RF 板端链路
 
-```cpp
-const QString modelPath = resolveModelPath();
-const QString inputPath = options_.visionDevice.trimmed();
-const bool useV4L2 = isAllowedVisionDevicePath(inputPath);
+1. 按 [STM32 教程](../project2_hardware/README.md) 把 `project2_hardware` 加入现有标准外设库工程并烧录。
+2. 按 [Linux 驱动教程](../project2_master/linux_driver/README.md) 配置 DTS、构建并加载 `rf433_drv.ko`。
+3. 确认 `/dev/rf433` 是字符设备且当前用户有权限。
+4. 构建并启动网关：
 
-if (modelPath.isEmpty()) {
-    backend_->addLog(
-        "ERROR",
-        "VISION",
-        QStringLiteral("VisionRuntime could not find a usable RKNN model inside project2_master assets")
-    );
-    running_.store(false);
-    return;
-}
-
-rknnPool<rkYolov5s> aiPool(modelPath.toStdString(), kAiWorkerThreads, kAiQueueSize);
-if (aiPool.init() != 0) {
-    backend_->addLog("ERROR", "VISION", QStringLiteral("VisionRuntime model init failed: %1").arg(modelPath));
-    running_.store(false);
-    return;
-}
+```bash
+cmake -S project2_master -B build/master \
+  -DBUILD_LINUX_APP=ON -DBUILD_QT5_GUI=OFF -DBUILD_TESTING=ON
+cmake --build build/master
+./build/master/linux_app/rf_gateway --rf-input /dev/rf433
 ```
 
-这段代码可以直接支撑“板端本地视觉运行时在 Qt 进程内”这个结论：它不是去连 `pc_sim` bridge，而是就地解析 `--vision-device`、定位 `project2_master` 里的模型文件，并创建 `rknnPool<rkYolov5s>` 做本地推理。
+master 明确只允许 `/dev/rf433`。stdout 的 envelope 总含 `type`、完整 `topic`、`mqtt_published`、`payload`；broker 不可用时仍应保留本地 JSON，MQTT 只降级而不终止 RF 处理。统计 timer 创建/注册失败只会禁用周期统计，不会放宽设备读错误处理。
 
-MQTT / RTSP 专题如果要继续深入，请转到：
+## 6. 启动 Qt 与视觉链路
 
-- [../project2_master/docs/project2_iot_design.md](../project2_master/docs/project2_iot_design.md)
-- [../project2_master/docs/rk3568_vision_dashboard.md](../project2_master/docs/rk3568_vision_dashboard.md)
+板端 GUI 依赖 RK3568 的本地媒体和 AI 库，不能用普通 PC 构建成功来替代目标验证。用匹配 toolchain/sysroot 配置并构建：
 
-## 6. 当前代码中的“已实现 / 保留 / 规划”总表
+```bash
+cmake -S project2_master -B build/master-board \
+  -DBUILD_LINUX_APP=ON -DBUILD_QT5_GUI=ON -DBUILD_TESTING=ON
+cmake --build build/master-board
+```
 
-| 能力项 | 现状 | 依据的代码事实 | 文档应如何表述 |
-| --- | --- | --- | --- |
-| STM32 采脉冲并 UART 上送 | 已实现 | `project2_hardware/User/main.c`、`RF_Capture.c`、`RF_Uart.c` | 可以写成已落地主链 |
-| RK3568 通过 serdev 导出 `/dev/rf433` | 已实现 | `project2_master/linux_driver/rf433_drv.c` | 可以写成已落地主链 |
-| `rf_gateway` 读取 `/dev/rf433` 并输出 JSON | 已实现 | `project2_master/linux_app/main.c` | 可以写成已落地主链 |
-| Qt 消费 RF JSON 并展示 | 已实现 | `project2_master/qt_gui/rf/*` | 可以写成已落地主链 |
-| 板端本地视觉运行时 | 已实现 | `project2_master/qt_gui/vision/vision_runtime.cpp` | 可以写成已落地主链 |
-| MQTT 发布 | 已实现但非本文重点 | `linux_app/mqtt_publisher.c`、`vision_runtime.cpp` | 只点到为止，细节外链 |
-| RTSP 推流支线 | 已实现但非本文重点 | `vision_runtime.cpp`、`mpp_encoder_rtsp.*` | 只点到为止，细节外链 |
-| MQTT command 输入 | 未完成 | 当前代码无命令订阅与处理闭环 | 必须写成规划 / TODO |
-| GPIO 干接点输入 | 未完成 | 仓库当前无落地实现 | 必须写成预留位 |
-| 事件触发录制闭环 | 未完成 | 只有接口规划，没有完整实装闭环 | 必须写成 TODO |
-| 实机联调完成 | 未确认 | 仓库无法靠静态代码证明 | 不得宣称 |
+随后运行：
 
-## 7. 顶层阅读路线
+```bash
+./build/master-board/qt_gui/rf_dashboard_qt5 \
+  --rf-input /dev/rf433 \
+  --vision-device /dev/video9 \
+  --vision-rtsp-url rtsp://192.168.30.26:8554/rk3568-001/cam0
+```
 
-## 7.1 推荐给第一次接手仓库的人
+也可用 `--disable-vision-rtsp` 关闭推流支路，或把 `--vision-device` 指向可读本地视频文件。程序会拒绝非 `/dev/video*` 且不可读的文件路径。
 
-1. 先读本页，建立整体地图。
-2. 再读 [project2_hardware_deep_dive.md](project2_hardware_deep_dive.md)，确认下位机链路的真实边界。
-3. 然后去 [../project2_master/docs/project2_master_reading_guide_zh.md](../project2_master/docs/project2_master_reading_guide_zh.md)，继续追板端主控侧。
-4. 最后再按需要看 `pc_sim` 文档，避免一上来把仿真路径误当成板端路径。
+视觉 publish 条件：帧成功转为 RGB 且 `detGroup.count > 0` 才发 `vision/detection`；编码器打开失败时，每次重试都可能向 retained `stream/status` 发布 `state="offline"`、`reason="open_failed"`，两个字段不能合并成 `state="open_failed"`。
 
-## 7.2 如果你只关心硬件链路
+## 7. MQTT 与 RTSP 验收
 
-按下面顺序读：
+固定默认值由代码定义：broker `192.168.30.26:1883`，device `rk3568-001`，根 topic `argi/device/rk3568-001`；RTSP URL 为 `rtsp://192.168.30.26:8554/rk3568-001/cam0`。具体订阅、retain 和故障恢复见 [MQTT 教程](../project2_master/docs/mqtt_publish_tutorial_zh.md)，推流观察见 [RTSP 教程](../project2_master/docs/rtsp_push_tutorial_zh.md)。
 
-1. [project2_hardware_deep_dive.md](project2_hardware_deep_dive.md)
-2. [project2_hardware_deep_dive_01_overview.md](project2_hardware_deep_dive_01_overview.md)
-3. [project2_hardware_deep_dive_02_capture_and_uart.md](project2_hardware_deep_dive_02_capture_and_uart.md)
-4. [project2_hardware_deep_dive_03_protocol_timer_and_aux.md](project2_hardware_deep_dive_03_protocol_timer_and_aux.md)
-5. [project2_hardware_deep_dive_04_function_index.md](project2_hardware_deep_dive_04_function_index.md)
+## 8. 排错顺序
 
-## 7.3 如果你只关心 RK3568 板端软件
+1. 没有 UART 数据：检查 PA0 输入、PA9 TX、9600 8N1、共地和逻辑分析仪波形。
+2. 驱动 `crc_err` 增长：这里指 legacy 名称下的 XOR 不匹配；检查串口丢字节、端序和帧边界。
+3. `/dev/rf433` 无法打开：检查 serdev 绑定、字符设备权限和 DTS compatible。
+4. 有帧无事件：检查 pulse 数、decoder confidence、稳定重复与 publish gap。
+5. `mqtt_published=false`：先看本地 JSON，再检查 broker 地址、ACL 和网络；不要把本地处理成功误判成 MQTT 成功。
+6. 视觉在线但无 detection topic：确认 RGB 转换成功且确实有目标。
+7. RTSP 不可播放：区分编码器 open、进程内 FFmpeg/libavformat 输出、服务器写权限和客户端缓存；GUI 本地推理仍可能正常。
 
-按下面顺序读：
+## 9. 清理与验证边界
 
-1. [../project2_master/docs/project2_master_reading_guide_zh.md](../project2_master/docs/project2_master_reading_guide_zh.md)
-2. [../project2_master/docs/project2_shared_protocol_deep_dive.md](../project2_master/docs/project2_shared_protocol_deep_dive.md)
-3. [../project2_master/docs/project2_master_driver_deep_dive.md](../project2_master/docs/project2_master_driver_deep_dive.md)
-4. [../project2_master/docs/project2_master_userland_deep_dive.md](../project2_master/docs/project2_master_userland_deep_dive.md)
-5. [../project2_master/docs/project2_master_qt_vision_deep_dive.md](../project2_master/docs/project2_master_qt_vision_deep_dive.md)
+停止用户态进程用 `Ctrl+C`，卸载驱动前先停止所有 `/dev/rf433` 使用者，再执行 `sudo rmmod rf433_drv`。构建目录和 `project2_pc_sim/sim_data` 是生成内容，可直接重建，不应提交。
 
-## 7.4 如果你只关心仿真与对照
-
-直接读：
-
-- [../project2_pc_sim/docs/project2_pc_sim_reading_guide.md](../project2_pc_sim/docs/project2_pc_sim_reading_guide.md)
-- [../project2_pc_sim/docs/project2_pc_sim_function_index.md](../project2_pc_sim/docs/project2_pc_sim_function_index.md)
-- [../project2_pc_sim/docs/pc_sim_architecture.md](../project2_pc_sim/docs/pc_sim_architecture.md)
-
-## 8. 阅读时最容易踩的三个误区
-
-### 误区 1：把 `pc_sim` 当成板端主路径
-
-不是。`pc_sim` 是离线仿真和回归参考。板端主路径在 `project2_master`。
-
-### 误区 2：把 Qt 当成 RF 主链的生产层
-
-不是。RF 主链的关键生产层是 `project2_hardware`、`rf433_drv` 和 `rf_gateway`。Qt 在 RF 侧主要是消费层，在视觉侧才同时承担本地运行时宿主角色。
-
-### 误区 3：把“代码里有支线”理解成“实机已经闭环”
-
-不能这么写。尤其是 MQTT command、GPIO 干接点、事件录制、整机联调，这些都必须按“未完成或未验证”处理。
-
-## 9. 本页之后应该去哪里
-
-- 想看下位机固件主线：去 [project2_hardware_deep_dive.md](project2_hardware_deep_dive.md)
-- 想看协议字节格式：去 [../project2_master/docs/project2_shared_protocol_deep_dive.md](../project2_master/docs/project2_shared_protocol_deep_dive.md)
-- 想看 MQTT / RTSP 专题：去 [../project2_master/docs/project2_iot_design.md](../project2_master/docs/project2_iot_design.md) 和 [../project2_master/docs/rk3568_vision_dashboard.md](../project2_master/docs/rk3568_vision_dashboard.md)
-- 想看 PC 仿真：去 [../project2_pc_sim/docs/project2_pc_sim_reading_guide.md](../project2_pc_sim/docs/project2_pc_sim_reading_guide.md)
+当前主机验证不覆盖 STM32 中断时序、真实 UART 电气、内核 ABI 与目标内核绑定、RK3568 零拷贝/媒体/AI 运行、真实 broker 重连/retain、真实 RTSP server 接收。完成部署必须按对应教程在目标环境复验。

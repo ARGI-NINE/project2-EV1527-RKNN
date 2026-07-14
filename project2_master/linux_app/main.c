@@ -26,7 +26,7 @@ typedef struct {
     uint32_t anchor_code;
     uint32_t best_code;
     float best_conf;
-    uint16_t hits;
+    uint32_t hits;
     uint32_t last_seq;
 } rf_stable_group_t;
 
@@ -183,9 +183,6 @@ static uint8_t hamming24(uint32_t a, uint32_t b) {
 
 static void stable_groups_decay(app_ctx_t *ctx) {
     uint16_t i = 0u;
-    if (ctx == NULL) {
-        return;
-    }
     for (i = 0u; i < RF_STABLE_GROUP_MAX; ++i) {
         rf_stable_group_t *g = &ctx->stable_groups[i];
         if (!g->active) {
@@ -201,9 +198,6 @@ static int stable_group_find(const app_ctx_t *ctx, uint32_t code) {
     int best_idx = -1;
     uint8_t best_dist = 255u;
     uint16_t i = 0u;
-    if (ctx == NULL) {
-        return -1;
-    }
     for (i = 0u; i < RF_STABLE_GROUP_MAX; ++i) {
         const rf_stable_group_t *g = &ctx->stable_groups[i];
         uint8_t dist = 0u;
@@ -226,9 +220,6 @@ static int stable_group_alloc(app_ctx_t *ctx) {
     int best_idx = 0;
     uint32_t oldest_seq = 0xFFFFFFFFu;
     uint16_t i = 0u;
-    if (ctx == NULL) {
-        return -1;
-    }
     for (i = 0u; i < RF_STABLE_GROUP_MAX; ++i) {
         if (!ctx->stable_groups[i].active) {
             return (int)i;
@@ -244,9 +235,6 @@ static int stable_group_alloc(app_ctx_t *ctx) {
 }
 
 static void stable_group_seed(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq) {
-    if (g == NULL) {
-        return;
-    }
     memset(g, 0, sizeof(*g));
     g->active = 1;
     g->anchor_code = code & 0xFFFFFFu;
@@ -257,10 +245,9 @@ static void stable_group_seed(rf_stable_group_t *g, uint32_t code, float conf, u
 }
 
 static void stable_group_update(rf_stable_group_t *g, uint32_t code, float conf, uint32_t seq) {
-    if (g == NULL) {
-        return;
+    if (g->hits < UINT32_MAX) {
+        g->hits++;
     }
-    g->hits++;
     g->last_seq = seq;
     if (conf >= g->best_conf) {
         g->best_conf = conf;

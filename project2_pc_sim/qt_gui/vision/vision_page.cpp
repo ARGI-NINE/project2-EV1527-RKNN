@@ -12,28 +12,16 @@
 
 namespace dashboard {
 
-static QString normalizedVisionBridgeHost(const QString &configured, QString *reason) {
+static QString normalizedVisionBridgeHost(const QString &configured) {
     const QString host = configured.trimmed();
     if (host.isEmpty()) {
-        if (reason != nullptr) {
-            *reason = QStringLiteral("empty host -> 127.0.0.1");
-        }
         return QStringLiteral("127.0.0.1");
     }
     if (host == QStringLiteral("localhost")) {
-        if (reason != nullptr) {
-            *reason = QStringLiteral("localhost -> 127.0.0.1");
-        }
         return QStringLiteral("127.0.0.1");
     }
     if (host == QStringLiteral("0.0.0.0")) {
-        if (reason != nullptr) {
-            *reason = QStringLiteral("0.0.0.0 is bind-only -> 127.0.0.1");
-        }
         return QStringLiteral("127.0.0.1");
-    }
-    if (reason != nullptr) {
-        *reason = QStringLiteral("as configured");
     }
     return host;
 }
@@ -207,10 +195,8 @@ void VisionPage::setupVisionBridge() {
         return;
     }
 
-    QString normalizeReason;
     const QString configuredHost = options_.visionHost.trimmed();
-    visionBridgeHost_ = normalizedVisionBridgeHost(configuredHost, &normalizeReason);
-    Q_UNUSED(normalizeReason);
+    visionBridgeHost_ = normalizedVisionBridgeHost(configuredHost);
     visionBridgePort_ = static_cast<quint16>(options_.visionPort);
 
     visionSocket_ = new QTcpSocket(this);

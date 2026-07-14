@@ -218,7 +218,6 @@ def main() -> int:
     server.setblocking(False)
 
     clients: list[socket.socket] = []
-    client_names: dict[int, str] = {}
     last_frame = None
     last_error = None
     last_heartbeat = 0.0
@@ -227,14 +226,13 @@ def main() -> int:
         while _RUNNING:
             while True:
                 try:
-                    conn, addr = server.accept()
+                    conn, _addr = server.accept()
                 except BlockingIOError:
                     break
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 conn.settimeout(1.0)
                 clients.append(conn)
-                client_names[id(conn)] = f"{addr[0]}:{addr[1]}"
 
             if clients:
                 now = time.monotonic()
@@ -258,7 +256,6 @@ def main() -> int:
                                 pass
                             if conn in clients:
                                 clients.remove(conn)
-                            client_names.pop(id(conn), None)
                     last_frame = int(summary.get("frame_count", 0))
                     last_error = str(summary.get("error_msg", "") or "")
                     last_heartbeat = now
@@ -271,7 +268,6 @@ def main() -> int:
             except OSError:
                 pass
         clients.clear()
-        client_names.clear()
         server.close()
         pipeline.stop()
 

@@ -5,6 +5,7 @@ add_library(
   rf_decode.c
   rf_decode_c.c
   rf_source.c
+  ../common/rf_protocol.c
 )
 
 target_include_directories(rf_gateway_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ../common ../linux_driver)

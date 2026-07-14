@@ -9,6 +9,37 @@
 
 #include "rf433_ioctl.h"
 
+static int create_stats_timer(int epfd, int interval_s) {
+    struct itimerspec its;
+    struct epoll_event ev;
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
+    if (timer_fd < 0) {
+        fprintf(stderr, "[RF_IO] stats timer unavailable: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = interval_s;
+    its.it_interval.tv_sec = interval_s;
+    if (timerfd_settime(timer_fd, 0, &its, NULL) != 0) {
+        fprintf(stderr, "[RF_IO] stats timer configuration failed: %s\n", strerror(errno));
+        close(timer_fd);
+        return -1;
+    }
+
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.fd = timer_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev) != 0) {
+        fprintf(stderr, "[RF_IO] stats timer epoll registration failed: %s\n", strerror(errno));
+        close(timer_fd);
+        return -1;
+    }
+
+    return timer_fd;
+}
+
 static int consume_frames(const rf_epoll_config_t *cfg) {
     struct rf433_frame drv_frame;
     rf_frame_t frame;
@@ -92,18 +123,8 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
     }
 
     if (cfg->on_stats != NULL && cfg->stats_interval_s > 0) {
-        struct itimerspec its;
-        timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-        if (timer_fd >= 0) {
-            memset(&its, 0, sizeof(its));
-            its.it_value.tv_sec = cfg->stats_interval_s;
-            its.it_interval.tv_sec = cfg->stats_interval_s;
-            timerfd_settime(timer_fd, 0, &its, NULL);
-            memset(&ev, 0, sizeof(ev));
-            ev.events = EPOLLIN;
-            ev.data.fd = timer_fd;
-            epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev);
-        }
+        /* Statistics are optional; RF frame delivery remains available if setup fails. */
+        timer_fd = create_stats_timer(epfd, cfg->stats_interval_s);
     }
 
     while (1) {
@@ -141,7 +162,14 @@ int rf_epoll_run(const rf_epoll_config_t *cfg) {
                 }
             } else if (timer_fd >= 0 && events[i].data.fd == timer_fd) {
                 uint64_t expirations;
-                (void)read(timer_fd, &expirations, sizeof(expirations));
+                ssize_t n = read(timer_fd, &expirations, sizeof(expirations));
+                if (n != (ssize_t)sizeof(expirations)) {
+                    if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+                        continue;
+                    }
+                    fprintf(stderr, "[RF_IO] stats timer read failed: %s\n", n < 0 ? strerror(errno) : "short read");
+                    continue;
+                }
                 if (cfg->on_stats != NULL) {
                     cfg->on_stats(cfg->rf_fd, cfg->user);
                 }

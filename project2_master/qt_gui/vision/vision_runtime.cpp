@@ -55,10 +55,6 @@ VisionSnapshot makeStatusSnapshot(const QString &message, bool cameraOnline, boo
     return snapshot;
 }
 
-void sleepShort() {
-    QThread::msleep(800);
-}
-
 #ifdef DASHBOARD_HAVE_LOCAL_VISION_RUNTIME
 
 constexpr int kAiWorkerThreads = 1;
@@ -715,16 +711,20 @@ VisionRuntime::~VisionRuntime() {
 }
 
 void VisionRuntime::start() {
-    if (backend_ == nullptr || running_.exchange(true)) {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    if (backend_ == nullptr || running_.load()) {
         return;
     }
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+    running_.store(true);
     worker_ = std::thread(&VisionRuntime::workerLoop, this);
 }
 
 void VisionRuntime::stop() {
-    if (!running_.exchange(false)) {
-        return;
-    }
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    running_.store(false);
     if (worker_.joinable()) {
         worker_.join();
     }

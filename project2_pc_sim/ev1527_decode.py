@@ -137,12 +137,17 @@ def _iter_wav_chunks(raw: bytes) -> Iterable[Tuple[bytes, bytes]]:
 
 
 def _decode_ima_adpcm_mono(data: bytes, block_align: int) -> List[int]:
+    if block_align < 4:
+        raise ValueError("Invalid IMA ADPCM block alignment.")
+
     samples: List[int] = []
     offset = 0
     while offset + block_align <= len(data):
         block = data[offset : offset + block_align]
         predictor = struct.unpack("<h", block[0:2])[0]
         step_index = block[2]
+        if step_index > 88:
+            raise ValueError("Invalid IMA ADPCM step index.")
         samples.append(predictor)
         for byte in block[4:]:
             for nibble in (byte & 0x0F, (byte >> 4) & 0x0F):

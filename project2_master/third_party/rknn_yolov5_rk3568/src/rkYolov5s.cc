@@ -86,9 +86,11 @@ rkYolov5s::rkYolov5s(const std::string &model_path)
 int rkYolov5s::init(rknn_context *ctx_in, bool share_weight)
 {
     std::string label_path = build_label_path_from_model(model_path);
-    if (setLabelNamePath(label_path.c_str()) == 0) {
-        printf("Label path: %s\n", label_path.c_str());
+    if (setLabelNamePath(label_path.c_str()) != 0) {
+        fprintf(stderr, "Label path conflicts with the initialized post-process labels: %s\n", label_path.c_str());
+        return -1;
     }
+    printf("Label path: %s\n", label_path.c_str());
 
     printf("Loading model...\n");
     int model_data_size = 0;
@@ -249,8 +251,6 @@ int rkYolov5s::infer(void *frame_data, int img_w, int img_h, int src_format,
 
 rkYolov5s::~rkYolov5s()
 {
-    deinitPostProcess();
-
     // Destroy zero-copy memory
     if (ctx && input_mems[0])
         rknn_destroy_mem(ctx, input_mems[0]);
